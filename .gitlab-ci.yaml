@@ -1,0 +1,244 @@
+# Linux Process Manager Kernel Module - CI/CD Pipeline
+# Complete automation for building, testing, and deployment
+
+# 全局配置
+variables:
+  KERNEL_VERSION: "$(uname -r)"
+  BUILD_DIR: "$CI_PROJECT_DIR/build"
+  MODULE_NAME: "proc_manager"
+
+# 阶段定义
+stages:
+  - prepare
+  - build
+  - test
+  - integration
+  - deploy
+  - cleanup
+
+# 缓存配置
+cache:
+  key: "${CI_COMMIT_REF_SLUG}"
+  paths:
+    - build/
+    - .cache/
+  policy: pull-push
+
+# 准备工作模板
+.before_script_template: &before_script
+  before_script:
+    - apt-get update -yq
+    - apt-get install -yq build-essential
+    - apt-get install -yq linux-headers-$KERNEL_VERSION
+    - apt-get install -yq kmod
+    - apt-get install -yq libelf-dev
+    - mkdir -p $BUILD_DIR
+
+# 1. 代码质量检查
+code_quality:
+  stage: prepare
+  image: alpine:latest
+  script:
+    - echo "=== Code Quality Check ==="
+    - apk add --no-cache git bash
+    - echo "Checking for TODO/FIXME comments..."
+    - ! grep -r "TODO\|FIXME" src/ test/ --include="*.c" --include="*.h"
+    - echo "✓ No TODO/FIXME comments found"
+  only:
+    - main
+    - merge_requests
+
+# 2. 内核模块编译
+build_module:
+  stage: build
+  image: ubuntu:20.04
+  <<: *before_script
+  script:
+    - echo "=== Building Kernel Module ==="
+    - echo "Kernel: $KERNEL_VERSION"
+    - make clean
+    - make module
+    - ls -la proc_manager.ko
+    - file proc_manager.ko
+    - cp proc_manager.ko $BUILD_DIR/
+  artifacts:
+    paths:
+      - proc_manager.ko
+      - build/
+    expire_in: 1 week
+  only:
+    - main
+    - develop
+    - tags
+
+# 3. 测试程序编译
+build_tests:
+  stage: build
+  image: ubuntu:20.04
+  <<: *before_script
+  script:
+    - echo "=== Building Test Programs ==="
+    - make test
+    - cp test/* $BUILD_DIR/ 2>/dev/null || true
+  needs: ["build_module"]
+  artifacts:
+    paths:
+      - test/
+      - build/
+    expire_in: 1 week
+
+# 4. 基础功能测试
+test_basic:
+  stage: test
+  image: ubuntu:20.04
+  <<: *before_script
+  needs: ["build_module", "build_tests"]
+  script:
+    - echo "=== Basic Functionality Test ==="
+    - insmod proc_manager.ko
+    - MAJOR=$(grep procman /proc/devices | awk '{print $1}')
+    - mknod /dev/procman c $MAJOR 0
+    - chmod 666 /dev/procman
+    
+    - echo "Testing basic operations..."
+    - ./test/procman_test_v2 <<< '1\ntest1\n5\n0\n3\n0' 2>&1 | grep -q "Created process"
+    - echo "✓ Basic operations passed"
+    
+    - rmmod proc_manager
+  tags:
+    - linux
+  allow_failure: false
+
+# 5. 调度器测试
+test_scheduler:
+  stage: test
+  image: ubuntu:20.04
+  <<: *before_script
+  needs: ["build_module", "build_tests"]
+  script:
+    - echo "=== Scheduler Test ==="
+    - insmod proc_manager.ko
+    - MAJOR=$(grep procman /proc/devices | awk '{print $1}')
+    - mknod /dev/procman c $MAJOR 0
+    - chmod 666 /dev/procman
+    
+    - echo "Testing scheduler..."
+    - ./test/scheduler_test <<< '1\n0' 2>&1 | grep -q "Testing"
+    - echo "✓ Scheduler test passed"
+    
+    - rmmod proc_manager
+  tags:
+    - linux
+  allow_failure: false
+
+# 6. 集成测试
+integration_test:
+  stage: integration
+  image: ubuntu:20.04
+  <<: *before_script
+  needs: ["test_basic", "test_scheduler"]
+  script:
+    - echo "=== Integration Test ==="
+    - insmod proc_manager.ko
+    - MAJOR=$(grep procman /proc/devices | awk '{print $1}')
+    - mknod /dev/procman c $MAJOR 0
+    - chmod 666 /dev/procman
+    
+    - echo "Running stress test..."
+    - ./test/stress_test memory
+    - ./test/stress_test boundary
+    
+    - echo "✓ Integration tests passed"
+    - rmmod proc_manager
+  tags:
+    - linux
+  only:
+    - main
+    - schedules
+
+# 7. 性能测试
+performance_test:
+  stage: integration
+  image: ubuntu:20.04
+  <<: *before_script
+  needs: ["build_module", "build_tests"]
+  script:
+    - echo "=== Performance Test ==="
+    - insmod proc_manager.ko
+    - MAJOR=$(grep procman /proc/devices | awk '{print $1}')
+    - mknod /dev/procman c $MAJOR 0
+    - chmod 666 /dev/procman
+    
+    - echo "Running performance benchmark..."
+    - ./test/stress_test performance
+    
+    - rmmod proc_manager
+  tags:
+    - linux
+  only:
+    - main
+    - schedules
+  when: manual
+
+# 8. 发布版本
+release:
+  stage: deploy
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  needs: ["integration_test"]
+  rules:
+    - if: $CI_COMMIT_TAG
+  script:
+    - echo "=== Releasing Version $CI_COMMIT_TAG ==="
+    - |
+      release-cli create \
+        --name "Process Manager v$CI_COMMIT_TAG" \
+        --tag-name "$CI_COMMIT_TAG" \
+        --description "Linux kernel module with priority scheduling" \
+        --assets-link "{\"name\":\"Source Code\",\"url\":\"$CI_PROJECT_URL/-/archive/$CI_COMMIT_TAG/proc_manager-$CI_COMMIT_TAG.tar.gz\"}"
+    
+    - tar -czf proc_manager-$CI_COMMIT_TAG-src.tar.gz \
+        --exclude="*.ko" \
+        --exclude="*.o" \
+        --exclude="*.mod*" \
+        --exclude="build/" \
+        .
+  artifacts:
+    paths:
+      - proc_manager-$CI_COMMIT_TAG-src.tar.gz
+    expire_in: 1 year
+  only:
+    - tags
+
+# 9. 清理工作
+cleanup:
+  stage: cleanup
+  image: ubuntu:20.04
+  when: always
+  script:
+    - echo "=== Cleanup ==="
+    - lsmod | grep -q proc_manager && rmmod proc_manager || true
+    - rm -f /dev/procman 2>/dev/null || true
+    - rm -rf $BUILD_DIR/* 2>/dev/null || true
+  tags:
+    - linux
+
+# 工作流配置
+workflow:
+  rules:
+    - if: $CI_MERGE_REQUEST_ID
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH == "develop"
+    - if: $CI_COMMIT_TAG
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - when: never
+
+# 超时设置
+timeout: 1h
+
+# 重试策略
+retry:
+  max: 2
+  when:
+    - runner_system_failure
+    - stuck_or_timeout_failure
