@@ -1,0 +1,14 @@
+# Zig 编译器工具
+tools/zig-x86_64-windows-0.16.0/
+
+# 构建目录和缓存
+os/build/
+zig-cache/
+zig-out/
+.zig-cache/
+
+# 系统编译产物
+*.exe
+*.o
+*.a
+*.so
