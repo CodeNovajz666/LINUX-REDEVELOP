@@ -1,4 +1,9 @@
 /*
+ * [历史归档] 本示例属于项目起点 —— Linux 内核模块 proc_manager（src/），
+ * 仅作历史保留。当前 Novix OS 的用户程序见 os/user/。
+ */
+
+/*
  * example_advanced.c - 高级使用示例
  * 展示调度器、统计、资源跟踪等高级功能
  */

@@ -1,3 +1,10 @@
+# ==================================================================
+# [历史归档] 本 CI 属于项目起点 —— Linux 内核模块 proc_manager（src/），
+# 与当前的 Novix OS（os/）无关，仅作历史保留：流水线构建的是
+# proc_manager.ko 而非 os/ 内核。当前验收门禁为
+# os/build.py test（-smp 2 / -smp 1）+ os/tools/test_shell.py。
+# ==================================================================
+
 # Linux Process Manager Kernel Module - CI/CD Pipeline
 # Complete automation for building, testing, and deployment
 

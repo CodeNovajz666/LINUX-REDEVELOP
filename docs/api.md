@@ -1,5 +1,10 @@
 # Process Manager API Documentation
 
+> **[历史归档]** 本文档描述项目起点 —— Linux 内核模块 proc_manager
+> （src/），并非当前的 Novix OS，仅作历史保留。
+> 当前架构见 [os/docs/DESIGN.md](../os/docs/DESIGN.md)，
+> 系统调用 ABI 见根目录 [DESIGN.md](../DESIGN.md)。
+
 ## 1. Overview
 This document describes the user-space API for the Process Manager kernel module.
 

@@ -1,5 +1,10 @@
 # Process Manager Test Cases
 
+> **[历史归档]** 本文档描述项目起点 —— Linux 内核模块 proc_manager
+> （src/）的测试用例，并非当前的 Novix OS，仅作历史保留。
+> 当前测试为 os/build.py test（ktest 34 项自测）+
+> os/tools/test_shell.py（shell 45 项自动检查）。
+
 ## 1. Overview
 This document describes the test cases for the Process Manager kernel module.
 

@@ -1,13 +1,24 @@
-.PHONY: all run test clean
+# Convenience wrapper around build.py (which does the real work).
+# PYTHON=python on Windows, python3 on Linux/macOS.
+
+PYTHON ?= python
+
+.PHONY: all run test test1 shell clean
 
 all:
-	python3 build.py build
+	$(PYTHON) build.py
 
 run:
-	python3 build.py run
+	$(PYTHON) build.py run
 
 test:
-	python3 build.py test
+	$(PYTHON) build.py test -smp 2
+
+test1:
+	$(PYTHON) build.py test -smp 1
+
+shell:
+	$(PYTHON) tools/test_shell.py
 
 clean:
-	python3 build.py clean
+	$(PYTHON) build.py clean

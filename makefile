@@ -1,3 +1,9 @@
+# ==================================================================
+# [历史归档] 本 Makefile 属于项目起点 —— Linux 内核模块
+# proc_manager（src/），与当前的 Novix OS（os/）无关，仅作历史保留。
+# 当前构建/测试入口：os/build.py（或 os/Makefile 便捷包装）。
+# ==================================================================
+
 # Process Manager Kernel Module Makefile
 # Complete build system for kernel module and test programs
 

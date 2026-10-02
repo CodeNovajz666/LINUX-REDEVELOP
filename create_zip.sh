@@ -1,4 +1,7 @@
 #!/bin/bash
+# [历史归档] 属于项目起点 —— Linux 内核模块 proc_manager（src/），
+# 与当前的 Novix OS（os/）无关，仅作历史保留。
+
 # create_zip.sh - 创建proc_manager.zip发布包
 
 set -e

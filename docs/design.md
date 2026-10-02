@@ -1,5 +1,10 @@
 # Process Manager Design Document
 
+> **[历史归档]** 本文档描述项目起点 —— Linux 内核模块 proc_manager
+> （src/）：一个用伪造 PCB/伪造上下文切换模拟进程管理的教学模块，
+> 并非当前的 Novix OS，仅作历史保留。
+> 当前架构见 [os/docs/DESIGN.md](../os/docs/DESIGN.md)（含模块 → OS 映射表）。
+
 ## 1. Overview
 This document describes the design and implementation of a process manager kernel module for Linux.
 

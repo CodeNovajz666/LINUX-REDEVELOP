@@ -9,6 +9,10 @@ zig-out/
 
 # 系统编译产物
 *.exe
-*.
+*.o
 *.a
 *.so
+
+# 调试输出残留（手工重定向的构建/测试日志）
+build_err.txt
+test_out.txt
