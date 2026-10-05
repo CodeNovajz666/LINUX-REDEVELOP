@@ -6,7 +6,7 @@
 #include <stdbool.h>
 #include "lib.h"
 
-#define NOVIX_VERSION "0.7.0"
+#define NOVIX_VERSION "1.0.0"
 
 /* ---- SMP (v0.7.0) ---- */
 #define SMP_MAX            4        /* QEMU -smp cap for stress runs */
@@ -34,6 +34,9 @@
 /* ---- task config ---- */
 #define TASK_MAX           64
 #define TASK_NAME_LEN      16
+#define TASK_MAX_ARGV      8         /* v0.9.0: exec argv slots */
+#define ARG_MAX_LEN        64        /* v0.9.0: per-argument byte cap */
+#define TASK_CWD_LEN       80
 #define KSTACK_SIZE        16384u
 #define PRIO_MIN           1
 #define PRIO_MAX           10
@@ -85,6 +88,11 @@ static inline uint8_t inb(uint16_t port) {
 }
 static inline void outw(uint16_t port, uint16_t val) {
     __asm__ volatile("outw %0, %1" : : "a"(val), "Nd"(port));
+}
+static inline uint16_t inw(uint16_t port) {
+    uint16_t v;
+    __asm__ volatile("inw %1, %0" : "=a"(v) : "Nd"(port));
+    return v;
 }
 static inline void io_wait(void) { outb(0x80, 0); }
 

@@ -7,7 +7,7 @@ int main(void) {
     uprintf("[hello] user process running, pid=%d\n", ugetpid());
     for (int i = 3; i > 0; i--) {
         uprintf("[hello] tick %d...\n", i);
-        usleep(200);
+        usleep(400);       /* long enough for the shell test's Ctrl+C to land */
     }
     uprintf("[hello] exiting with status 42\n");
     return 42;

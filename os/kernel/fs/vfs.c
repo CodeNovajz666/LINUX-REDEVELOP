@@ -20,6 +20,21 @@ static struct file *file_new(struct inode *ino, uint16_t flags) {
     return f;
 }
 
+/* v0.9.0: the Unix permission decision. uid 0 bypasses everything (root);
+ * otherwise exactly one of the owner/group/world bit triples applies --
+ * owner wins over group wins over world, per POSIX. */
+int vfs_permitted(const struct inode *ino, uint16_t want) {
+    if (!ino) return 0;
+    struct task *cur = current_task();
+    uint16_t uid = cur ? cur->uid : 0;         /* boot context: root */
+    if (uid == 0) return 1;
+    uint16_t bits;
+    if (ino->uid == uid)          bits = (ino->mode >> 6) & 7;
+    else if (ino->gid == cur->gid) bits = (ino->mode >> 3) & 7;
+    else                          bits = ino->mode & 7;
+    return (bits & want) == want;
+}
+
 struct file *vfs_open(const char *path, uint16_t flags) {
     struct inode *ino = namei(path);
     if (!ino) {
@@ -27,13 +42,29 @@ struct file *vfs_open(const char *path, uint16_t flags) {
         char last[32];
         struct inode *parent = namei_parent(path, last, sizeof(last));
         if (!parent || !parent->i_op || !parent->i_op->create) return NULL;
-        ino = parent->i_op->create(parent, last, S_IFREG);
+        /* v0.9.0: creating a name needs write+search on the parent
+         * directory (the walk only X-checked the ancestors) */
+        if (!vfs_permitted(parent, VFS_PERM_W | VFS_PERM_X)) return NULL;
+        ino = parent->i_op->create(parent, last, S_IFREG | 0644);
         if (!ino) return NULL;
+        /* new files belong to their creator (root where no task context) */
+        struct task *cur = current_task();
+        ino->uid = cur ? cur->uid : 0;
+        ino->gid = cur ? cur->gid : 0;
     }
 
-    if (ino->mode & S_IFDIR) return NULL;   /* directories are not openable */
+    if ((ino->mode & S_IFMT) == S_IFDIR) return NULL;   /* directories are not openable */
 
     uint16_t acc = flags & O_ACCMODE;       /* 0=RD 1=WR 2=RDWR */
+    /* v0.9.0: the access mode is checked against the file's permission bits
+     * at open time (later reads/writes ride on the fd's mode, like Unix) */
+    if ((acc == O_RDONLY || acc == O_RDWR) && !vfs_permitted(ino, VFS_PERM_R))
+        return NULL;
+    if ((acc == O_WRONLY || acc == O_RDWR) && !vfs_permitted(ino, VFS_PERM_W))
+        return NULL;
+    if ((flags & (O_TRUNC | O_APPEND)) && !vfs_permitted(ino, VFS_PERM_W))
+        return NULL;
+
     if (acc == O_RDONLY && (!ino->f_op || !ino->f_op->read)) return NULL;
     if (acc != O_RDONLY && (!ino->f_op || !ino->f_op->write)) return NULL;
 
@@ -74,7 +105,7 @@ int vfs_close(struct file *f) {
 
 int vfs_lseek(struct file *f, int32_t off, int whence) {
     if (!f || !f->inode) return -1;
-    if (!(f->inode->mode & S_IFREG)) return -1;   /* pipes/devices: no seek */
+    if ((f->inode->mode & S_IFMT) != S_IFREG) return -1;   /* pipes/devices: no seek */
     uint32_t size = f->inode->size;
     uint32_t np;
     switch (whence) {
@@ -101,6 +132,9 @@ int vfs_mkdir(const char *path) {
     char last[32];
     struct inode *parent = namei_parent(path, last, sizeof(last));
     if (!parent || !parent->i_op || !parent->i_op->mkdir) return -1;
+    /* v0.9.0: like create, a new subdirectory needs write+search on the
+     * parent (the walk only X-checked the ancestors) */
+    if (!vfs_permitted(parent, VFS_PERM_W | VFS_PERM_X)) return -1;
     return parent->i_op->mkdir(parent, last);
 }
 
@@ -108,13 +142,30 @@ int vfs_unlink(const char *path) {
     char last[32];
     struct inode *parent = namei_parent(path, last, sizeof(last));
     if (!parent || !parent->i_op || !parent->i_op->unlink) return -1;
+    /* v0.9.0: removing a name needs write+search on the parent directory */
+    if (!vfs_permitted(parent, VFS_PERM_W | VFS_PERM_X)) return -1;
     return parent->i_op->unlink(parent, last);
 }
 
 int vfs_readdir(const char *path, int idx, char *name_out, size_t name_max) {
     struct inode *ino = namei(path);
-    if (!ino || !ino->i_op || !ino->i_op->readdir) return -1;
-    return ino->i_op->readdir(ino, idx, name_out, name_max);
+    if (!ino || !name_out || name_max == 0) return -1;
+    /* v0.9.0: enumerating a directory is search permission on it */
+    if (!vfs_permitted(ino, VFS_PERM_X)) return -1;
+
+    /* mounts attached to this directory come first in the listing, so a
+     * mountpoint is visible in its parent (ls / shows the pinned /dev and
+     * /tmp under the FAT32 root, exactly as ramfs showed its real /dev) */
+    int nm = vfs_mount_count(ino);
+    if (idx < nm) {
+        const char *n = vfs_mount_name_at(ino, idx);
+        if (!n) return -1;
+        strncpy(name_out, n, name_max - 1);
+        name_out[name_max - 1] = 0;
+        return 0;
+    }
+    if (!ino->i_op || !ino->i_op->readdir) return -1;
+    return ino->i_op->readdir(ino, idx - nm, name_out, name_max);
 }
 
 /* ---- per-task fd table ---- */

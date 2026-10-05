@@ -60,7 +60,7 @@ static void child_unlink(struct ramfs_node *dir, struct ramfs_node *n) {
 
 static int ramfs_f_read(struct file *f, void *buf, uint32_t len) {
     struct ramfs_node *n = node_of(f->inode);
-    if (!n || !(n->mode & S_IFREG)) return -1;
+    if (!n || (n->mode & S_IFMT) != S_IFREG) return -1;
     if (f->pos >= n->size) return 0;        /* EOF */
     uint32_t avail = n->size - f->pos;
     if (len > avail) len = avail;
@@ -71,7 +71,7 @@ static int ramfs_f_read(struct file *f, void *buf, uint32_t len) {
 
 static int ramfs_f_write(struct file *f, const void *buf, uint32_t len) {
     struct ramfs_node *n = node_of(f->inode);
-    if (!n || !(n->mode & S_IFREG)) return -1;
+    if (!n || (n->mode & S_IFMT) != S_IFREG) return -1;
 
     uint32_t end = f->pos + len;
     if (end > n->cap) {
@@ -106,13 +106,13 @@ static struct inode *ramfs_i_lookup(struct inode *dir, const char *name);
 static struct ramfs_node *node_new(const char *name, uint16_t mode);
 
 static struct inode *ramfs_i_create(struct inode *dir, const char *name, uint16_t mode) {
-    if (!(dir->mode & S_IFDIR) || !name[0] || strlen(name) >= 32)
+    if ((dir->mode & S_IFMT) != S_IFDIR || !name[0] || strlen(name) >= 32)
         return NULL;
     if (child_find(node_of(dir), name)) return NULL;    /* already exists */
     irq_flags_t fl = irq_save();
     struct ramfs_node *n = node_new(name, mode);
     if (!n) { irq_restore(fl); return NULL; }
-    if (mode & S_IFDIR)
+    if ((mode & S_IFMT) == S_IFDIR)
         n->inode.f_op = NULL;              /* directories are not openable */
     child_link(node_of(dir), n);
     irq_restore(fl);
@@ -120,15 +120,17 @@ static struct inode *ramfs_i_create(struct inode *dir, const char *name, uint16_
 }
 
 static int ramfs_i_mkdir(struct inode *dir, const char *name) {
-    return ramfs_i_create(dir, name, S_IFDIR) ? 0 : -1;
+    /* v0.9.0: rwxr-xr-x -- directories are searchable by everyone,
+     * writable only by their owner (root for boot-created ones) */
+    return ramfs_i_create(dir, name, S_IFDIR | 0755) ? 0 : -1;
 }
 
 static int ramfs_i_unlink(struct inode *dir, const char *name) {
     struct ramfs_node *d = node_of(dir);
-    if (!(dir->mode & S_IFDIR)) return -1;
+    if ((dir->mode & S_IFMT) != S_IFDIR) return -1;
     irq_flags_t fl = irq_save();
     struct ramfs_node *n = child_find(d, name);
-    if (!n || (n->mode & S_IFDIR)) { irq_restore(fl); return -1; }  /* no rmdir yet */
+    if (!n || ((n->mode & S_IFMT) == S_IFDIR)) { irq_restore(fl); return -1; }  /* no rmdir yet */
     child_unlink(d, n);
     if (n->data) kfree(n->data);
     kfree(n);
@@ -138,7 +140,7 @@ static int ramfs_i_unlink(struct inode *dir, const char *name) {
 
 static int ramfs_i_truncate(struct inode *ino) {
     struct ramfs_node *n = node_of(ino);
-    if (!n || !(n->mode & S_IFREG)) return -1;
+    if (!n || (n->mode & S_IFMT) != S_IFREG) return -1;
     irq_flags_t fl = irq_save();
     if (n->data) { kfree(n->data); n->data = NULL; }
     n->size = n->cap = 0;
@@ -148,7 +150,7 @@ static int ramfs_i_truncate(struct inode *ino) {
 }
 
 static int ramfs_i_readdir(struct inode *dir, int idx, char *name_out, size_t name_max) {
-    if (!(dir->mode & S_IFDIR)) return -1;
+    if ((dir->mode & S_IFMT) != S_IFDIR) return -1;
     struct ramfs_node *c = node_of(dir)->children;
     for (int i = 0; c && i < idx; i++) c = c->sibling;
     if (!c) return 1;                       /* end of directory */
@@ -188,7 +190,7 @@ static struct inode *ramfs_i_lookup(struct inode *dir, const char *name) {
 /* ---- mount / public api ---- */
 
 void ramfs_init(void) {
-    root = node_new("", S_IFDIR);
+    root = node_new("", S_IFDIR | 0755);       /* v0.9.0: world-searchable */
     root->inode.f_op = NULL;
     root->inode.i_parent = &root->inode;    /* ".." at root stays at root */
     vfs_set_root(&root->inode);
@@ -229,7 +231,7 @@ struct ramfs_img_entry {
 
 static int ensure_dir(const char *path) {
     struct inode *ino = namei(path);
-    if (ino) return (ino->mode & S_IFDIR) ? 0 : -1;
+    if (ino) return ((ino->mode & S_IFMT) == S_IFDIR) ? 0 : -1;
     return ramfs_mkdir(path);
 }
 
@@ -264,11 +266,11 @@ int ramfs_mount_initrd(const void *img, uint32_t size) {
 
         struct inode *ino = namei(path);
         if (!ino) {
-            ino = ramfs_mknod(path, S_IFREG, &ramfs_file_fops);
+            ino = ramfs_mknod(path, S_IFREG | 0644, &ramfs_file_fops);  /* v0.9.0 mode bits */
             if (!ino) return -1;
         }
         struct ramfs_node *n = node_of(ino);
-        if (!(n->mode & S_IFREG)) continue;
+        if ((n->mode & S_IFMT) != S_IFREG) continue;
 
         irq_flags_t fl = irq_save();
         uint8_t *nd = kmalloc(e[i].size);

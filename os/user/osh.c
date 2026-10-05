@@ -1,0 +1,515 @@
+#include "ulib.h"
+#include "etc.h"
+
+/* osh: the user-space scripting shell (v1.0.0). Replaces the v0.9.0 sh and
+ * the kernel debug shell's user-facing role: pipelines, redirection,
+ * background jobs, shell variables, $?, comments -- everything the ROADMAP
+ * scoped for this milestone, built on the 0.2-0.9 syscall base.
+ *
+ * Explicit teaching scope (v1.0.0 honesty):
+ *   - no quoting/escaping: words split on blanks, operators always split
+ *   - variables are shell-local; they are NOT exported to children
+ *   - no Ctrl-C routing to foreground jobs (the kernel debug shell has it;
+ *     this shell has no line-discipline hook yet) and no Ctrl-D/EOF
+ *   - globs, here-docs, conditionals are 1.x territory */
+
+#define OSH_LINE_MAX   128
+#define OSH_EXP_MAX    256
+#define OSH_TOK_MAX    32
+#define OSH_STAGE_MAX  5
+#define OSH_ARGV_MAX   8
+#define OSH_JOB_MAX    8
+#define OSH_VAR_MAX    16
+
+struct osh_tok {
+    const char *p;
+    int len;
+};
+
+struct osh_redir {
+    const char *in_file;                        /* < file */
+    const char *out_file;                       /* > / >> file */
+    int append;
+};
+
+struct osh_stage {
+    const char *argv[OSH_ARGV_MAX];
+    int argc;
+    struct osh_redir r;
+};
+
+struct osh_job {
+    int pid;
+    char cmd[48];
+    bool used;
+    bool done;
+};
+
+struct osh_var {
+    char name[16];
+    char value[48];
+};
+
+static struct osh_job jobs[OSH_JOB_MAX];
+static struct osh_var vars[OSH_VAR_MAX];
+static int nvars;
+static int last_status;                         /* $? */
+
+/* operator token? ('|' '<' '>' '&' or the two-char '>>') */
+static bool tok_is_op(const struct osh_tok *t) {
+    if (t->len == 2) return t->p[0] == '>' && t->p[1] == '>';
+    if (t->len != 1) return false;
+    return t->p[0] == '|' || t->p[0] == '<' || t->p[0] == '>' || t->p[0] == '&';
+}
+
+/* ---- variable table ---- */
+
+static struct osh_var *var_find(const char *name, int len) {
+    for (int i = 0; i < nvars; i++)
+        if ((int)ustrlen(vars[i].name) == len && ustrncmp(vars[i].name, name, len) == 0)
+            return &vars[i];
+    return 0;
+}
+
+static void var_set(const char *name, int nlen, const char *value) {
+    if (nlen <= 0 || nlen >= (int)sizeof(vars[0].name)) return;
+    struct osh_var *v = var_find(name, nlen);
+    if (!v) {
+        if (nvars >= OSH_VAR_MAX) return;       /* table full: silently drop */
+        v = &vars[nvars++];
+        for (int i = 0; i < nlen; i++) v->name[i] = name[i];
+        v->name[nlen] = 0;
+    }
+    ustrncpy(v->value, value, sizeof(v->value) - 1);
+    v->value[sizeof(v->value) - 1] = 0;
+}
+
+/* is this word NAME=VALUE (assignable)? */
+static bool word_is_assign(const char *w, int len) {
+    if (len <= 1 || w[0] == '$') return false;
+    if (!((w[0] >= 'A' && w[0] <= 'Z') || (w[0] >= 'a' && w[0] <= 'z') || w[0] == '_'))
+        return false;
+    for (int i = 1; i < len; i++) {
+        char c = w[i];
+        if (c == '=') return i > 0;
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') || c == '_'))
+            return false;
+    }
+    return false;
+}
+
+/* ---- $VAR expansion (pre-tokenization, so values may contain blanks) -- */
+
+static int var_value(const char *name, int len, char *out, int cap) {
+    if (len == 1 && name[0] == '?') {           /* $? */
+        char num[12];
+        char *p = num + sizeof(num);
+        unsigned u = (unsigned)last_status;
+        do { *--p = '0' + u % 10; u /= 10; } while (u);
+        int n = 0;
+        while (p < num + sizeof(num) && n < cap) out[n++] = *p++;
+        return n;
+    }
+    if (len == 3 && ustrncmp(name, "pid", 3) == 0) {
+        char num[12];
+        char *p = num + sizeof(num);
+        unsigned u = (unsigned)ugetpid();
+        do { *--p = '0' + u % 10; u /= 10; } while (u);
+        int n = 0;
+        while (p < num + sizeof(num) && n < cap) out[n++] = *p++;
+        return n;
+    }
+    struct osh_var *v = var_find(name, len);
+    if (!v) return 0;                           /* unknown name -> empty */
+    int n = 0;
+    while (v->value[n] && n < cap) { out[n] = v->value[n]; n++; }
+    return n;
+}
+
+static int expand_line(const char *in, char *out, int cap) {
+    int o = 0;
+    for (const char *p = in; *p; p++) {
+        if (*p != '$' || o >= cap - 1) {
+            out[o++] = *p;
+            if (o >= cap - 1) {                 /* truncate: rest dropped */
+                while (*p) p++;
+                break;
+            }
+            continue;
+        }
+        p++;                                    /* past '$' */
+        if (*p == '{') {                        /* ${NAME} */
+            const char *e = ustrchr(p + 1, '}');
+            if (!e) { out[o++] = '$'; out[o++] = '{'; continue; }
+            int n = var_value(p + 1, (int)(e - (p + 1)), out + o, cap - 1 - o);
+            o += n;
+            p = e;
+            continue;
+        }
+        /* $NAME / $? / $pid: longest legal name */
+        const char *s = p;
+        if (*p == '?' || *p == '_') p++;
+        else while ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') ||
+                    (*p >= '0' && *p <= '9') || *p == '_') p++;
+        if (p == s) { out[o++] = '$'; if (o < cap - 1 && *s) out[o++] = *s; continue; }
+        o += var_value(s, (int)(p - s), out + o, cap - 1 - o);
+        p--;                                    /* the for-loop re-advances */
+    }
+    out[o] = 0;
+    return o;
+}
+
+/* ---- tokenizer: words + single-char operators ('>>' pairs) ---- */
+
+/* words are copied here as proper C strings: downstream (exec, file
+ * opens, comparisons) all read argv as NUL-terminated, and the raw line
+ * must keep its delimiters for the operator scan */
+static char tok_word[OSH_TOK_MAX][64];
+
+static int tokenize(char *line, struct osh_tok *toks, int max) {
+    int n = 0;
+    char *p = line;
+    while (*p) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        if (*p == '#') break;                   /* comment: rest of line */
+        if (n >= max) return -1;
+        if (*p == '|' || *p == '<' || *p == '>' || *p == '&') {
+            if (*p == '>' && p[1] == '>') {     /* append operator */
+                toks[n].p = p; toks[n].len = 2;
+                p += 2;
+            } else {
+                toks[n].p = p; toks[n].len = 1;
+                p += 1;
+            }
+            n++;
+            continue;
+        }
+        int len = 0;
+        char *w = tok_word[n];
+        while (*p && *p != ' ' && *p != '\t' &&
+               *p != '|' && *p != '<' && *p != '>' && *p != '&' && *p != '#') {
+            if (len < (int)sizeof(tok_word[0]) - 1) w[len++] = *p;
+            p++;
+        }
+        w[len] = 0;
+        toks[n].p = w;
+        toks[n].len = len;
+        n++;
+    }
+    return n;
+}
+
+/* ---- execution ---- */
+
+static void wire_child_fds(const struct osh_stage *st, int pipe_in, int pipe_out) {
+    if (pipe_in >= 0) udup2(pipe_in, 0);
+    if (pipe_out >= 0) udup2(pipe_out, 1);
+    if (st->r.in_file) {
+        int fd = uopen(st->r.in_file, U_O_RDONLY);
+        if (fd < 0) { uprintf("osh: cannot open %s\n", st->r.in_file); uexit(1); }
+        udup2(fd, 0);
+    }
+    if (st->r.out_file) {
+        int flags = U_O_WRONLY | U_O_CREAT | (st->r.append ? U_O_APPEND : U_O_TRUNC);
+        int fd = uopen(st->r.out_file, flags);
+        if (fd < 0) { uprintf("osh: cannot open %s\n", st->r.out_file); uexit(1); }
+        udup2(fd, 1);
+    }
+}
+
+/* resolve a command word to /bin/<name> (bare) or pass paths through */
+static void resolve_cmd(const char *word, char *path, int cap) {
+    if (word[0] == '/' || word[0] == '.') {
+        ustrncpy(path, word, cap - 1);
+        path[cap - 1] = 0;
+        return;
+    }
+    int n = 0;
+    const char *b = "/bin/";
+    while (*b && n < cap - 1) path[n++] = *b++;
+    while (*word && n < cap - 1) path[n++] = *word++;
+    path[n] = 0;
+}
+
+/* spawn one stage; returns child pid or -1 (message already printed) */
+static int run_stage(const struct osh_stage *st, int pipe_in, int pipe_out) {
+    char path[64];
+    resolve_cmd(st->argv[0], path, sizeof(path));
+    int pid = ufork();
+    if (pid < 0) {
+        uputs("osh: fork failed\n");
+        return -1;
+    }
+    if (pid == 0) {                             /* child: wire, exec, never back */
+        wire_child_fds(st, pipe_in, pipe_out);
+        uexec_argv(path, st->argv, st->argc);
+        uprintf("osh: %s: not found\n", st->argv[0]);
+        uexit(127);
+    }
+    return pid;
+}
+
+static void kill_stage_pids(const int *pids, int n) {
+    for (int i = 0; i < n; i++) {
+        if (!pids[i]) continue;
+        ukill(pids[i], U_SIGKILL);
+        uwaitpid(pids[i]);
+    }
+}
+
+static int run_pipeline(struct osh_stage *stages, int nstages, bool background) {
+    int pipe_r = -1, pipe_w = -1;
+    int pids[OSH_STAGE_MAX] = { 0 };
+
+    for (int i = 0; i < nstages; i++) {
+        int pin = -1, pout = -1;
+        if (i > 0) pin = pipe_r;
+        if (i < nstages - 1) {
+            int pfds[2];
+            if (upipe(pfds) != 0) {
+                uputs("osh: pipe failed\n");
+                kill_stage_pids(pids, i);
+                return 1;
+            }
+            pipe_r = pfds[0];
+            pipe_w = pfds[1];
+            pout = pipe_w;
+        }
+        pids[i] = run_stage(&stages[i], pin, pout);
+        if (pin >= 0) uclose(pin);              /* parent drops stage ends */
+        if (pout >= 0) uclose(pout);
+        if (pids[i] < 0) {
+            kill_stage_pids(pids, i);
+            return 1;
+        }
+    }
+
+    if (background) {
+        for (int j = 0; j < OSH_JOB_MAX; j++) {
+            if (jobs[j].used && jobs[j].done) jobs[j].used = false;
+            if (!jobs[j].used) {
+                jobs[j].pid = pids[nstages - 1];
+                jobs[j].used = true;
+                jobs[j].done = false;
+                char *o = jobs[j].cmd;
+                for (int a = 0; a < stages[0].argc &&
+                                o < jobs[j].cmd + (int)sizeof(jobs[j].cmd) - 1; a++) {
+                    if (a) *o++ = ' ';
+                    const char *w = stages[0].argv[a];
+                    while (*w && o < jobs[j].cmd + (int)sizeof(jobs[j].cmd) - 1)
+                        *o++ = *w++;
+                }
+                *o = 0;
+                uprintf("[%d] pid %d\n", j + 1, jobs[j].pid);
+                return 0;
+            }
+        }
+        uputs("osh: too many background jobs\n");
+        kill_stage_pids(pids, nstages);
+        return 1;
+    }
+
+    /* foreground: every stage is reaped; the last stage's status becomes $? */
+    for (int i = 0; i < nstages; i++)
+        last_status = uwaitpid(pids[i]);
+    return last_status;
+}
+
+/* ---- builtins (single stage, no redirection) ---- */
+
+static bool stage_is_builtin(const struct osh_stage *st) {
+    if (!st->argc || st->r.in_file || st->r.out_file) return false;
+    static const char *names[] =
+        { "cd", "exit", "logout", "help", "poweroff", "wait", "jobs", 0 };
+    for (int i = 0; names[i]; i++)
+        if (ustrcmp(st->argv[0], names[i]) == 0) return true;
+    return false;
+}
+
+static void reap_finished_jobs(void) {
+    /* best effort: WNOHANG's 0 is ambiguous with "exited 0", so an exit-0
+     * job may stay listed until `wait` collects it (blocking wait is exact) */
+    for (int j = 0; j < OSH_JOB_MAX; j++) {
+        if (!jobs[j].used || jobs[j].done) continue;
+        int r = uwaitpid_nohang(jobs[j].pid);
+        if (r != 0) jobs[j].done = true;
+    }
+}
+
+static void kill_all_jobs(void) {
+    for (int j = 0; j < OSH_JOB_MAX; j++) {
+        if (!jobs[j].used) continue;
+        ukill(jobs[j].pid, U_SIGKILL);
+        uwaitpid(jobs[j].pid);                  /* reap so no zombie leaks */
+        jobs[j].used = false;
+    }
+}
+
+static int run_builtin(struct osh_stage *st) {
+    const char *cmd = st->argv[0];
+    if (ustrcmp(cmd, "exit") == 0 || ustrcmp(cmd, "logout") == 0) {
+        kill_all_jobs();
+        int code = last_status;
+        if (st->argc > 1) {                     /* exit N */
+            code = 0;
+            for (const char *p = st->argv[1]; *p >= '0' && *p <= '9'; p++)
+                code = code * 10 + (*p - '0');
+        }
+        uexit(code);
+    }
+    if (ustrcmp(cmd, "cd") == 0) {
+        const char *dir = st->argc > 1 ? st->argv[1] : "/";
+        if (uchdir(dir) != 0)
+            uprintf("cd: %s: no such directory\n", dir);
+        last_status = 0;
+        return 0;
+    }
+    if (ustrcmp(cmd, "help") == 0) {
+        uputs("osh built-ins: cd DIR, exit, logout, help, poweroff, wait, jobs\n"
+              "scripting: a|b, a>b a>>b a<b, a&, $VAR ${VAR} $? $pid,\n"
+              "           NAME=value assignments, # comments\n"
+              "everything else runs from /bin (cat grep echo ls-class tools,\n"
+              "id whoami who passwd useradd hello ...)\n"
+              "limits: no quoting, vars are not exported, no Ctrl-C to jobs\n");
+        last_status = 0;
+        return 0;
+    }
+    if (ustrcmp(cmd, "poweroff") == 0) {
+        kill_all_jobs();
+        upoweroff();
+    }
+    if (ustrcmp(cmd, "wait") == 0) {
+        for (int j = 0; j < OSH_JOB_MAX; j++) {
+            if (!jobs[j].used || jobs[j].done) continue;
+            uwaitpid(jobs[j].pid);              /* exact status; we keep $? */
+            jobs[j].done = true;
+            jobs[j].used = false;
+        }
+        last_status = 0;
+        return 0;
+    }
+    if (ustrcmp(cmd, "jobs") == 0) {
+        for (int j = 0; j < OSH_JOB_MAX; j++) {
+            if (!jobs[j].used) continue;
+            reap_finished_jobs();
+            uprintf("[%d] %s pid %d %s\n", j + 1, jobs[j].cmd,
+                    jobs[j].pid, jobs[j].done ? "done" : "running");
+        }
+        last_status = 0;
+        return 0;
+    }
+    return -1;
+}
+
+/* ---- prompt and main loop ---- */
+
+static void prompt(void) {
+    char cwd[80];
+    char name[24];
+    ustrcpy(name, "?");
+    struct pwent pw;
+    if (etc_getpwuid(ugetuid(), &pw) == 0)
+        ustrncpy(name, pw.name, sizeof(name) - 1);
+    if (ugetcwd(cwd, sizeof(cwd)) < 0)
+        ustrcpy(cwd, "/");
+    uprintf("%s@novix:%s%s ", name, cwd, ugetuid() == 0 ? "#" : "$");
+}
+
+/* one parsed line -> stages; returns nstages or 0 (nothing to run) */
+static int parse_stages(struct osh_tok *toks, int ntok,
+                        struct osh_stage *stages) {
+    int nstages = 0;
+    struct osh_stage *st = &stages[0];
+    st->argc = 0;
+    st->r.in_file = 0;
+    st->r.out_file = 0;
+    st->r.append = 0;
+
+    for (int i = 0; i < ntok; i++) {
+        struct osh_tok *t = &toks[i];
+        if (t->len == 1 && t->p[0] == '|') {
+            if (st->argc == 0) return -1;       /* empty stage */
+            if (++nstages >= OSH_STAGE_MAX) return -1;
+            st = &stages[nstages];
+            st->argc = 0;
+            st->r.in_file = 0;
+            st->r.out_file = 0;
+            st->r.append = 0;
+            continue;
+        }
+        if (t->len == 1 && t->p[0] == '<' && !st->r.in_file) {
+            if (i + 1 >= ntok || tok_is_op(&toks[i + 1])) return -1;
+            st->r.in_file = toks[++i].p;
+            continue;
+        }
+        /* '>' or '>>' -- tok_is_op tells operators from two-letter words */
+        if (tok_is_op(t) && t->p[0] == '>') {
+            if (st->r.out_file) return -1;
+            if (i + 1 >= ntok || tok_is_op(&toks[i + 1])) return -1;
+            st->r.out_file = toks[++i].p;
+            st->r.append = (t->len == 2);
+            continue;
+        }
+        if (t->len == 1 && t->p[0] == '&') {
+            if (i != ntok - 1) return -1;       /* '&' only ends the line */
+            continue;                           /* caller checks last token */
+        }
+        if (st->argc >= OSH_ARGV_MAX) return -1;
+        st->argv[st->argc++] = t->p;
+    }
+    if (stages[0].argc == 0 && nstages == 0) return 0;
+    if (st->argc == 0) return -1;
+    for (int s = 0; s <= nstages; s++)
+        stages[s].argv[stages[s].argc] = 0;
+    return nstages + 1;
+}
+
+int main(int argc, char **argv) {
+    (void)argc; (void)argv;
+    char line[OSH_LINE_MAX];
+    char exp[OSH_EXP_MAX];
+    struct osh_tok toks[OSH_TOK_MAX];
+    struct osh_stage stages[OSH_STAGE_MAX];
+    last_status = 0;
+
+    for (;;) {
+        reap_finished_jobs();
+        prompt();
+        ureadline(line, sizeof(line));
+        expand_line(line, exp, sizeof(exp));
+
+        bool background = false;
+        int ntok = tokenize(exp, toks, OSH_TOK_MAX);
+        if (ntok < 0) { uputs("osh: too many tokens\n"); last_status = 2; continue; }
+        if (ntok > 0 && toks[ntok - 1].len == 1 && toks[ntok - 1].p[0] == '&') {
+            background = true;
+            ntok--;                             /* '&' is not a stage token */
+        }
+        int nstages = parse_stages(toks, ntok, stages);
+        if (nstages < 0) { uputs("osh: syntax error\n"); last_status = 2; continue; }
+        if (nstages == 0) continue;             /* blank / comment line */
+
+        /* assignments: NAME=value at the head of a single command */
+        int a = 0;
+        while (a < nstages && stages[a].argc == 1 &&
+               word_is_assign(stages[a].argv[0], (int)ustrlen(stages[a].argv[0]))) {
+            const char *w = stages[a].argv[0];
+            const char *eq = ustrchr(w, '=');
+            var_set(w, (int)(eq - w), eq + 1);
+            a++;
+        }
+        if (a == nstages) { last_status = 0; continue; }
+        if (a > 0) {                            /* shift assignments away */
+            for (int s = a; s < nstages; s++) stages[s - a] = stages[s];
+            nstages -= a;
+        }
+
+        if (nstages == 1 && stage_is_builtin(&stages[0])) {
+            run_builtin(&stages[0]);
+            continue;
+        }
+        run_pipeline(stages, nstages, background);
+    }
+}

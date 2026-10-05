@@ -11,6 +11,7 @@
 #include "vfs.h"
 #include "signal.h"
 #include "mm.h"
+#include "rtc.h"
 #include "lib.h"
 
 /* v0.5.0: the most recent spawned task is the "foreground" one -- Ctrl+C
@@ -29,6 +30,7 @@ static void cmd_help(void) {
     kprintf("  kill PID [SIGNO]  terminate a task (default 15=SIGTERM)\n");
     kprintf("  policy N          0=PRIORITY 1=RR 2=FCFS 3=EDF 4=RMS\n");
     kprintf("  uptime            ms since boot\n");
+    kprintf("  date              hardware wall clock (v0.8.0 RTC)\n");
     kprintf("  mem [-v]           memory usage (-v: paging/swap counters)\n");
     kprintf("  ls [PATH]         list directory (default /)\n");
     kprintf("  cat FILE          print file contents\n");
@@ -86,6 +88,17 @@ static void cmd_reboot(void) {
     kprintf("reboot failed\n");
 }
 
+/* v0.8.0: the hardware wall clock, verbatim (QEMU runs -rtc base=localtime
+ * so the CMOS holds local time; no timezone machinery, honestly) */
+static void cmd_date(void) {
+    struct rtc_time t;
+    if (rtc_read(&t) != 0) { kprintf("date: RTC not sane\n"); return; }
+    kprintf("%04u-%02u-%02u %02u:%02u:%02u local (unix %llu, up %u ms)\n",
+            t.year, t.mon, t.day, t.hour, t.min, t.sec,
+            (unsigned long long)rtc_unix_seconds(),
+            (unsigned)timer_uptime_ms());
+}
+
 static void cmd_kill(const char *arg) {
     int pid = 0;
     const char *p = arg;
@@ -117,7 +130,7 @@ static void cmd_ls(const char *path) {
         kprintf("ls: %s: no such file or directory\n", path);
         return;
     }
-    if (!(st.st_mode & S_IFDIR)) {
+    if ((st.st_mode & S_IFMT) != S_IFDIR) {
         kprintf("%s  %u bytes\n", path, st.st_size);
         return;
     }
@@ -135,10 +148,12 @@ static void cmd_ls(const char *path) {
         struct stat es;
         if (vfs_stat(full, &es) != 0) {
             kprintf("  %-24s ?\n", name);
-        } else if (es.st_mode & S_IFDIR) {
+        } else if ((es.st_mode & S_IFMT) == S_IFDIR) {
             kprintf("  %-24s <dir>\n", name);
-        } else if (es.st_mode & S_IFCHR) {
+        } else if ((es.st_mode & S_IFMT) == S_IFCHR) {
             kprintf("  %-24s <chr>\n", name);
+        } else if ((es.st_mode & S_IFMT) == S_IFBLK) {
+            kprintf("  %-24s <blk>\n", name);
         } else {
             kprintf("  %-24s %u bytes\n", name, es.st_size);
         }
@@ -231,6 +246,7 @@ static void shell_parse(char *line) {
     }
     else if (!strcmp(line, "uptime")) kprintf("uptime: %u ms (%u ticks)\n",
                                               (unsigned)timer_uptime_ms(), (unsigned)timer_ticks());
+    else if (!strcmp(line, "date")) cmd_date();
     else if (!strcmp(line, "mem")) cmd_mem(arg);
     else if (!strcmp(line, "clear")) console_clear();
     else if (!strcmp(line, "reboot")) cmd_reboot();
@@ -252,7 +268,7 @@ static int hist_pos;        /* browsing cursor; == hist_count while typing */
 
 static const char *const cmd_names[] = {
     "help", "ps", "tasks", "spawn", "kill", "ls", "dir", "cat",
-    "mkdir", "touch", "rm", "echo", "policy", "uptime", "mem",
+    "mkdir", "touch", "rm", "echo", "policy", "uptime", "date", "mem",
     "clear", "reboot", "poweroff", "exit", NULL
 };
 

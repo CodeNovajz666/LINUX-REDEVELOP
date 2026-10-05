@@ -40,6 +40,20 @@ static int user_buf_ok(uint64_t buf, uint64_t len) {
     return 1;
 }
 
+/* v0.9.0: copy an argv pointer array out of user memory. The strings stay
+ * put -- elf_load copies them onto the new stack synchronously while the
+ * caller's CR3 is still loaded, so plain user pointers are safe here. */
+static int copy_argv_from_user(uint64_t uargv, int argc, const char *kargv[TASK_MAX_ARGV]) {
+    if (argc <= 0 || argc > TASK_MAX_ARGV) return -1;
+    if (uargv < USER_CODE_BASE || uargv + 8u * (uint64_t)argc > USER_STACK_TOP) return -1;
+    for (int i = 0; i < argc; i++) {
+        uint64_t p = *(volatile uint64_t *)(uintptr_t)(uargv + 8u * (uint64_t)i);
+        if (p < USER_CODE_BASE || p >= USER_STACK_TOP) return -1;
+        kargv[i] = (const char *)(uintptr_t)p;
+    }
+    return 0;
+}
+
 static long sys_write(uint64_t fd, uint64_t buf, uint64_t len) {
     if (!user_buf_ok(buf, len)) return -1;
     struct file *f = fd_get((int)fd);
@@ -88,7 +102,7 @@ static long sys_stat(uint64_t upath, uint64_t ustat) {
     return 0;
 }
 
-static long sys_spawn(uint64_t uname) {
+static long sys_spawn(uint64_t uname, uint64_t uargv, uint64_t uargc) {
     char name[64];
     if (copy_str_from_user(name, uname, sizeof(name)) != 0) return -1;
     if (!name[0]) return -1;
@@ -102,11 +116,21 @@ static long sys_spawn(uint64_t uname) {
         strncpy(path + 5, name, sizeof(path) - 6);
         path[sizeof(path) - 1] = 0;
     }
-    struct task *t = task_spawn_path(path);
+    /* v0.9.0: argv rides along (rsi = char** argv, rdx = argc; the pair
+     * (0, 0) means "no arguments" and argv[0] defaults to the path) */
+    struct task *t;
+    if (uargv == 0) {
+        if (uargc != 0) return -1;
+        t = task_spawn_path(path);
+    } else {
+        const char *kargv[TASK_MAX_ARGV];
+        if (copy_argv_from_user(uargv, (int)(int32_t)uargc, kargv) != 0) return -1;
+        t = task_spawn_argv(path, kargv, (int)(int32_t)uargc);
+    }
     return t ? t->pid : -1;
 }
 
-static long sys_exec(struct pt_regs *r, uint64_t upath) {
+static long sys_exec(struct pt_regs *r, uint64_t upath, uint64_t uargv, uint64_t uargc) {
     char path[80];
     if (copy_str_from_user(path, upath, sizeof(path)) != 0) return -1;
     if (!path[0]) return -1;
@@ -120,9 +144,16 @@ static long sys_exec(struct pt_regs *r, uint64_t upath) {
         strncpy(full + 5, path, sizeof(full) - 6);
         full[sizeof(full) - 1] = 0;
     }
+    /* v0.9.0: argv from rsi/rdx, same convention as spawn */
+    if (uargv == 0) {
+        if (uargc != 0) return -1;
+        return task_exec(r, full, NULL, 0);
+    }
+    const char *kargv[TASK_MAX_ARGV];
+    if (copy_argv_from_user(uargv, (int)(int32_t)uargc, kargv) != 0) return -1;
     /* on success this never "returns": the frame is replaced and the
      * pending iretq enters the new image (rax ends up 0, harmless) */
-    return task_exec(r, full);
+    return task_exec(r, full, kargv, (int)(int32_t)uargc);
 }
 
 /* ---- v0.5.0: sbrk / signals / pipes ---- */
@@ -234,6 +265,130 @@ static long sys_pipe(uint64_t ufd) {
     return 0;
 }
 
+/* ---- v0.9.0: users, working directory, terminal, power ---- */
+
+static long sys_getuid(void) {
+    struct task *cur = current_task();
+    return cur ? cur->uid : 0;
+}
+
+static long sys_getruid(void) {
+    struct task *cur = current_task();
+    return cur ? cur->ruid : 0;
+}
+
+static long sys_getgid(void) {
+    struct task *cur = current_task();
+    return cur ? cur->gid : 0;
+}
+
+/* setuid(2) teaching rule: root becomes anyone; a mortal may only restate
+ * its own uid. login drops privilege through this call, never raises it. */
+static long sys_setuid(uint64_t uid) {
+    struct task *cur = current_task();
+    if (!cur || !cur->is_user) return -1;
+    if (cur->uid == 0) {
+        cur->uid = cur->ruid = (uint16_t)uid;
+        return 0;
+    }
+    return (uint16_t)uid == cur->uid ? 0 : -1;
+}
+
+static long sys_setgid(uint64_t gid) {
+    struct task *cur = current_task();
+    if (!cur || !cur->is_user) return -1;
+    if (cur->uid == 0) {
+        cur->gid = (uint16_t)gid;
+        return 0;
+    }
+    return (uint16_t)gid == cur->gid ? 0 : -1;
+}
+
+static long sys_chdir(uint64_t upath) {
+    char path[80];
+    if (copy_str_from_user(path, upath, sizeof(path)) != 0) return -1;
+    struct task *cur = current_task();
+    if (!cur || !cur->is_user) return -1;
+    char canon[TASK_CWD_LEN];
+    if (vfs_canonicalize(cur->cwd, path, canon, sizeof(canon)) != 0) return -1;
+    struct inode *ino = namei(canon);       /* the walk already gates on X */
+    if (!ino || (ino->mode & S_IFMT) != S_IFDIR) return -1;
+    if (!vfs_permitted(ino, VFS_PERM_X)) return -1;
+    strcpy(cur->cwd, canon);
+    return 0;
+}
+
+static long sys_getcwd(uint64_t ubuf, uint64_t len) {
+    struct task *cur = current_task();
+    if (!cur || !cur->is_user) return -1;
+    if (len < 2 || !user_buf_ok(ubuf, len)) return -1;
+    size_t n = strlen(cur->cwd);
+    if (n + 1 > (size_t)len) return -1;
+    memcpy((void *)(uintptr_t)ubuf, cur->cwd, n + 1);
+    return (long)n;
+}
+
+/* TCGETS/TCSETS subset over stdio: one flag word, bit TC_ECHO. The echo
+ * state lives in the console device, shared by every reader -- a single
+ * tty is the documented v0.9.0 scope. */
+static long sys_ioctl(uint64_t fd, uint64_t req, uint64_t uflags) {
+    struct task *cur = current_task();
+    if (!cur || !cur->is_user) return -1;
+    if (fd > 2) return -1;
+    struct file *f = fd_get((int)fd);
+    if (!f || !f->inode || (f->inode->mode & S_IFMT) != S_IFCHR) return -1;
+    if (uflags < USER_CODE_BASE || uflags + 2 > USER_STACK_TOP) return -1;
+    uint16_t *fl = (uint16_t *)(uintptr_t)uflags;
+    if (req == TCGETS) {
+        *fl = console_echo_enabled() ? TC_ECHO : 0;
+        return 0;
+    }
+    if (req == TCSETS) {
+        console_set_echo((*fl & TC_ECHO) != 0);
+        return 0;
+    }
+    return -1;
+}
+
+static long sys_mkdir(uint64_t upath) {
+    char path[80];
+    if (copy_str_from_user(path, upath, sizeof(path)) != 0) return -1;
+    return vfs_mkdir(path);               /* parent W checked inside */
+}
+
+/* ---- v1.0.0: osh scripting plumbing ---- */
+
+/* dup2(2): the new fd joins the caller's old open-file description (shared
+ * offset, like fork's inherited fds). osh's children get their stdin/stdout
+ * wired to pipes and files through exactly this call -- fd_close on the
+ * target first is the implicit-close dup2(2) semantics. */
+static long sys_dup2(uint64_t oldfd, uint64_t newfd) {
+    struct task *cur = current_task();
+    if (!cur || !cur->is_user) return -1;
+    if (oldfd >= TASK_MAX_FD || newfd >= TASK_MAX_FD) return -1;
+    struct file *f = fd_get((int)oldfd);
+    if (!f) return -1;
+    if (oldfd == newfd) return (long)newfd;
+    if (cur->fd[newfd]) fd_close((int)newfd);
+    cur->fd[newfd] = f;
+    f->f_count++;
+    return (long)newfd;
+}
+
+/* chown(2): root only. FAT stores no ownership, so this edits the inode
+ * cache (what the permission checks read) -- documented teaching scope. */
+static long sys_chown(uint64_t upath, uint64_t uid, uint64_t gid) {
+    struct task *cur = current_task();
+    if (!cur || !cur->is_user || cur->uid != 0) return -1;
+    char path[80];
+    if (copy_str_from_user(path, upath, sizeof(path)) != 0) return -1;
+    struct inode *ino = namei(path);
+    if (!ino) return -1;
+    ino->uid = (uint16_t)uid;
+    ino->gid = (uint16_t)gid;
+    return 0;
+}
+
 void syscall_dispatch(struct pt_regs *r) {
     struct task *cur = current_task();
     long ret;
@@ -261,7 +416,7 @@ void syscall_dispatch(struct pt_regs *r) {
         }
         break;
     case SYS_SPAWN:
-        ret = sys_spawn(r->rdi);
+        ret = sys_spawn(r->rdi, r->rsi, r->rdx);
         break;
     case SYS_FORK:
         ret = -1;
@@ -272,7 +427,7 @@ void syscall_dispatch(struct pt_regs *r) {
         }
         break;
     case SYS_EXEC:
-        ret = sys_exec(r, r->rdi);
+        ret = sys_exec(r, r->rdi, r->rsi, r->rdx);
         break;
     case SYS_FREEPAGES:
         ret = (long)pmm_free_pages();
@@ -332,6 +487,45 @@ void syscall_dispatch(struct pt_regs *r) {
         break;
     case SYS_STAT:
         ret = sys_stat(r->rdi, r->rsi);
+        break;
+    case SYS_GETUID:                             /* v0.9.0 */
+        ret = sys_getuid();
+        break;
+    case SYS_GETRUID:
+        ret = sys_getruid();
+        break;
+    case SYS_GETGID:
+        ret = sys_getgid();
+        break;
+    case SYS_SETUID:
+        ret = sys_setuid(r->rdi);
+        break;
+    case SYS_SETGID:
+        ret = sys_setgid(r->rdi);
+        break;
+    case SYS_CHDIR:
+        ret = sys_chdir(r->rdi);
+        break;
+    case SYS_GETCWD:
+        ret = sys_getcwd(r->rdi, r->rsi);
+        break;
+    case SYS_IOCTL:
+        ret = sys_ioctl(r->rdi, r->rsi, r->rdx);
+        break;
+    case SYS_MKDIR:
+        ret = sys_mkdir(r->rdi);
+        break;
+    case SYS_CHOWN:
+        ret = sys_chown(r->rdi, r->rsi, r->rdx);
+        break;
+    case SYS_DUP2:
+        ret = sys_dup2(r->rdi, r->rsi);
+        break;
+    case SYS_POWEROFF:
+        kprintf("poweroff: requested by pid %d (%s)\n",
+                cur ? cur->pid : -1, cur ? cur->name : "?");
+        qemu_exit(0);
+        ret = 0;                                  /* never reached under QEMU */
         break;
     default:
         ret = -1;

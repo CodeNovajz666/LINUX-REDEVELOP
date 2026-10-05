@@ -37,6 +37,11 @@ struct task {
     bool is_user;
     bool is_idle;           /* v0.7.0: per-CPU idle tasks -- never picked,
                              * never killable; each CPU falls back to its own */
+    uint16_t uid;           /* v0.9.0: user id (0 = root, bypasses VFS perms) */
+    uint16_t gid;           /* v0.9.0: group id */
+    uint16_t ruid;          /* v0.9.0: real uid -- survives SUID exec, so
+                             * /bin/passwd still knows who invoked it */
+    char cwd[TASK_CWD_LEN]; /* v0.9.0: working directory ("/" until chdir) */
     int cpu;                /* v0.7.0: CPU that last ran us (ps column) */
     int on_cpu;             /* v0.7.0 ownership: -1 = parked, else the CPU
                              * executing us right now. Pickable only when -1;
@@ -64,14 +69,20 @@ void task_set_current(struct task *t);
 
 struct task *task_create_kernel(const char *name, void (*entry)(void *), void *arg, int priority);
 struct task *task_create_idle(const char *name);       /* adopts boot stack */
-struct task *task_create_user(const char *name, struct inode *elf_ino);
+/* v0.9.0: argv rides onto the fresh user stack (crt0 -> main(argc, argv)) */
+struct task *task_create_user(const char *name, struct inode *elf_ino,
+                              const char *const argv[], int argc);
 /* spawn a user program from a VFS path (e.g. "/bin/hello"); resolves the
- * ELF through ramfs. returns the new task or NULL. */
+ * ELF through ramfs. returns the new task or NULL. argv may be NULL. */
 struct task *task_spawn_path(const char *path);
+struct task *task_spawn_argv(const char *path, const char *const argv[], int argc);
 
 /* fork/exec (v0.4.0) */
 struct task *task_fork(struct pt_regs *parent_regs); /* child of current, or NULL */
-int task_exec(struct pt_regs *r, const char *path);  /* replace current image */
+/* v0.9.0: exec gains argv -- the strings are pushed onto the fresh user stack
+ * so main(argc, argv) works (crt0 reads them off the initial rsp). */
+int task_exec(struct pt_regs *r, const char *path,
+              const char *const argv[], int argc);    /* replace current image */
 
 void task_exit(int status) __attribute__((noreturn));
 void task_kill(int signo) __attribute__((noreturn));  /* kill current task */

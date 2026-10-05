@@ -64,6 +64,12 @@ char *strncpy(char *dst, const char *src, size_t n) {
     return dst;
 }
 
+char *strchr(const char *s, int c) {
+    for (; *s; s++)
+        if (*s == (char)c) return (char *)s;
+    return c == 0 ? (char *)s : NULL;
+}
+
 const char *strstr(const char *hay, const char *needle) {
     if (!*needle) return hay;
     for (; *hay; hay++) {

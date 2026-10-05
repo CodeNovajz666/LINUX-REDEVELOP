@@ -13,6 +13,10 @@
 #include "percpu.h"
 #include "smp.h"
 #include "spinlock.h"
+#include "driver.h"
+#include "fat32.h"
+#include "rtc.h"
+#include "sha256.h"
 #include "lib.h"
 
 /*
@@ -938,5 +942,264 @@ static const struct ktest_case smp_cases[] = {
 int ktest_run_smp(void) {
     run_cases("smp", smp_cases, sizeof(smp_cases) / sizeof(smp_cases[0]));
     sched_set_policy(SCHED_PRIORITY);
+    return failed;
+}
+
+/* ---------------- disk tests (v0.8.0: driver model / FAT32 / RTC) -------
+ *
+ * Run inside init after smp_release: the APs are live, so FAT32 operations
+ * from this task can genuinely race kswapd and the tick on another CPU.
+ * The suite is skipped (without failing) when the boot had no disk root --
+ * but the project's three gates always pass root=/dev/hd0, so a silently
+ * skipped suite there would still fail gate H via fat32_mounted().
+ */
+
+static void test_dev_registry(void) {
+    /* every built-in driver brought its device up and published it */
+    KT_ASSERT(device_present("console"));
+    KT_ASSERT(device_present("null"));
+    KT_ASSERT(device_present("zero"));
+    KT_ASSERT(device_present("hd0"));
+
+    struct stat st;
+    KT_ASSERT(vfs_stat("/dev/console", &st) == 0);
+    KT_ASSERT((st.st_mode & S_IFMT) == S_IFCHR);
+    KT_ASSERT(vfs_stat("/dev/hd0", &st) == 0);
+    KT_ASSERT((st.st_mode & S_IFMT) == S_IFBLK);     /* v0.8.0: block device */
+
+    /* null swallows, zero reads zeros */
+    struct file *n = vfs_open("/dev/null", O_WRONLY);
+    KT_ASSERT(n != NULL);
+    KT_ASSERT(vfs_write(n, "void", 4) == 4);
+    KT_ASSERT(vfs_close(n) == 0);
+    struct file *z = vfs_open("/dev/zero", O_RDONLY);
+    KT_ASSERT(z != NULL);
+    char zbuf[16];
+    KT_ASSERT(vfs_read(z, zbuf, sizeof(zbuf)) == (int)sizeof(zbuf));
+    for (unsigned i = 0; i < sizeof(zbuf); i++)
+        if (zbuf[i] != 0) { cur_failed = 1; return; }
+    KT_ASSERT(vfs_close(z) == 0);
+}
+
+/* FAT32 read/write round trip through the live root: create, write, read
+ * back, append, lseek, stat, mkdir/readdir/rmdir -- all hitting the disk. */
+static void test_fat_roundtrip(void) {
+    if (!fat32_mounted()) {
+        kprintf("  (no FAT32 root -- skipped)\n");
+        return;
+    }
+    uint32_t free0 = fat32_free_clusters(g_fat_sb);
+
+    const char *p = "/ktest-rt.txt";
+    struct file *f = vfs_open(p, O_WRONLY | O_CREAT | O_TRUNC);
+    KT_ASSERT(f != NULL);
+    KT_ASSERT(vfs_write(f, "novix on fat32", 14) == 14);
+    KT_ASSERT(vfs_close(f) == 0);
+    KT_ASSERT(fat32_free_clusters(g_fat_sb) == free0 - 1);   /* one cluster */
+
+    struct file *g = vfs_open(p, O_RDONLY);
+    KT_ASSERT(g != NULL);
+    char buf[32] = { 0 };
+    KT_ASSERT(vfs_read(g, buf, sizeof(buf)) == 14);
+    KT_ASSERT(memcmp(buf, "novix on fat32", 14) == 0);
+    KT_ASSERT(vfs_lseek(g, 9, SEEK_SET) == 9);
+    KT_ASSERT(vfs_read(g, buf, 5) == 5);
+    KT_ASSERT(memcmp(buf, "fat32", 5) == 0);
+    KT_ASSERT(vfs_close(g) == 0);
+
+    /* append grows the file and the dirent's size field follows */
+    struct file *a = vfs_open(p, O_WRONLY | O_APPEND);
+    KT_ASSERT(a != NULL);
+    KT_ASSERT(vfs_write(a, "!", 1) == 1);
+    KT_ASSERT(vfs_close(a) == 0);
+    struct stat st;
+    KT_ASSERT(vfs_stat(p, &st) == 0);
+    KT_ASSERT(st.st_size == 15);
+
+    /* directories on FAT: create, fill, empty, remove (the unlink handles
+     * empty dirs -- ramfs could not). 8.3 names only: base <= 8 chars. */
+    KT_ASSERT(vfs_mkdir("/ktdir") == 0);
+    struct file *d = vfs_open("/ktdir/inside.txt", O_WRONLY | O_CREAT);
+    KT_ASSERT(d != NULL);
+    vfs_close(d);
+    KT_ASSERT(vfs_unlink("/ktdir/inside.txt") == 0);
+    KT_ASSERT(vfs_unlink("/ktdir") == 0);
+    KT_ASSERT(vfs_stat("/ktdir", &st) == -1);
+
+    KT_ASSERT(vfs_unlink(p) == 0);
+    KT_ASSERT(fat32_free_clusters(g_fat_sb) == free0);      /* all returned */
+}
+
+/* Power-cycle semantics: a fresh, independent FAT32 mount of the same disk
+ * sees the file this task wrote moments ago. RAM state cannot fool it --
+ * only data that actually reached the platters survives a remount. */
+static void test_fat_powercycle(void) {
+    if (!fat32_mounted()) {
+        kprintf("  (no FAT32 root -- skipped)\n");
+        return;
+    }
+    const char *p = "/ktest-pc.txt";
+    struct file *f = vfs_open(p, O_WRONLY | O_CREAT | O_TRUNC);
+    KT_ASSERT(f != NULL);
+    KT_ASSERT(vfs_write(f, "survives remount", 16) == 16);
+    KT_ASSERT(vfs_close(f) == 0);
+
+    struct fat32_sb *sb2 = fat32_mount();               /* fresh instance */
+    KT_ASSERT(sb2 != NULL);
+    struct inode *root2 = fat32_root_inode(sb2);
+    KT_ASSERT(root2 != NULL);
+    struct inode *ino2 = root2->i_op->lookup(root2, "ktest-pc.txt");
+    KT_ASSERT(ino2 != NULL);
+    KT_ASSERT(ino2->size == 16);
+    struct file rf = { .inode = ino2, .pos = 0 };
+    char buf[32] = { 0 };
+    KT_ASSERT(ino2->f_op->read(&rf, buf, sizeof(buf)) == 16);
+    KT_ASSERT(memcmp(buf, "survives remount", 16) == 0);
+    fat32_unmount(sb2);                                 /* "power off" */
+
+    KT_ASSERT(vfs_unlink(p) == 0);                      /* cleanup via live fs */
+    struct stat st;
+    KT_ASSERT(vfs_stat(p, &st) == -1);
+}
+
+static void test_rtc_wallclock(void) {
+    KT_ASSERT(rtc_valid());
+    const struct rtc_time *bt = rtc_boot_time();
+    KT_ASSERT(bt != NULL);
+    KT_ASSERT(bt->year >= 2020 && bt->year <= 2099);    /* 2000+yy CMOS limit */
+    KT_ASSERT(bt->mon >= 1 && bt->mon <= 12);
+    KT_ASSERT(bt->day >= 1 && bt->day <= 31);
+
+    uint64_t u0 = rtc_unix_seconds();
+    timer_sleep_ms(1100);                               /* let a second pass */
+    uint64_t u1 = rtc_unix_seconds();
+    KT_ASSERT(u1 >= u0);
+    KT_ASSERT(u1 - u0 <= 2);                            /* wall clock runs */
+}
+
+static const struct ktest_case disk_cases[] = {
+    { "dev_registry",    test_dev_registry },
+    { "fat_roundtrip",   test_fat_roundtrip },
+    { "fat_powercycle",  test_fat_powercycle },
+    { "rtc_wallclock",   test_rtc_wallclock },
+};
+
+int ktest_run_disk(void) {
+    run_cases("disk", disk_cases, sizeof(disk_cases) / sizeof(disk_cases[0]));
+    return failed;
+}
+
+/* ---------------- v0.9.0: users & login ---------------- */
+
+/* case 1 -- the boundary walk runs inside /bin/uidtest (spawned here as
+ * root, it steps down to uid 100 and proves it can never climb back);
+ * this side proves the argv plumbing: "uidtest magic42" must reach main. */
+static void test_setuid_boundary(void) {
+    const char *argv[2] = { "uidtest", "magic42" };
+    struct task *t = task_spawn_argv("/bin/uidtest", argv, 2);
+    KT_ASSERT(t != NULL);
+    reap_expect(t, 0);
+}
+
+/* case 2 -- the roundtrip: the digest tools/mkpasswd.py baked into
+ * /etc/shadow for the shadow-only "kck" anchor (password "ktest-pass")
+ * must equal what this kernel's own SHA-256 computes from salt||password.
+ * Green here means host tool and kernel hash agree byte for byte. The
+ * anchor is used instead of "ktest" because passwd rewrites only the
+ * target user's line -- kck keeps its build-time digest even on an image
+ * whose passwords were changed at runtime (test_shell.py session 3). */
+static void test_shadow_roundtrip(void) {
+    struct file *f = vfs_open("/etc/shadow", O_RDONLY);
+    if (!f) { kprintf("  (no /etc/shadow -- skipped)\n"); return; }
+    char buf[1024];
+    int n = vfs_read(f, buf, sizeof(buf) - 1);
+    vfs_close(f);
+    KT_ASSERT(n > 0);
+    buf[n] = 0;
+
+    const char *line = strstr(buf, "kck:");
+    KT_ASSERT(line != NULL);
+    const char *c1 = strchr(line, ':');            /* after the name */
+    const char *c2 = c1 ? strchr(c1 + 1, ':') : NULL;
+    KT_ASSERT(c2 != NULL && c2 - (c1 + 1) == 8);   /* 8-char salt */
+    const char *eol = strchr(c2, '\n');
+    size_t hlen = eol ? (size_t)(eol - c2 - 1) : strlen(c2 + 1);
+    KT_ASSERT(hlen == 64);                         /* sha256 hex digest */
+
+    char msg[32];                                  /* salt + "ktest-pass" */
+    memcpy(msg, c1 + 1, 8);
+    memcpy(msg + 8, "ktest-pass", 11);
+    char got[65];
+    sha256_hex(msg, 8 + 10, got);
+    KT_ASSERT(strncmp(got, c2 + 1, 64) == 0);
+}
+
+/* case 3 -- alice (uid 100) against the VFS: /bin and /etc/shadow are
+ * closed to her, her own /home/alice is not. The uid flip is direct (this
+ * is the boot-time root context) and is restored before any assert can
+ * return, so a failure can never leak uid 100 into the boot task. */
+static void test_perm_boundary(void) {
+    if (!namei("/home/alice")) { kprintf("  (no /home/alice -- skipped)\n"); return; }
+    struct task *cur = current_task();
+    uint16_t s_uid = cur->uid, s_gid = cur->gid;
+    cur->uid = 100; cur->gid = 100;
+    bool bin_denied = vfs_open("/bin/nope", O_WRONLY | O_CREAT) == NULL;
+    bool shadow_denied = vfs_open("/etc/shadow", O_RDONLY) == NULL;
+    struct file *f = vfs_open("/home/alice/ok.txt", O_WRONLY | O_CREAT | O_TRUNC);
+    bool home_ok = f != NULL;
+    if (home_ok) vfs_close(f);
+    cur->uid = s_uid; cur->gid = s_gid;            /* restore FIRST */
+
+    KT_ASSERT(bin_denied);
+    KT_ASSERT(shadow_denied);
+    KT_ASSERT(home_ok);
+    KT_ASSERT(vfs_unlink("/home/alice/ok.txt") == 0);
+}
+
+static const struct ktest_case uid_cases[] = {
+    { "setuid_boundary",  test_setuid_boundary },
+    { "shadow_roundtrip", test_shadow_roundtrip },
+    { "perm_boundary",    test_perm_boundary },
+};
+
+int ktest_run_uid(void) {
+    run_cases("uid", uid_cases, sizeof(uid_cases) / sizeof(uid_cases[0]));
+    return failed;
+}
+
+/* ---------------- v1.0.0: osh scripting plumbing ---------------- */
+
+/* the dup2 carrier: a fresh task proves pipe+fork+dup2 wiring, dup2's edge
+ * semantics (invalid oldfd, same-fd no-op, high newfd) and file redirect --
+ * the exact moves osh's pipelines and redirections make on every command */
+static void test_dup2_osh(void) {
+    const char *argv[1] = { "iotest" };
+    struct task *t = task_spawn_argv("/bin/iotest", argv, 1);
+    KT_ASSERT(t != NULL);
+    reap_expect(t, 0);
+}
+
+/* the scripting toolkit shipped in the image: the shell itself, its
+ * pipeline partners, the user-space init and the /etc files it reads */
+static void test_scripting_toolkit(void) {
+    if (!fat32_mounted()) {
+        kprintf("  (no FAT32 root -- skipped)\n");
+        return;
+    }
+    KT_ASSERT(namei("/bin/osh") != NULL);
+    KT_ASSERT(namei("/bin/echo") != NULL);
+    KT_ASSERT(namei("/bin/grep") != NULL);
+    KT_ASSERT(namei("/bin/init") != NULL);
+    KT_ASSERT(namei("/etc/init") != NULL);
+    KT_ASSERT(namei("/etc/motd") != NULL);
+}
+
+static const struct ktest_case shell_cases[] = {
+    { "dup2_osh",          test_dup2_osh },
+    { "scripting_toolkit", test_scripting_toolkit },
+};
+
+int ktest_run_shell(void) {
+    run_cases("osh", shell_cases, sizeof(shell_cases) / sizeof(shell_cases[0]));
     return failed;
 }

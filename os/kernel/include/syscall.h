@@ -31,6 +31,27 @@
 /* v0.6.0 */
 #define SYS_MMAP        25      /* rdi = length -> va (anonymous, kernel-picked) */
 #define SYS_MUNMAP      26      /* rdi = va, rsi = length */
+/* v0.9.0 -- users & login */
+#define SYS_GETUID      27      /* -> uid */
+#define SYS_SETUID      28      /* rdi = uid (caller must be root) */
+#define SYS_GETGID      29      /* -> gid */
+#define SYS_SETGID      30      /* rdi = gid (caller must be root) */
+#define SYS_CHDIR       31      /* rdi = path (dir must grant X) */
+#define SYS_GETCWD      32      /* rdi = buf, rsi = len -> strlen */
+#define SYS_IOCTL       33      /* rdi = fd(0-2), rsi = req, rdx = u16* flags */
+#define SYS_POWEROFF    34      /* isa-debug-exit(0) */
+#define SYS_MKDIR       35      /* rdi = path (parent must grant W) */
+#define SYS_CHOWN       36      /* rdi = path, rsi = uid, rdx = gid (root only) */
+#define SYS_GETRUID     37      /* -> real uid (survives SUID exec) */
+/* v0.9.0: SYS_EXEC grows args -- rsi = char** argv, rdx = argc
+ * (both 0 = "no arguments", argv[0] defaults to the path) */
+/* v1.0.0 -- osh scripting plumbing */
+#define SYS_DUP2        38      /* rdi = oldfd, rsi = newfd -> newfd */
+
+/* ioctl requests (TCGETS/TCSETS subset; flags word: bit 0x8 = ECHO) */
+#define TCGETS 0
+#define TCSETS 1
+#define TC_ECHO 0x0008
 
 void syscall_dispatch(struct pt_regs *r);
 

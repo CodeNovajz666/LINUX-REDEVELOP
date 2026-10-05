@@ -26,6 +26,21 @@
 #define SYS_SIGPROCMASK 24
 #define SYS_MMAP        25
 #define SYS_MUNMAP      26
+/* v0.9.0 -- users & login */
+#define SYS_GETUID      27
+#define SYS_SETUID      28
+#define SYS_GETGID      29
+#define SYS_SETGID      30
+#define SYS_CHDIR       31
+#define SYS_GETCWD      32
+#define SYS_IOCTL       33
+#define SYS_POWEROFF    34
+#define SYS_MKDIR       35
+#define SYS_CHOWN       36
+#define SYS_GETRUID     37
+#define SYS_DUP2        38
+#define TCGETS          0
+#define TCSETS          1
 
 /* pipe read/write "blocking, retry" marker (see kernel fs/pipe.c) */
 #define EAGAIN_RETRY (-2L)
@@ -45,6 +60,7 @@ static inline long _sys3(long nr, long a, long b, long c) {
 }
 
 int uwrite(const char *buf, int len) { return (int)_sys3(SYS_WRITE, 1, (long)buf, len); }
+void uputs(const char *s) { uwrite(s, (int)ustrlen(s)); }
 int ugetpid(void) { return (int)_sys3(SYS_GETPID, 0, 0, 0); }
 int uyield(void) { return (int)_sys3(SYS_YIELD, 0, 0, 0); }
 int usleep(int ms) { return (int)_sys3(SYS_SLEEP, ms, 0, 0); }
@@ -173,6 +189,7 @@ int ufreepages(void) { return (int)_sys3(SYS_FREEPAGES, 0, 0, 0); }
 
 int uopen(const char *path, int flags) { return (int)_sys3(SYS_OPEN, (long)path, flags, 0); }
 int uclose(int fd) { return (int)_sys3(SYS_CLOSE, fd, 0, 0); }
+int udup2(int oldfd, int newfd) { return (int)_sys3(SYS_DUP2, oldfd, newfd, 0); }
 int ulseek(int fd, int off, int whence) { return (int)_sys3(SYS_LSEEK, fd, off, whence); }
 int ustat(const char *path, struct ustat *st) { return (int)_sys3(SYS_STAT, (long)path, (long)st, 0); }
 
@@ -183,6 +200,131 @@ void *ummap(unsigned long len) {
 
 int umunmap(void *va, unsigned long len) {
     return (int)_sys3(SYS_MUNMAP, (long)va, (long)len, 0);
+}
+
+/* ---- users & login (v0.9.0) ---- */
+
+int ugetuid(void) { return (int)_sys3(SYS_GETUID, 0, 0, 0); }
+int ugetruid(void) { return (int)_sys3(SYS_GETRUID, 0, 0, 0); }
+int ugetgid(void) { return (int)_sys3(SYS_GETGID, 0, 0, 0); }
+int usetuid(int uid) { return (int)_sys3(SYS_SETUID, uid, 0, 0); }
+int usetgid(int gid) { return (int)_sys3(SYS_SETGID, gid, 0, 0); }
+int uchdir(const char *path) { return (int)_sys3(SYS_CHDIR, (long)path, 0, 0); }
+int ugetcwd(char *buf, int len) { return (int)_sys3(SYS_GETCWD, (long)buf, len, 0); }
+int umkdir(const char *path) { return (int)_sys3(SYS_MKDIR, (long)path, 0, 0); }
+int uchown(const char *path, int uid, int gid) {
+    return (int)_sys3(SYS_CHOWN, (long)path, uid, gid);
+}
+unsigned long uuptime(void) { return (unsigned long)_sys3(SYS_UPTIME, 0, 0, 0); }
+void upoweroff(void) {
+    _sys3(SYS_POWEROFF, 0, 0, 0);
+    for (;;) __asm__ volatile("hlt");
+}
+
+/* terminal echo: TCGETS/TCSETS on fd 0. login turns echo off before the
+ * password and back on after; the kernel's console device honors the bit
+ * on its read path, so typed characters come back (or don't) automatically. */
+int uecho_set(int on) {
+    unsigned short fl = 0;
+    if (_sys3(SYS_IOCTL, 0, TCGETS, (long)&fl) != 0) return -1;
+    if (on) fl |= U_TC_ECHO;
+    else fl &= (unsigned short)~U_TC_ECHO;
+    return (int)_sys3(SYS_IOCTL, 0, TCSETS, (long)&fl);
+}
+
+int uspawn_argv(const char *name, const char *const argv[], int argc) {
+    return (int)_sys3(SYS_SPAWN, (long)name, (long)argv, argc);
+}
+int uexec_argv(const char *path, const char *const argv[], int argc) {
+    return (int)_sys3(SYS_EXEC, (long)path, (long)argv, argc);
+}
+
+/* read one line from fd 0. The console device echoes printables and \n
+ * itself while the echo flag is on (see dev_console_read); backspace
+ * editing is the reader's job, hence the explicit "\b \b" here. Returns
+ * the line length without the newline; the buffer is NUL-terminated. */
+int ureadline(char *buf, int max) {
+    int n = 0;
+    for (;;) {
+        char c;
+        if (uread(0, &c, 1) != 1) continue;
+        if (c == '\n') break;
+        if (c == '\b' || c == 0x7f) {
+            if (n > 0) {
+                n--;
+                uwrite("\b \b", 3);
+            }
+            continue;
+        }
+        if (c >= 32 && c < 127 && n < max - 1)
+            buf[n++] = c;
+    }
+    buf[n] = 0;
+    return n;
+}
+
+/* ---- freestanding string helpers ---- */
+
+unsigned long ustrlen(const char *s) {
+    unsigned long n = 0;
+    while (s[n]) n++;
+    return n;
+}
+
+int ustrcmp(const char *a, const char *b) {
+    while (*a && *a == *b) { a++; b++; }
+    return (int)(unsigned char)*a - (int)(unsigned char)*b;
+}
+
+int ustrncmp(const char *a, const char *b, unsigned long n) {
+    for (; n; n--, a++, b++) {
+        if (*a != *b) return (int)(unsigned char)*a - (int)(unsigned char)*b;
+        if (!*a) break;
+    }
+    return 0;
+}
+
+char *ustrcpy(char *dst, const char *src) {
+    char *d = dst;
+    while ((*d++ = *src++) != 0) ;
+    return dst;
+}
+
+char *ustrncpy(char *dst, const char *src, unsigned long n) {
+    unsigned long i = 0;
+    for (; i < n && src[i]; i++) dst[i] = src[i];
+    for (; i < n; i++) dst[i] = 0;
+    return dst;
+}
+
+char *ustrchr(const char *s, int c) {
+    for (; *s; s++)
+        if (*s == (char)c) return (char *)s;
+    return c == 0 ? (char *)s : (char *)0;
+}
+
+char *ustrstr(const char *hay, const char *needle) {
+    if (!*needle) return (char *)hay;
+    for (; *hay; hay++) {
+        const char *h = hay, *nd = needle;
+        while (*h == *nd && *nd) { h++; nd++; }
+        if (!*nd) return (char *)hay;
+        if (!*h) break;
+    }
+    return (char *)0;
+}
+
+void *umemcpy(void *dst, const void *src, unsigned long n) {
+    char *d = dst;
+    const char *s = src;
+    while (n--) *d++ = *s++;
+    return dst;
+}
+
+void *umemset(void *dst, int c, unsigned long n) {
+    char *d = dst;
+    while (n--) *d++ = (char)c;
+    return dst;
 }
 
 static void print_uint(unsigned long v, unsigned base, int width, char pad) {

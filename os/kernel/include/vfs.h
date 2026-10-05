@@ -28,12 +28,33 @@
 #define SEEK_CUR 1
 #define SEEK_END 2
 
-/* inode mode: type bits. Permission bits are stored too but only become
- * meaningful when the uid model lands (0.7.0). */
+/* inode mode: type bits in the high nibble, Unix permission bits in the
+ * low 12 -- meaningful since v0.9.0, when uid/gid entered the task and
+ * vfs_permitted() started enforcing them (root bypasses everything). */
 #define S_IFMT  0xF000
 #define S_IFCHR 0x2000
 #define S_IFDIR 0x4000
 #define S_IFREG 0x8000
+#define S_IFBLK 0x6000
+
+#define S_ISUID 0x0800
+#define S_IRUSR 0x0100
+#define S_IWUSR 0x0080
+#define S_IXUSR 0x0040
+#define S_IRGRP 0x0020
+#define S_IWGRP 0x0010
+#define S_IXGRP 0x0008
+#define S_IROTH 0x0004
+#define S_IWOTH 0x0002
+#define S_IXOTH 0x0001
+#define S_IRWXU 0x0700
+#define S_IRWXG 0x0038
+#define S_IRWXO 0x0007
+
+/* the access class bits vfs_permitted() asks about */
+#define VFS_PERM_R 0x04
+#define VFS_PERM_W 0x02
+#define VFS_PERM_X 0x01
 
 struct stat {
     uint32_t st_ino;
@@ -63,7 +84,9 @@ struct inode_operations {
 
 struct inode {
     uint32_t ino;
-    uint16_t mode;                          /* S_IF* */
+    uint16_t mode;                          /* S_IF* | perm bits */
+    uint16_t uid;                           /* v0.9.0: owning user */
+    uint16_t gid;                           /* v0.9.0: owning group */
     uint32_t size;
     void *i_priv;                           /* filesystem-private data */
     struct inode *i_parent;                 /* tree filesystems: ".." (root -> itself) */
@@ -82,15 +105,33 @@ struct file {
 void vfs_set_root(struct inode *root);
 struct inode *vfs_get_root(void);
 
+/* ---- mount points (v0.8.0) ----
+ * A mount hides a name in its parent directory behind another filesystem's
+ * root: lookups for that name return the mounted root instead of whatever
+ * the parent itself contains. ".." from the mounted root climbs to the
+ * parent (set at mount time). Up to 8 mounts, done once at boot. */
+int vfs_mount(struct inode *parent, const char *name, struct inode *fs_root);
+int vfs_unmount(struct inode *parent, const char *name);
+/* enumerate the mounts attached to a directory (for readdir merging) */
+int vfs_mount_count(struct inode *dir);
+const char *vfs_mount_name_at(struct inode *dir, int idx);
+
 /* ---- path resolution (fs/namei.c) ---- */
 struct inode *namei(const char *path);
 /* resolve all but the last component; returns parent dir inode and copies
  * the final component into last[]. NULL if the parent path does not resolve
  * to a directory. */
 struct inode *namei_parent(const char *path, char *last, size_t last_max);
+/* v0.9.0: lexical canonicalisation of `path` against `base` (exact here:
+ * no symlinks); out receives an absolute path. -1 if it cannot fit. */
+int vfs_canonicalize(const char *base, const char *path,
+                     char *out, size_t out_max);
 
 /* ---- vfs interface (fs/vfs.c) ---- */
 struct file *vfs_open(const char *path, uint16_t flags);
+/* v0.9.0: Unix permission check (owner/group/world bits, uid 0 bypasses);
+ * `want` is a mask of VFS_PERM_{R,W,X} that must all be granted */
+int vfs_permitted(const struct inode *ino, uint16_t want);
 int vfs_read(struct file *f, void *buf, uint32_t len);
 int vfs_write(struct file *f, const void *buf, uint32_t len);
 int vfs_close(struct file *f);

@@ -3,7 +3,7 @@
 
 #include "vfs.h"
 
-/* registers /dev/console as a character device on the ramfs tree */
+/* create /dev and mknod every live device from the driver registry */
 void devfs_init(void);
 
 #endif /* DEVFS_H */

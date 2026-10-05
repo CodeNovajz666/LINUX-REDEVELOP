@@ -105,9 +105,23 @@ v0.3.0 移植定基，v0.5.0 随 sbrk 固化，v0.6.0 mmap 区启用。**写死�
 | 24 | sigprocmask | how, set*, oldset* | 0 |
 | 25 | mmap | length | 起始 va（内核选址，匿名清零页） |
 | 26 | munmap | va, length | 0（仅接受整段映射） |
+| 27 | getuid | — | uid |
+| 28 | setuid | uid | 0（仅 root 可任意设；凡人只许设回自己） |
+| 29 | getgid | — | gid |
+| 30 | setgid | gid | 0（仅 root） |
+| 31 | chdir | path | 0（目录须授 X） |
+| 32 | getcwd | buf*, len | 路径长度 |
+| 33 | ioctl | fd(0-2), req, u16* | 0（TCGETS/TCSETS：echo 位） |
+| 34 | poweroff | — | 不返回（isa-debug-exit） |
+| 35 | mkdir | path | 0（父目录须授 W） |
+| 36 | chown | path, uid, gid | 0（仅 root；只改 inode 缓存） |
+| 37 | getruid | — | ruid（SUID exec 后仍记调用者） |
 
 约定：错误统一 −1（sign-extend）；pipe 的"请稍后重试"是 −2
 （`EAGAIN_RETRY`，仅 pipe 返回，ulib 包装成阻塞语义）。
+v0.9.0：SYS_SPAWN/SYS_EXEC 扩参——rsi = char\*\* argv、
+rdx = argc，ELF 加载器把 argv 数组压上用户栈（`main(argc, argv)`）；
+exec 同名不换 uid/gid/cwd（POSIX），SUID 例外见 §6.2。
 
 ## 4. 版本测试账目
 
@@ -119,23 +133,30 @@ v0.3.0 移植定基，v0.5.0 随 sbrk 固化，v0.6.0 mmap 区启用。**写死�
 | v0.5.0 | 27 | 32 |
 | v0.6.0 | 30 | 42 |
 | v0.7.0 | 34（smp=2 与 smp=1 双跑） | 45（会话跑在 2 CPU） |
+| v0.8.0 | 38（gate H 磁盘套件，smp=2/1 双跑） | 50（FAT 根上的持久化检查） |
+| v0.9.0 | 41（gate I uid 套件，smp=2/1 双跑） | 66（50 内核 shell + 13 登录/passwd 回环 + 3 断电密码存续） |
 
 `python build.py test`（自测）与 `python tools/test_shell.py`
 （串口自动化）双双全绿是收版的硬门槛；页账目零回退由 gate C/D/E
 门禁保证，v0.6.0 起页与 swap 槽位零泄漏另由 gate F 把关，v0.7.0
-起 SMP 套件由 gate G 把关（断言随在线核数自适应，`-smp 1` 亦全绿）。
+起 SMP 套件由 gate G 把关（断言随在线核数自适应，`-smp 1` 亦全绿），
+v0.8.0 起磁盘套件由 gate H 把关（FAT 根读写往返 + 独立实例重挂的
+断电语义），v0.9.0 起身份套件由 gate I 把关（setuid 边界漫步 +
+shadow 哈希往返 + alice 三向权限）。shell 测试自 v0.9.0 起为
+三会话：console=debug 内核 shell 全量回归、登录链冒烟（含 passwd
+改密回环）、断电后新密码存续（shadow 在 FAT 盘上）。
 
 ## 5. SMP 契约（v0.7.0 定基）
 
 单核时代"关中断即互斥"的全部隐含假设已失效。以下不变量是
-0.8.0（磁盘/RTC 中断）及以后所有驱动代码的安全前提。
+0.8.0（磁盘/RTC 驱动）及以后所有驱动代码的安全前提。
 
 ### 5.1 中断向量布局（`smp.h`）
 
 | 向量 | 用途 | 备注 |
 |------|------|------|
 | 0x00-0x1F | CPU 异常 | 不变 |
-| 0x20-0x2F | 传统 ISA IRQ（IOAPIC 投递，BSP） | 0.8.0 新 IRQ 从此区续排 |
+| 0x20-0x2F | 传统 ISA IRQ（IOAPIC 投递，BSP） | 后续新 IRQ（如 ATA 中断模式）从此区续排 |
 | 0x30 | LAPIC timer | **每核各自**的 tick 与本地抢占 |
 | 0x50 | IPI: RESCHED | 唤醒/偷闲提示，接收方只置 need_resched |
 | 0x51 | IPI: TLB shootdown | 对端按 CR3 匹配后 invlpg |
@@ -165,6 +186,9 @@ sched_lock  >  fs_lock / pipe locks  >  pmm_lock / heap_lock  >  console_lock
 
 - 只许按此序获取、反序释放；pmm/heap/console 是叶子锁，持有
   它们时不得再取任何锁。
+- v0.8.0 新增叶子上同此规：`ata_lock`（ATA 通道寄存器组是共享
+  状态，整命令串行）、FAT32 per-instance 锁——设备 fops 只拿
+  自己的硬件锁，持锁时不得再取任何高级锁。
 - `spin_lock_irqsave` 是共享数据的默认形态（cli/sti 只护本核；
   持锁中断重入同一把锁是 SMP 经典死锁）。裸 `spin_lock` 只用于
   中断已确定关闭的路径。
@@ -192,3 +216,75 @@ sched_lock  >  fs_lock / pipe locks  >  pmm_lock / heap_lock  >  console_lock
   ——在此之前读 `this_cpu()` 的任何代码（含异常路径）都不可靠。
 - 调度器上下文就绪前（AP 门前停泊期）不得接收 timer tick/
   IPI 驱动的 schedule()：LAPIC timer 保持屏蔽直到收养 idle。
+
+## 6. 权限与登录契约（v0.9.0 定基）
+
+"你是谁"从此有唯一权威来源：`task->uid/gid/ruid`。以下不变量是
+1.x（PAM、多用户会话、网络登录）及所有新系统调用的安全前提。
+
+### 6.1 身份继承规则
+
+- fork：uid/gid/ruid 三者全继承。
+- exec：三者全保持（POSIX）——SUID 例外见 6.2。
+- spawn：继承调用者（`task_fill`）；内核线程上下文一律 uid 0。
+- `setuid`：root 可任意设且 **ruid 同动**（登录式降落，登录
+  shell 里 `id` 不显示多余 ruid）；凡人只许设回自己当前的 uid。
+- boot 任务（gate/ktest/fixup）恒 uid 0；权限测试在 boot 任务上
+  直接翻 `cur->uid` 时，必须**先恢复后断言**，KT_ASSERT 提前
+  return 也不许泄漏 uid 100。
+
+### 6.2 SUID 语义（教学简化：单 uid，无 euid 拆分）
+
+- 二进制带 S_ISUID 且属主 ≠ 调用者 uid → 任务 uid 改采文件属主，
+  ruid 留作调用者记录（`id` 据此加显 ruid）。
+- **两个入口都要应用**：`task_exec`（exec 链，getty→login）与
+  `task_create_user`（spawn 链，sh 启动 /bin/passwd）——漏掉
+  spawn 侧，凡人从 shell 里跑 passwd 就是自己 uid，永远写不了
+  /etc/shadow（v0.9.0 实测抓出的坑）。
+- 系统里唯一的 SUID 二进制是 `/bin/passwd`（fs_perm_fixup 授位）。
+  新增 SUID 程序必须论证必要性。
+
+### 6.3 权限判定（`vfs_permitted`，唯一权威）
+
+- uid 0 全通过（root 旁路）。
+- 否则 owner/group/world 三选一：文件属主命中读 owner 位段，
+  否则 gid 命中读 group 位段，否则 world——**不叠加**（owner
+  胜 group 胜 world，POSIX）。
+- 检查点全集（新增 VFS 入口必须对照此清单）：
+  - open：按 O_ACCMODE 查 R/W（O_CREAT 另查父目录 W；
+    O_TRUNC/O_APPEND 按 W）；
+  - read/write：复用 open 时的 fd 模式（Unix 语义，事后改
+    inode 位不影响已开 fd）；
+  - unlink/mkdir：父目录 W；
+  - spawn/exec：目标文件 X。
+- 新建文件属主 = 创建者 uid/gid（无任务上下文时为 root）。
+
+### 6.4 FAT32 权限补正（`fs_perm_fixup`，boot 期一次性）
+
+- FAT 不存 Unix 位；inode 缓存的 0644/0755 默认在 root 挂载后
+  按以下规则补正（**只改缓存，不落盘，每次 boot 重放**）：
+  - `/bin` 全部 +x；`/bin/passwd` 另加 S_ISUID；
+  - `/etc/shadow` 收 0600（凡人不可读的唯一文件）；
+  - `/etc/passwd`、`/etc/issue`、`/etc/inittab` 显式 0644；
+  - `/home/<name>` 按 /etc/passwd 对应行的 uid/gid chown。
+- 运行期 `chown`(36)/`useradd` 改的同样只活 in 缓存——重启
+  归零，documented teaching scope。
+- 教训：解析 passwd 七字段（name:x:uid:gid:comment:home:shell）
+  时 home 是**第 6 列**（下标 5）；错取 comment 列会让全部家
+  目录归 root，perm_boundary 抓出。
+
+### 6.5 登录链不变量
+
+- 链是**同 pid 换程序**：init →(spawn) getty →(exec) login
+  →(exec) sh；logout 时整链归零，init waitpid 收尸后 respawn
+  （SysV 规则）。任何环节失败都回到 getty 提示符。
+- `login` 失败语义：错误用户名与错误密码同报 "Login incorrect"
+  （不泄露账户存在性）；3 次失败 3 秒刹车后 getty 重来。
+- 密码哈希：salted SHA-256（salt 8 字符 + hex 摘要），内核/
+  ulib/构建期工具三份同算法（shadow_roundtrip 逐字节对账）；
+  **无慢因子**——离线爆破理论可行，1.x 换 PBKDF2，注释与
+  ROADMAP 均已标注。
+- 回显开关走 ioctl(TCSETS)，仅 fd 0-2 有效；login/passwd 读
+  密码前关、读完开（login 崩溃路径也要保证——它是 exec 走的，
+  进程死了 getty 重来，echo 由 console 设备按任务旗标维护，
+  新任务默认开）。

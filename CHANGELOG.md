@@ -3,6 +3,288 @@
 版本号约定见 ROADMAP.md：次版本号递增 = 交付一个完整子系统；
 修订号递增 = 稳定性/小改进。
 
+## v1.0.0 —— 里程碑：脚本化 shell、用户态 init 与 ISO（2026-10）
+
+README 里那句 "a real OS" 的完整兑现：osh（管道/重定向/后台/变量）、
+用户态 init 读 /etc/init、/etc/motd、grub ISO 目标、文档四件套。
+
+**新增**
+- osh（`user/osh.c`，替代 v0.9.0 的 sh）：基于 0.2-0.9 全部系统
+  调用的脚本化 shell——管道 `|`（fork+exec+dup2 接线）、重定向
+  `>` `>>` `<`、后台 `&`（jobs/wait 作业表，exit 前 kill+reap 防
+  僵尸泄漏）、变量 `NAME=value` 与 `$VAR`/`${VAR}`/`$?`/`$pid`、
+  `#` 注释。明确教学边界：无引号/转义、变量不导出给子进程、
+  无 Ctrl-C 到前台作业的路由
+- DUP2（38 号系统调用 + ulib `udup2`）：新 fd 并入调用者的打开
+  文件描述（共享偏移，同 fork 继承），目标 fd 隐式 close——osh 的
+  管道/重定向全靠它。ktest 新增 osh 套件（gate J，41→43）：
+  dup2_osh（iotest 载体证明管道接线/边界语义/文件重定向）+
+  scripting_toolkit（/bin/osh echo grep init 与 /etc/init motd 在镜像）
+- 用户态 init（`user/init.c`）：内核 pid 1 监督 /bin/init；init 读
+  /etc/init 逐行执行——一次性行顺序跑，首个 `respawn` 行监督到底
+  （SysV respawn 规则，logout 即回登录屏）；无 /etc/init 时回退
+  v0.9.0 的 /etc/inittab 契约；换班间隙尽力收养孤儿
+- /etc/motd：login 成功后、降权之后打印（像真 login(1)）；
+  /etc/init 与 /etc/motd 烤进镜像（mkfatimg）
+- 新命令：echo（-n 支持）、grep（子串匹配，stdin/文件/`-`，
+  exit 0/1/2）——验收线 `cat /etc/motd | grep Novix > /tmp/x`
+  全链路可用
+- ISO：`build.py iso` 用 grub-mkrescue 生成 novix.iso（multiboot1
+  菜单，grub.cfg 入库）；宿主缺 grub-pc-bin/xorriso 时如实报因
+  跳过——QEMU `-kernel` 仍是受测路径
+- 文档四件套：`docs/syscall.md`（38 项编号表，tools/check_syscalls.py
+  随构建比对头文件——ROADMAP 验收 #4）、`docs/driver-writer-guide.md`、
+  `docs/DESIGN.en.md`（英文版设计文档，与中文版并列）
+
+**修复**
+- `elf_load` argv 压栈 8 字节错位（v0.9.0 埋雷，osh 首次踩中）：
+  `arr_beg ≡ 0 (mod 16)` 时 16 字节对齐在 rsp 与 argv 数组之间
+  留出 8 字节空洞——exec 出的程序读到 argv[0]=(null)、
+  argv[1]=arr[0]。是否踩中由参数长度组合决定（"-sh"、"magic42"
+  幸运通过；`cat /tmp/pv2.txt` 必炸：argv[1] 变成 "cat"）。修复后
+  数组位置钉死在 argc_off+8，与 [rsp]/[rsp+8] 严格成对
+- /tmp 补 0777（Unix 惯例）：v0.9.0 的 ramfs /tmp 是 root 0755，
+  凡人重定向全部 `cannot open`
+- osh 首版三处（自测抓出）：2 字符词被 '>>' 分支误吞（`id` 直接
+  syntax error）；tokenizer 只记 (指针,长度) 未 NUL 落地导致
+  argv[0] 吞整行——改为词槽 arena 规范化；作业表满时旧实现漏杀
+  中间阶段进程
+
+**测试**
+- 内核自测 43/43（-smp 2 与 -smp 1 双跑），shell 自动化 71/71
+  （50 内核 shell + 18 登录/脚本化/改密 + 3 断电存续）；门禁
+  C-J 全绿；check_syscalls 38/38 对齐
+
+**诚实边界**（教学取舍，1.x 再还）
+- ISO 目标在缺 grub 工具链的宿主上跳过（本仓库 Windows 工具链
+  不含 grub-pc-bin/xorriso），真机引导清单留 1.x
+- osh 无引号/转义、变量不导出、无 Ctrl-C 到前台作业；/tmp 无
+  sticky 位；/etc/init 只支持一个 respawn 服务
+- v0.9.0 的边界（SHA-256 无慢因子、FAT 权限位重启重建、单 tty、
+  logout 不清 utmp）原样继承
+
+## v0.9.0 —— 用户与登录（2026-10）
+
+开机不再直接给 shell：init 读 /etc/inittab 拉起 getty，getty→login→sh
+一条进程链完成"你是谁"的证明，uid/gid 从 PCB 一路贯穿到 VFS 权限位。
+
+**新增**
+- 身份层（`task.h/c`）：`task->uid/gid/ruid`（uint16_t）；fork 继承、
+  exec 保持（POSIX 语义）、spawn 默认继承调用者。ruid 与 uid 分工：
+  root 的 setuid 是登录式降落（两者同动，登录 shell 里 `id` 不显示
+  多余 ruid）；SUID exec 时 ruid 继续记录"是谁调用的"
+- 系统调用 +11（`syscall.h` 27-37 号）：GETUID/SETUID/GETGID/
+  SETGID/GETRUID、CHDIR/GETCWD（目录 X 位检查，per-task cwd）、
+  IOCTL（TCGETS/TCSETS，fd 0-2 的 echo 位——login 读密码前关回显）、
+  MKDIR（父目录 W 检查）、CHOWN（root only）、POWEROFF；
+  SYS_SPAWN/SYS_EXEC 扩参 argv/argc——ELF 加载器把 argv 数组压上
+  用户栈，`main(argc, argv)` 第一次真正可用（getty→login 传用户名、
+  login→sh 传 "-sh" 都靠它）
+- VFS 权限检查（`fs/vfs.c vfs_permitted`）：uid 0 全通过；否则
+  owner/group/world 三选一比对（owner 胜 group 胜 world，POSIX），
+  检查点在 open（含 O_CREAT 的父目录 W、O_TRUNC/APPEND 的 W）、
+  unlink、mkdir；新文件属主=创建者。0.2.0 埋下的 mode 位至此启用
+- FAT32 权限补正（`kmain.c fs_perm_fixup`）：FAT 不存 Unix 位，
+  boot 期对 inode 缓存一次性补正——/bin 全部 +x、/bin/passwd 加
+  S_ISUID、/etc/shadow 收 0600、/home/<name> 按 /etc/passwd 的
+  uid chown。实测坑：passwd 七字段解析时错用 comment 位当 home，
+  家目录全部归了 root，perm_boundary 测试抓出
+- SUID exec（`task.c task_exec`）：二进制带 S_ISUID 且属主非
+  调用者 → uid 改采文件属主，ruid 留作调用者记录。教学简化：
+  单 uid 无 euid 拆分，/bin/passwd 对凡人是"真变 root"而非
+  "有效 root"
+- 登录链三程序（`user/`）：getty（打 /etc/issue、"login: " 读名、
+  **exec** /bin/login <name>——链上每个环节同 pid 换程序，shell
+  退出即整链归零）；login（/etc/shadow 校验 salted SHA-256；错误
+  用户名与错误密码同报 "Login incorrect" 不泄露账户存在性；3 次
+  失败 3 秒刹车；成功 → 写 utmp → setgid/setuid 降落 → chdir(home)
+  → exec(shell, "-sh")）；sh（用户态 shell：cd/logout/help/
+  poweroff 内建 + /bin 程序 spawn+wait，"ktest@novix:/home/ktest$ "
+  式提示符）
+- init 收尸循环（`kmain.c getty_loop`）：读 /etc/inittab
+  （"tty1:getty"，全路径直通），waitpid 收尸后 respawn——SysV
+  respawn 规则，logout 即触发；`console=debug` 启动参数保留内核
+  shell 作调试后门（shell 测试 session 1 即此模式）
+- 密码体系：salted SHA-256 三份同算法——内核 `sha256.c`
+  （shadow_roundtrip 用）、ulib 用户态一份（login/passwd 用）、
+  构建期 `tools/mkpasswd.py`（烤进镜像）；root/alice 密码每次
+  构建随机生成，记录在 build/etc-passwd.txt；ktest 用户固定
+  "ktest-pass"（测试锚点）。**教学取舍**：无慢因子（bcrypt/
+  PBKDF2 留 1.x）
+- 用户命令 8 个：id（uid/gid 带用户名，SUID 下加显 ruid）、
+  whoami、who（读 /var/run/utmp）、passwd（改密；系统唯一 SUID
+  二进制——凡人 exec 后可改自己的密码，改他人密码仍需真 root）、
+  useradd（root 专用，非 SUID：凡人 exec 即拒）、cat
+  （stat-then-open 区分 no such file 与 permission denied）、
+  touch、uidtest
+- ktest uid 套件 +3（38 → 41）+ gate I：setuid_boundary（spawn
+  /bin/uidtest 带 argv "magic42"——argv 传递 + root 降级 uid 100 +
+  凡人 setuid(0) 必拒，一次边界漫步全证明）；shadow_roundtrip
+  （构建期哈希 == 内核 SHA-256，逐字节）；perm_boundary（alice
+  三向：写 /bin 拒、读 shadow 拒、写 /home/alice 成——uid 直接
+  翻在 boot task 上，先恢复后断言，失败不可能泄漏 uid 100）
+- test_shell.py 三会话：session 1 `console=debug` 内核 shell
+  （v0.2-0.8 全量回归 50 项）；session 2 登录冒烟 13 项——错密码
+  "Login incorrect" 后正确密码登录 ktest、id/whoami/who、
+  cat /etc/shadow 被拒、passwd 改密回环（改完旧密码即死）、
+  logout→getty respawn（banner 二次出现）→再登录→poweroff；
+  session 3 断电存续 3 项——fresh boot 后只有新密码能登录
+  （/etc/shadow 在 FAT 盘上活过关机），验证后把 ktest 密码改回
+  "ktest-pass" 保持镜像幂等
+
+**修复**
+- `dir_append_slot` 只认 0x00 结束槽、从不复用 0xE5 删除槽——目录一旦
+  "活项+删除项占满"（如上一轮启动留下的根目录），再建文件就追加新簇
+  且目录永不收缩：fat_roundtrip 的 free-count 不变量在脏盘上必红
+  （实测一次启动净漏 2 簇，40/41），反复建删文件的目录单调膨胀。现按
+  链序取第一个 0xE5/0x00 槽（FAT 惯例；walker 遇 0xE5 即重置 LFN 组，
+  单槽复用拼不进存活 LFN）。连带修掉 `fat_i_create` 的隐含猜测
+  "off==0 且非首簇 ⇒ 刚追加的新簇、可免读盘"——复用后已存在簇的
+  0 号槽也会被选中，盲目 memset 会抹掉同簇其余目录项；改为
+  `dir_append_slot` 显式回传 fresh 标志。修复后同一脏盘连续 7 次启动
+  挂载簇数零漂移
+- init 门禁汇总行硬编码 `GATE-E-OK/FAILED`——门禁只有 C-E 时代的
+  历史遗留（磁盘/uid 套件已是 gate H/I），改为 `GATES-OK/FAILED`
+- `namei_parent` 把末尾的 `.`/`..` 当作待创建的名字交出去——FAT/ramfs
+  的 walker 都跳过真 `.`/`..` 项，查重失效，`mkdir a/.`、`mkdir a/..`
+  会造出第二个点目录项（POSIX 应 EEXIST/EINVAL）。现直接拒绝，
+  路径中段的 `.`/`..` 不受影响
+- 密码长度两端截断不一致：`passwd` 用全长（≤39 字符）哈希，
+  `etc_verify` 却截到 32 字节——设置 33-39 字符的密码后永远验证
+  不过，账户锁死。统一为 `etc.h` 的 `ETC_PW_MAX 40`（8+40 装得进
+  64 字节哈希输入），两端同截
+- `useradd` 不校验用户名：>23 字符的名字在 /etc/passwd 被截成
+  pwent.name 大小而 /etc/shadow 写全名，两表对不上即无法登录；
+  名字带 `:` 直接破坏行格式。现拒收 >23 字符或含 `:` 的名字
+- `fat_i_create` 的 mkdir 错误路径漏簇：目录自身簇分配成功后，若
+  写 "."/".." 或追加父目录槽位失败（盘满等），该簇无人引用也无人
+  归还。现失败且 slot dirent 尚未落盘时 `chain_free` 回收
+- VFS 权限检查补最终父目录的搜索（X）位：create/mkdir/unlink 此前
+  只查 W，路径遍历只 X 检查了祖先目录——POSIX 对父目录要求 W+X，
+  "有 W 无 X"的目录可被穿透创建/删除。`vfs_permitted(parent,
+  W|X)` 三处补齐
+- `etc_shadow_set` 残留的 `replaced` 标志 set 而不用（-Wall 报警），
+  删除；删旧行+追加新行的逻辑不变
+- `elf_load` 成功路径漏写 `*pd_out/*entry_out`——task_create_user
+  拿到 0 页目录，调度器切 CR3 即三重故障（QEMU `-d int,cpu_reset`
+  定位到 mov cr3,0）。此前调用方恰好都不读这两个出参，v0.9.0
+  argv 改造后首次踩中
+- `vfs_canonicalize` 只写 out[1..] 从不落 out[0]——绝对路径首字符
+  是栈上垃圾，namei 必失败，sys_chdir 全链路瘫痪（login 进不了
+  家目录、提示符恒 "/$ "）。补一行 `out[0]='/'`，login shell
+  prompt 检查抓出
+- utmp 双坑：镜像缺 `/var/run` 目录（mkfatimg 补建）+
+  `etc_write_file` 开文件不带 O_CREAT（首写 /var/run/utmp 时
+  文件不存在，open 失败静默丢会话，`who` 恒 "no sessions"）
+- shadow_roundtrip 改锚 shadow-only 账户 `kck`：原校验钉死
+  "ktest-pass"，test_shell session 3 启动时盘上密码已被 session 2
+  改掉，gate E 必红。passwd 只重写目标用户行，kck 的构建期摘要
+  永不被动——契约校验在任何镜像状态都成立
+- hello 每个 tick 200→400ms：ctrl-c 检查的 ^C 落点原在 450ms、
+  总时长 600ms，宿主一慢就擦边（实测 13 个 QEMU 并发时必失败）
+- whoami 检查针 `'\nktest\n'`→`'\nktest\r'`：Windows 宿主 QEMU
+  stdout 文本模式把 guest 的 CRLF 再展开成 0D 0D 0A——内核
+  serial_putc 只发一次 CR，是宿主伪影不是 OS 缺陷；检查针锚定
+  guest 真实发出的 CR 即跨宿主稳定
+- uidtest ruid 断言对齐 POSIX：root setuid(100) 后 ruid 同步为
+  100（登录降落语义），原断言 ruid==0 错误
+
+**测试**
+- 内核自测 41/41（`-smp 2`）+ 41/41（`-smp 1` 单核回归），
+  shell 自动化 66/66（50 内核 shell + 13 登录/passwd 回环 +
+  3 断电密码存续）；gate C-I 全绿（新增 gate I：uid 套件）
+
+**诚实边界**（教学取舍，1.x 再还）
+- SHA-256 无慢因子：离线爆破 /etc/shadow 理论可行；无密码长度/
+  复杂度策略
+- 权限补正只活 in inode 缓存（FAT 不存 Unix 位）：重启重建，
+  运行期 chown/useradd 改的同样不落盘
+- logout 不清 utmp 行（下次登录重写）；无 PAM/会话管理/登录
+  时间戳；单 tty（COM1），VGA 多终端留 1.x
+- 用户 shell 无重定向/管道/脚本/变量（v1.0.0 osh 的范围）
+
+## v0.8.0 —— 磁盘与驱动框架（2026-10）
+
+文件第一次活过断电：ATA 盘上真 FAT32 做根文件系统，驱动统一
+注册成设备出现在 `/dev`，墙钟从 CMOS RTC 起步。
+
+**新增**
+- ATA PIO（`drivers/ata.c`）：主通道 0x1F0-0x1F7 主盘、LBA28、
+  同步轮询（中断模式按计划留 1.x）。探测先"嗅总线"——选中空
+  槽位读回 0xFF 即无盘，再 IDENTIFY 取扇区数；写后 FLUSH CACHE
+  保证数据落盘。`ata_lock` 整命令串行（寄存器组是通道级共享
+  状态，双核交叠命令会互相踩——叶子锁，调用者不得持更高级锁）；
+  MBR 分区表解析（首个分区 LBA 2048 起）
+- FAT32（`fs/fat32.c`）：BPB 解析 + 全 FAT 一次扫描定空闲簇数
+  （FSInfo 只是参考，FAT 本体才是真相）；簇链遍历带 guard 防
+  环。`dir_walk` 单遍扫描器统一 lookup/readdir/create/unlink
+  四路径；**LFN 读**（0x0F 属性组、0x40 序号标记、校验和核对后
+  按 UTF-16 组装）+ **LFN 写**（创建小写名时生成 8.3 别名 +
+  LFN 项）——实测坑：别名恒大写，`needs_lfn` 必须大小写敏感
+  比较，否则小写目录名 readdir 吐出大写别名，`ls /bin` 里
+  hello 变 HELLO；inode 缓存按 (父簇, sname) 键控、lookup 时
+  刷新磁盘现状；per-instance 自旋锁 + 512B 扇区 bounce 缓冲；
+  `fat32_mount`/`fat32_unmount` 实例化/拆除（断电测试的基础）。
+  写路径：簇分配 + FAT 链接 + 目录项追加（目录满则链新簇）、
+  append 后 dirent 尺寸回写（`dirent_update`）、删除打 0xE5
+  标记（含 LFN 区间）+ 簇链归还
+- 统一驱动模型（`drivers/driver.c`）：`device_driver{name, probe,
+  init}` + `device{name, mode, f_op}`；boot 期静态总线遍历
+  probe→init→注册表，`/dev` 经 `ramfs_mknod` 发布——console、
+  null、zero、hd0（`<blk>`，f->pos 计扇区的裸块设备）。注册表
+  boot 期写一次之后只读，无需锁；设备 fops 自带各自的硬件锁
+- RTC（`drivers/rtc.c`）：CMOS 0x70/0x71（索引位 7 顺带屏蔽
+  NMI），经典读法——等 UIP 更新周期过去、整组读回、秒值复读
+  证明稳定；BCD 按 B 寄存器 DM 位解码、12 小时制 PM 位兜底；
+  世纪寄存器不通用，年 = 2000+yy。启动拍下 `boot_time` 快照；
+  `rtc_unix_seconds` 折算 Unix 秒。`date` 命令原样打本地时间
+  （QEMU `-rtc base=localtime`）+ unix 秒 + uptime——无时区
+  机制，诚实标注 local
+- **rootfs 切换**（`kmain.c`）：内核参数 `root=/dev/hd0` 时
+  FAT32 根取代 ramfs 根，ramfs 只留 `/dev`、`/tmp` 两个目录
+  钉在 FAT 根下；无 FAT 卷则诚实回退 ramfs。挂载表（`namei.c`，
+  8 槽）：lookup 时挂载**遮蔽**底层同名项、`..` 从挂载根爬回
+  父目录（`fs_root->i_parent = parent`）、`vfs_unmount` 干净
+  拆除；**readdir 合并挂载点**——`ls /` 先列 dev、tmp 再列
+  FAT 本体（bin、novix.txt），挂载点在其父目录可见，与真 OS
+  一致
+- 构建接线（`build.py` + `tools/mkfatimg.py`）：构建期生成
+  64 MiB FAT32 镜像（MBR + LBA 2048 分区 + LFN 项），打包
+  /bin 全部用户程序与 novix.txt 标记文件；QEMU `-drive
+  if=ide,index=0`、`-rtc base=localtime`、`-append root=/dev/hd0`
+- FILE 页缺页直接从 FAT32 inode 读入——exec/spawn 的按需分页
+  跑在真磁盘上（gate C 的 /bin/hello 已在 FAT 根下）
+- ktest 新增 4 例（34 → 38）+ gate H：dev_registry（注册表与
+  /dev 节点一一对应）/ fat_roundtrip（写读 lseek append
+  mkdir unlink 全往返 + **空闲簇账目精确**：一个文件一簇，
+  删光归还）/ fat_powercycle（**断电语义**：另起一个独立的
+  fat32_mount 实例读同一张盘——RAM 状态骗不过重挂，只有真
+  到达盘片的数据幸存；读完 unmount 即"关机"）/ rtc_wallclock
+  （启动时间合理 + 墙钟在走）
+- shell `date` 命令；shell 自动检查 45 → 50（date 墙钟、
+  novix.txt 标记、cat 标记、`<blk>` 块设备节点、FAT 根上
+  write+read+rm 持久往返）
+
+**测试**
+- 内核自测 38/38（`-smp 2`）+ 38/38（`-smp 1` 单核回归），
+  shell 自动化 50/50；gate C-H 全绿（新增 gate H：disk 套件）
+- fat_powercycle 的独立实例重挂即模拟断电——验收标准"写文件
+  → 重启 → 文件仍在"以更严格的形式成立：不重启就换一个全新
+  内存状态读同一张盘
+
+**修复**
+- 文件类型判断全内核统一改掩码比较 `(mode & S_IFMT) == S_IF*`
+  （ramfs/vfs/namei/task/shell 原为裸位测试 `mode & S_IFDIR`——
+  S_IF* 是类型位段而非独立标志位，可并存叠加，`ls` 把块设备
+  /dev/hd0 误报成 `<dir>`，shell 检查 dev block node 抓出）
+
+**诚实边界**（教学取舍，1.x 再还）
+- 无 fsck/日志：只保证顺序写不撕裂，掉电半写的修复留 1.x
+- ATA 轮询占 CPU（每扇区 200K 次 status 轮询上限），IRQ 模式
+  留 1.x；FAT32 无 rmdir 非空目录、无 truncate 收缩
+- 无页缓存统一层：FAT 文件读写过自己的 bounce 缓冲，与
+  swap/inode 生命周期的整合留 0.9.x
+
 ## v0.7.0 —— SMP 多核（2026-10）
 
 内核从"关中断即安全"的单核假设升级为真多核：AP 真并行执行任务、

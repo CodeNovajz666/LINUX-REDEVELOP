@@ -103,12 +103,21 @@ KERNEL_SOURCES = [
     # v0.7.0: SMP -- per-CPU state, APIC (LAPIC+IOAPIC), MP table,
     # AP trampoline and IPIs
     'percpu.c', 'smp/mp.c', 'smp/apic.c', 'smp/smp.c', 'smp/trampoline.S',
+    # v0.8.0: driver model, ATA PIO, RTC, FAT32 on the boot disk
+    'drivers/driver.c', 'drivers/ata.c', 'drivers/rtc.c', 'fs/fat32.c',
+    # v0.9.0: password hashing for the login world
+    'sha256.c',
 ]
 
 USER_PROGRAMS = ['hello', 'spawner', 'fault_div', 'fault_segv', 'filetest',
                  'forker', 'forkacct', 'execer',
                  'malloctest', 'sigtest', 'masktest', 'pipetest',
-                 'memhog']
+                 'memhog',
+                 # v0.9.0: users & login
+                 'getty', 'login', 'id', 'whoami', 'who',
+                 'passwd', 'useradd', 'cat', 'touch', 'uidtest',
+                 # v1.0.0: osh scripting world (osh replaces sh)
+                 'osh', 'echo', 'grep', 'init', 'iotest']
 
 def run(cmd, **kw):
     printable = ' '.join(str(c) for c in cmd)
@@ -157,10 +166,12 @@ def build_user():
     udir = os.path.join(BUILD, 'user')
     os.makedirs(udir, exist_ok=True)
     user_inc = ['-I' + os.path.join(ROOT, 'user')]
+    # sha256.c is the user twin of kernel/sha256.c; etc.c parses /etc for
+    # the login-world programs (v0.9.0)
     objs = [compile_file(os.path.join(ROOT, 'user', src),
                          os.path.join(udir, src.replace('.', '_') + '.o'),
                          extra_inc=user_inc)
-            for src in ('crt0.S', 'ulib.c')]
+            for src in ('crt0.S', 'ulib.c', 'sha256.c', 'etc.c')]
     binaries = []
     for prog in USER_PROGRAMS:
         po = compile_file(os.path.join(ROOT, 'user', prog + '.c'),
@@ -181,6 +192,14 @@ def build_ramfs_image(binaries):
     out = os.path.join(BUILD, 'ramfs_img.c')
     pairs = ['/bin/%s=%s' % (os.path.basename(b), b) for b in binaries]
     run([sys.executable, os.path.join(ROOT, 'tools', 'mkramfs.py'), out] + pairs)
+    return out
+
+def build_fat_image(binaries):
+    """build the FAT32 boot disk holding /bin (v0.8.0) -- read and written
+    by kernel/fs/fat32.c, so image and driver agree by construction"""
+    out = os.path.join(BUILD, 'novix-hd.img')
+    pairs = ['/bin/%s=%s' % (os.path.basename(b), b) for b in binaries]
+    run([sys.executable, os.path.join(ROOT, 'tools', 'mkfatimg.py'), out] + pairs)
     return out
 
 # ---------- kernel link (multiboot a.out-kludge) ----------
@@ -247,6 +266,7 @@ def build_kernel():
     ramfs_obj = os.path.join(kdir, 'ramfs_img_c.o')
     compile_file(ramfs_c, ramfs_obj)
     objs.append(ramfs_obj)
+    build_fat_image(binaries)               # v0.8.0: the FAT32 boot disk
     archive = build_paging_rs()
     return link_kernel(objs, [archive])
 
@@ -275,21 +295,32 @@ def parse_smp(argv):
 
 def cmd_build(argv=None):
     build_kernel()                    # uniform (argv) command signature
+    # v1.0.0: keep the syscall reference honest (ROADMAP acceptance #4)
+    run([sys.executable, os.path.join(ROOT, 'tools', 'check_syscalls.py')])
 
-def qemu_cmd(smp=2):
+def qemu_cmd(smp=2, append='root=/dev/hd0'):
     # sockets=N: one physical package per CPU. SeaBIOS writes the MP table
     # with one processor entry per package when HTT is on (default topology
     # underreports cores), so a plain "-smp 2" makes mp.c find a single cpu.
-    return [QEMU, '-kernel', os.path.join(BUILD, 'kernel.elf'), '-m', '128M',
-            '-smp', f'{smp},sockets={smp},cores=1,threads=1',
-            '-display', 'none', '-device', 'isa-debug-exit']
+    # v0.8.0: novix-hd.img on IDE primary master (ATA 0x1F0) is the FAT32
+    # root; -rtc base=localtime puts the host's local time in CMOS.
+    img = os.path.join(BUILD, 'novix-hd.img')
+    cmd = [QEMU, '-kernel', os.path.join(BUILD, 'kernel.elf'), '-m', '128M',
+           '-smp', f'{smp},sockets={smp},cores=1,threads=1',
+           '-display', 'none', '-device', 'isa-debug-exit',
+           '-drive', f'file={img},format=raw,if=ide,index=0,media=disk',
+           '-rtc', 'base=localtime']
+    if append:
+        cmd += ['-append', append]
+    return cmd
 
 def cmd_run(argv):
     smp, _ = parse_smp(argv)
     build_kernel()
-    print(f'booting with {smp} cpu(s) (gates C-G run in the init task, '
-          f'then the interactive shell)...')
-    cmd = qemu_cmd(smp) + ['-append', 'interactive', '-serial', 'stdio']
+    print(f'booting with {smp} cpu(s) (gates C-I run in the init task, '
+          f'then getty asks you to log in; the root password was printed '
+          f'above and lives in build/etc-passwd.txt)...')
+    cmd = qemu_cmd(smp, 'root=/dev/hd0 interactive') + ['-serial', 'stdio']
     try:
         rc = subprocess.call(cmd)
     except KeyboardInterrupt:
@@ -320,7 +351,37 @@ def cmd_clean():
     shutil.rmtree(BUILD, ignore_errors=True)
     print('cleaned')
 
+def cmd_iso(rest):
+    """v1.0.0: build novix.iso -- GRUB multiboot1 menu + the ELF kernel.
+
+    Needs grub-mkrescue (grub-pc-bin + xorriso) on the host. Those are NOT
+    part of the bundled Windows toolchain under tools/, so on a host without
+    them this target exits non-zero with that stated reason: QEMU -kernel
+    remains the tested and CI-covered boot path (build.py run / test)."""
+    kernel = os.path.join(BUILD, 'kernel.elf')
+    if not os.path.exists(kernel):
+        sys.exit('iso: kernel.elf missing -- run `python build.py` first')
+    grub = shutil.which('grub-mkrescue') or shutil.which('grub2-mkrescue')
+    if not grub:
+        print('iso: grub-mkrescue not found on this host.')
+        print('iso: install grub-pc-bin + xorriso (not bundled under tools/).')
+        print('iso: ISO target skipped honestly; QEMU -kernel stays the')
+        print('iso: tested boot path (python build.py run / test).')
+        sys.exit(1)
+    isodir = os.path.join(BUILD, 'iso')
+    os.makedirs(os.path.join(isodir, 'boot', 'grub'), exist_ok=True)
+    shutil.copy(kernel, os.path.join(isodir, 'boot', 'kernel.elf'))
+    shutil.copy(os.path.join(ROOT, 'grub.cfg'),
+                os.path.join(isodir, 'boot', 'grub', 'grub.cfg'))
+    out = os.path.join(BUILD, 'novix.iso')
+    run([grub, isodir, '-o', out, '-volid', 'NOVIX', '-quiet'])
+    print(f'iso: {out}')
+    print('iso: boot with `qemu-system-x86_64 -cdrom %s -m 128M`' % out)
+    print('iso: the FAT32 root needs a second disk: add the usual')
+    print('iso: -drive file=build/novix-hd.img,format=raw,if=ide,index=0,media=disk')
+
 if __name__ == '__main__':
     what = sys.argv[1] if len(sys.argv) > 1 else 'build'
     rest = sys.argv[2:]
-    {'build': cmd_build, 'run': cmd_run, 'test': cmd_test, 'clean': cmd_clean}[what](rest)
+    {'build': cmd_build, 'run': cmd_run, 'test': cmd_test,
+     'clean': cmd_clean, 'iso': cmd_iso}[what](rest)

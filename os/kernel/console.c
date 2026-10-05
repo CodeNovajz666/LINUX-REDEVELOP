@@ -24,6 +24,13 @@ static spinlock_t console_lock = SPINLOCK_INIT;
  * it again, and accept interleaved output (better garbled than gone). */
 static volatile bool console_panicking;
 
+/* v0.9.0: tty echo. On by default; the console device read echoes printable
+ * characters and newline while enabled (a one-flag line discipline). */
+static volatile bool console_echo = true;
+
+void console_set_echo(bool on) { console_echo = on; }
+bool console_echo_enabled(void) { return console_echo; }
+
 void console_enter_panic(void) {
     console_panicking = true;
     console_lock.locked = 0;            /* force-release any dead holder */

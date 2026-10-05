@@ -120,6 +120,15 @@ static void task_fill(struct task *t, const char *name, int prio) {
     t->cpu = -1;
     t->on_cpu = -1;
     t->ticks_run = 0;
+    /* v0.9.0: Unix identity + working directory are inherited from the
+     * spawner (kernel-thread spawners run as root, cwd "/") */
+    {
+        struct task *cur = current_task();
+        t->uid = cur ? cur->uid : 0;
+        t->gid = cur ? cur->gid : 0;
+        t->ruid = cur ? cur->ruid : 0;
+        strcpy(t->cwd, cur ? cur->cwd : "/");
+    }
     memset(t->fd, 0, sizeof(t->fd));
     task_open_std_fds(t);                   /* fd 0/1/2 -> /dev/console */
 }
@@ -180,12 +189,13 @@ struct task *task_create_kernel(const char *name, void (*entry)(void *), void *a
     return t;
 }
 
-struct task *task_create_user(const char *name, struct inode *elf_ino) {
+struct task *task_create_user(const char *name, struct inode *elf_ino,
+                               const char *const argv[], int argc) {
     struct mm *mm = mm_create();
     if (!mm) return NULL;
 
     uint64_t pd, entry, uesp, brk;
-    if (elf_load(elf_ino, mm, &pd, &entry, &uesp, &brk) != 0) {
+    if (elf_load(elf_ino, mm, argv, argc, &pd, &entry, &uesp, &brk) != 0) {
         mm_free_vmas(mm);
         return NULL;
     }
@@ -201,6 +211,12 @@ struct task *task_create_user(const char *name, struct inode *elf_ino) {
     }
     memset(t, 0, sizeof(*t));
     task_fill(t, name, 5);
+    /* v0.9.0: same SUID rule as task_exec -- spawn *is* "run this binary",
+     * so a SUID file adopts its owner's uid here too (ruid keeps recording
+     * the invoker; without this, sh's spawn-launched /bin/passwd would run
+     * as the mortal and could never write /etc/shadow) */
+    if ((elf_ino->mode & S_ISUID) && elf_ino->uid != t->uid)
+        t->uid = elf_ino->uid;
     t->pid = (int)(t - tasks);
     {
         struct task *cur = current_task();
@@ -228,10 +244,13 @@ struct task *task_create_user(const char *name, struct inode *elf_ino) {
 }
 
 /* Spawn a user program from a VFS path (e.g. "/bin/hello"): resolve the
- * inode once and hand it to the loader; FILE VMAs page straight from it. */
-struct task *task_spawn_path(const char *path) {
+ * inode once and hand it to the loader; FILE VMAs page straight from it.
+ * v0.9.0: argv rides along onto the fresh stack (argc/argv for main). */
+struct task *task_spawn_argv(const char *path, const char *const argv[], int argc) {
     struct inode *ino = namei(path);
-    if (!ino || !(ino->mode & S_IFREG) || ino->size == 0) return NULL;
+    if (!ino || (ino->mode & S_IFMT) != S_IFREG || ino->size == 0) return NULL;
+    /* v0.9.0: running a binary is X permission on it (root bypasses) */
+    if (!vfs_permitted(ino, VFS_PERM_X)) return NULL;
 
     const char *slash = path;
     for (const char *p = path; *p; p++)
@@ -240,7 +259,11 @@ struct task *task_spawn_path(const char *path) {
     strncpy(name, *slash ? slash : path, TASK_NAME_LEN - 1);
     name[TASK_NAME_LEN - 1] = 0;
 
-    return task_create_user(name, ino);
+    return task_create_user(name, ino, argv, argc);
+}
+
+struct task *task_spawn_path(const char *path) {
+    return task_spawn_argv(path, NULL, 0);       /* argv[0] defaults to the path */
 }
 
 /* ---- fork (v0.4.0): dup_mm + dup_files + copy_thread ----
@@ -287,6 +310,12 @@ struct task *task_fork(struct pt_regs *parent_regs) {
     t->state = TASK_RUNNABLE;
     t->on_cpu = -1;                /* parked from birth (memset skipped task_fill) */
     t->is_user = true;
+    /* v0.9.0: identity and working directory are inherited across fork
+     * (POSIX: the child keeps the parent's uid/gid/cwd) */
+    t->uid = parent->uid;
+    t->gid = parent->gid;
+    t->ruid = parent->ruid;
+    strcpy(t->cwd, parent->cwd);
     t->kstack_base = (uint64_t)(uintptr_t)kmalloc(KSTACK_SIZE);
     if (!t->kstack_base) {
         spin_unlock_irqrestore(&sched_lock, f);
@@ -327,18 +356,28 @@ struct task *task_fork(struct pt_regs *parent_regs) {
  * the old image untouched. On success the old directory is destroyed (its
  * COW-shared frames just drop a ref), CR3 moves, and the *live* interrupt
  * frame is overwritten with a fresh first-frame -- the iretq at the end of
- * the syscall path enters the new program without any scheduler tricks. */
-int task_exec(struct pt_regs *r, const char *path) {
+ * the syscall path enters the new program without any scheduler tricks.
+ *
+ * v0.9.0: argv[] is pushed onto the new stack (main(argc, argv)); identity
+ * and cwd are NOT reset (POSIX exec keeps uid/gid/cwd) -- except when the
+ * binary carries S_ISUID, in which case the caller adopts the file owner's
+ * uid while ruid keeps recording who invoked it. Teaching simplification:
+ * a single uid, no euid split, so /bin/passwd really becomes root rather
+ * than "effectively root". */
+int task_exec(struct pt_regs *r, const char *path,
+              const char *const argv[], int argc) {
     struct task *cur = current_task();
     if (!cur || !cur->is_user) return -1;
 
     struct inode *ino = namei(path);
-    if (!ino || !(ino->mode & S_IFREG) || ino->size == 0) return -1;
+    if (!ino || (ino->mode & S_IFMT) != S_IFREG || ino->size == 0) return -1;
+    /* v0.9.0: executing a binary is X permission on it */
+    if (!vfs_permitted(ino, VFS_PERM_X)) return -1;
 
     struct mm *mm = mm_create();
     if (!mm) return -1;
     uint64_t pd, entry, uesp, brk;
-    if (elf_load(ino, mm, &pd, &entry, &uesp, &brk) != 0) {
+    if (elf_load(ino, mm, argv, argc, &pd, &entry, &uesp, &brk) != 0) {
         mm_free_vmas(mm);
         return -1;                              /* old image still intact */
     }
@@ -356,6 +395,10 @@ int task_exec(struct pt_regs *r, const char *path) {
     cur->sigblocked = 0;
     memset(cur->sighandlers, 0, sizeof(cur->sighandlers));
     cur->sigrestorer = 0;
+
+    /* v0.9.0: setuid binaries adopt their owner's identity (see above) */
+    if ((ino->mode & S_ISUID) && ino->uid != cur->uid)
+        cur->uid = ino->uid;                     /* ruid stays: who invoked us */
 
     /* rename to the new basename */
     const char *slash = path;
@@ -521,7 +564,7 @@ static const char *itoa_dec(int v, char *end) {
 }
 
 void task_dump_table(void) {
-    kprintf("PID   PPID  STATE     PRI  CPU  TICKS  USER  EXIT      NAME\n");
+    kprintf("PID   PPID  STATE     PRI  CPU  UID   TICKS  USER  EXIT      NAME\n");
     for (struct task *t = task_list; t; t = t->next) {
         char exit_buf[12];
         const char *exit_str = "-";
@@ -535,9 +578,9 @@ void task_dump_table(void) {
             *o = '\0';
             exit_str = exit_buf;
         }
-        kprintf("%-5d %-5d %-9s %-3d %-4d %-6u %-5s %-9s %s\n",
+        kprintf("%-5d %-5d %-9s %-3d %-4d %-5u %-6u %-5s %-9s %s\n",
                 t->pid, t->ppid, task_state_name(t->state),
-                t->priority, t->cpu, (unsigned)t->ticks_run,
+                t->priority, t->cpu, t->uid, (unsigned)t->ticks_run,
                 t->is_user ? "yes" : "no", exit_str, t->name);
     }
 }

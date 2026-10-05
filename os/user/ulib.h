@@ -1,6 +1,8 @@
 #ifndef ULIB_H
 #define ULIB_H
 
+#include <stdbool.h>                     /* user land gets bool/true/false */
+
 /* open(2) flags subset -- values match the kernel's vfs.h */
 #define U_O_RDONLY   0x0000
 #define U_O_WRONLY   0x0001
@@ -23,6 +25,7 @@ struct ustat {
 
 int uprintf(const char *fmt, ...);
 int uwrite(const char *buf, int len);
+void uputs(const char *s);
 int ugetpid(void);
 int uyield(void);
 int usleep(int ms);
@@ -67,11 +70,48 @@ int uopen(const char *path, int flags);
 int uread(int fd, void *buf, int len);
 int uwrite_fd(int fd, const void *buf, int len);
 int uclose(int fd);
+int udup2(int oldfd, int newfd);             /* v1.0.0: osh redirection */
 int ulseek(int fd, int off, int whence);
 int ustat(const char *path, struct ustat *st);
 
 /* anonymous mmap (v0.6.0): kernel picks the address, pages fault in zeroed */
 void *ummap(unsigned long len);              /* NULL on failure */
 int umunmap(void *va, unsigned long len);    /* whole mappings only */
+
+/* ---- users & login (v0.9.0) -- numbers match the kernel's syscall.h ---- */
+int ugetuid(void);                           /* effective uid */
+int ugetruid(void);                          /* real uid (survives SUID exec) */
+int ugetgid(void);
+int usetuid(int uid);                        /* root: anyone; mortal: own uid only */
+int usetgid(int gid);
+int uchdir(const char *path);
+int ugetcwd(char *buf, int len);             /* strlen, or -1 */
+int umkdir(const char *path);
+int uchown(const char *path, int uid, int gid);   /* root only */
+unsigned long uuptime(void);                 /* ms since boot (salt entropy) */
+void upoweroff(void) __attribute__((noreturn));
+
+/* terminal echo (TCGETS/TCSETS subset over fd 0-2) */
+#define U_TC_ECHO 0x0008
+int uecho_set(int on);                       /* login: off before the password */
+
+/* argv-capable spawn/exec (v0.9.0 ABI: rsi = argv, rdx = argc) */
+int uspawn_argv(const char *name, const char *const argv[], int argc);
+int uexec_argv(const char *path, const char *const argv[], int argc);
+
+/* read one line from fd 0 (echoed by the console device; handles \b/DEL
+ * editing). Returns the length, buffer NUL-terminated. */
+int ureadline(char *buf, int max);
+
+/* ---- freestanding string helpers (no libc on this side of the fence) ---- */
+unsigned long ustrlen(const char *s);
+int ustrcmp(const char *a, const char *b);
+int ustrncmp(const char *a, const char *b, unsigned long n);
+char *ustrcpy(char *dst, const char *src);
+char *ustrncpy(char *dst, const char *src, unsigned long n);
+char *ustrchr(const char *s, int c);
+char *ustrstr(const char *hay, const char *needle);   /* NULL = absent */
+void *umemcpy(void *dst, const void *src, unsigned long n);
+void *umemset(void *dst, int c, unsigned long n);
 
 #endif /* ULIB_H */

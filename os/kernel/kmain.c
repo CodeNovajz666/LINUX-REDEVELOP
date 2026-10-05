@@ -14,6 +14,10 @@
 #include "keyboard.h"
 #include "ramfs.h"
 #include "devfs.h"
+#include "driver.h"
+#include "ata.h"
+#include "fat32.h"
+#include "rtc.h"
 #include "sched.h"
 #include "task.h"
 #include "ktest.h"
@@ -23,6 +27,7 @@
 #include "lib.h"
 
 bool g_interactive;
+bool g_debug_console;                      /* v0.9.0: console=debug -> kernel shell */
 uint64_t g_ram_top;
 
 extern char boot_stack_top[];      /* boot.S */
@@ -129,9 +134,132 @@ static bool gate_g(void) {
     return true;
 }
 
+/* H (v0.8.0): disk + driver model + RTC. Runs after G with the APs live:
+ * FAT32 lock contention across CPUs is part of the proof. No pmm equality
+ * snapshot -- the mounted FAT32 instance owns a permanent inode cache. */
+static bool gate_h(void) {
+    if (ktest_run_disk() != 0) return false;
+    kprintf("gate H: disk suite green (root on %s)\n",
+            fat32_mounted() ? "FAT32 /dev/hd0" : "ramfs");
+    return true;
+}
+
+/* I (v0.9.0): users, login and permission boundaries. Like H, no pmm
+ * snapshot: the suite touches FAT (shadow read, alice's home) and the
+ * inode cache it grows is permanent by design. */
+static bool gate_i(void) {
+    if (ktest_run_uid() != 0) return false;
+    kprintf("gate I: uid suite green\n");
+    return true;
+}
+
+/* J (v1.0.0): the osh scripting plumbing. iotest walks the new dup2
+ * syscall end to end (pipe+fork wiring, edge semantics, file redirect) --
+ * exactly the moves osh's pipelines make -- and the toolkit check proves
+ * the shell, its pipeline partners and the /etc script files ship in the
+ * image. No pmm snapshot: iotest grows FAT/ramfs state like the other
+ * post-disk suites. */
+static bool gate_j(void) {
+    if (ktest_run_shell() != 0) return false;
+    kprintf("gate J: osh plumbing suite green\n");
+    return true;
+}
+
+/* ---- v0.9.0: boot-time permission fixup ----
+ * FAT32 carries no Unix bits, so the inode cache's 0644/0755 defaults are
+ * corrected once at boot: everything in /bin becomes executable (passwd
+ * additionally gains S_ISUID), /etc/shadow goes root-only, and each
+ * /home/<name> directory is chowned to the uid /etc/passwd lists for that
+ * name. The fixups live in the inode cache only and are re-applied at
+ * every boot -- runtime chowns (useradd) share the same limitation. */
+
+static int parse_dec(const char *s, int len) {
+    int v = 0;
+    for (int i = 0; i < len && s[i] >= '0' && s[i] <= '9'; i++)
+        v = v * 10 + (s[i] - '0');
+    return v;
+}
+
+static void fix_mode(const char *path, uint16_t perm) {
+    struct inode *ino = namei(path);
+    if (ino) ino->mode = (ino->mode & S_IFMT) | perm;
+}
+
+static void fs_perm_fixup(void) {
+    /* /bin: +x for everyone; passwd is the one SUID binary */
+    char name[32], full[48];
+    for (int i = 0; vfs_readdir("/bin", i, name, sizeof(name)) == 0; i++) {
+        strcpy(full, "/bin/");
+        strncpy(full + 5, name, sizeof(full) - 6);
+        full[sizeof(full) - 1] = 0;
+        struct inode *ino = namei(full);
+        if (!ino || (ino->mode & S_IFMT) != S_IFREG) continue;
+        ino->mode |= 0111;
+        if (strcmp(name, "passwd") == 0) ino->mode |= S_ISUID;
+    }
+    fix_mode("/etc/passwd", 0644);
+    fix_mode("/etc/shadow", 0600);         /* the one file mortals may not read */
+    fix_mode("/etc/issue", 0644);
+    fix_mode("/etc/inittab", 0644);
+    fix_mode("/etc/init", 0644);           /* v1.0.0: user init script */
+    fix_mode("/etc/motd", 0644);           /* v1.0.0: post-login banner */
+
+    /* /home/<name> belongs to the uid /etc/passwd announces for <name> */
+    static char buf[2048];
+    struct file *f = vfs_open("/etc/passwd", O_RDONLY);
+    if (!f) return;
+    int n = vfs_read(f, buf, sizeof(buf) - 1);
+    vfs_close(f);
+    if (n <= 0) return;
+    buf[n] = 0;
+    for (char *line = buf; line && *line; ) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = 0;
+        /* name:x:uid:gid:comment:home:shell */
+        char *c[6] = { 0 };
+        char *p = line;
+        for (int i = 0; i < 6 && p; i++) {
+            c[i] = p;
+            char *colon = strchr(p, ':');
+            if (colon) { *colon = 0; p = colon + 1; } else p = NULL;
+        }
+        if (c[0] && c[2] && c[5] && strncmp(c[5], "/home/", 6) == 0) {
+            struct inode *home = namei(c[5]);
+            if (home && (home->mode & S_IFMT) == S_IFDIR) {
+                home->uid = (uint16_t)parse_dec(c[2], (int)strlen(c[2]));
+                home->gid = home->uid;
+            }
+        }
+        line = nl ? nl + 1 : NULL;
+    }
+}
+
+/* ---- v1.0.0: the user-space init ----
+ * pid 1 (this kernel task) supervises /bin/init: the user-space script
+ * executor that runs /etc/init's one-shot lines and then supervises the
+ * respawn service (the tty getty -- same SysV rule as the v0.9.0 loop that
+ * lived here, but scripted and editable on the disk). If /bin/init itself
+ * ever dies, the kernel respawns it, so the machine always comes back to a
+ * login prompt. console=debug still selects the kernel debug shell. */
+static void user_init_supervise(void) {
+    for (;;) {
+        const char *argv[1] = { "init" };
+        struct task *t = task_spawn_argv("/bin/init", argv, 1);
+        if (!t) {
+            kprintf("init: cannot spawn /bin/init -- retrying\n");
+            task_sleep_until(current_task(), timer_ticks() + TICK_HZ);
+            kyield();
+            continue;
+        }
+        task_waitpid(t->pid, 0);           /* reap, then respawn */
+        kprintf("init: /bin/init exited -- respawning\n");
+    }
+}
+
 /* init (pid 1): runs every gate, then either hands the machine to the
- * interactive shell or prints the test summary and exits QEMU. Being
- * pid 1 is what makes "kill 1" hit the shell's own guard. */
+ * login world (getty -> login -> sh), the debug kernel shell (console=debug)
+ * or prints the test summary and exits QEMU. Being pid 1 is what makes
+ * "kill 1" hit the shell's own guard. */
 static void init_main(void *arg) {
     (void)arg;
     bool ok = gate_c() && gate_d() && gate_e() && gate_f();
@@ -140,8 +268,11 @@ static void init_main(void *arg) {
      * gate); now let them join the runqueue and prove SMP under load */
     smp_release();
     ok = gate_g() && ok;
+    ok = gate_h() && ok;
+    ok = gate_i() && ok;
+    ok = gate_j() && ok;
 
-    kprintf("\n%s\n", ok ? "GATE-E-OK" : "GATE-E-FAILED");
+    kprintf("\n%s\n", ok ? "GATES-OK" : "GATES-FAILED");
 
     int failed = ktest_failed_count();
     kprintf("\nKTEST SUMMARY: %d/%d passed, %d failed\n",
@@ -149,7 +280,11 @@ static void init_main(void *arg) {
 
     if (g_interactive) {
         if (!ok) kprintf("boot: WARNING -- gate failed, shell may misbehave\n");
-        shell_run();                           /* never returns */
+        if (g_debug_console) {
+            kprintf("boot: console=debug -> kernel shell\n");
+            shell_run();                       /* never returns */
+        }
+        user_init_supervise();                 /* v1.0.0: /bin/init, never returns */
     }
 
     if (ok) kprintf("NOVIX-BOOT-OK\n");
@@ -173,11 +308,18 @@ void kmain(uint32_t magic, struct multiboot_info *mbi) {
     if (g_ram_top < 0x01000000u)
         panic("need at least 16 MiB, have %llu MiB", (unsigned long long)(g_ram_top >> 20));
 
-    if ((mbi->flags & 0x4) && mbi->cmdline)
+    if ((mbi->flags & 0x4) && mbi->cmdline) {
         g_interactive = strstr((const char *)(uintptr_t)mbi->cmdline, "interactive") != NULL;
+        g_debug_console = strstr((const char *)(uintptr_t)mbi->cmdline, "console=debug") != NULL;
+    }
 
-    kprintf("boot: magic ok, ram top %llu MiB, interactive=%s\n",
-            (unsigned long long)(g_ram_top >> 20), g_interactive ? "yes" : "no");
+    const char *cmdline = (mbi->flags & 0x4) && mbi->cmdline
+        ? (const char *)(uintptr_t)mbi->cmdline : "";
+    bool want_disk_root = strstr(cmdline, "root=/dev/hd0") != NULL;
+
+    kprintf("boot: magic ok, ram top %llu MiB, interactive=%s%s\n",
+            (unsigned long long)(g_ram_top >> 20), g_interactive ? "yes" : "no",
+            g_debug_console ? ", console=debug" : "");
 
     /* v0.7.0: percpu_init wires %gs -> &cpus[0] BEFORE anything touches
      * this_cpu() (gdt_init builds CPU0's private GDT/TSS through it) */
@@ -201,9 +343,52 @@ void kmain(uint32_t magic, struct multiboot_info *mbi) {
     keyboard_init();
 
     paging_init(g_ram_top);
-    ramfs_init();
-    devfs_init();
+    ramfs_init();                       /* ramfs root: the boot fallback */
     ramfs_mount_initrd(ramfs_img, ramfs_img_size);
+
+    /* v0.8.0: the driver bus -- probe the static registry, bring up what is
+     * wired (console/null/zero always, hd0 when a disk answers IDENTIFY) */
+    driver_init();
+    driver_bus_init();
+    devfs_init();                       /* /dev + publish every live device */
+    ramfs_mkdir("/tmp");                /* scratch survives the root switch */
+    ramfs_mkdir("/var");                /* v0.9.0: utmp home, survives too */
+    /* v1.0.0: /tmp is world-writable (Unix convention; no sticky bit yet) --
+     * osh redirections and mortal tests create their scratch here */
+    {
+        struct inode *tmp_ino = namei("/tmp");
+        if (tmp_ino) tmp_ino->mode |= 0777;
+    }
+    ramfs_mkdir("/var/run");
+    rtc_init();
+
+    /* v0.8.0 rootfs switch: FAT32 root over the ramfs root, ramfs /dev, /tmp
+     * and /var pinned under it. Failures fall back to the ramfs root, honestly. */
+    if (want_disk_root) {
+        struct inode *dev_dir = namei("/dev");
+        struct inode *tmp_dir = namei("/tmp");
+        struct inode *var_dir = namei("/var");
+        struct fat32_sb *sb = fat32_mount();
+        struct inode *fat_root = sb ? fat32_root_inode(sb) : NULL;
+        if (sb && fat_root && dev_dir && tmp_dir && var_dir &&
+            vfs_mount(fat_root, "dev", dev_dir) == 0 &&
+            vfs_mount(fat_root, "tmp", tmp_dir) == 0 &&
+            vfs_mount(fat_root, "var", var_dir) == 0) {
+            g_fat_sb = sb;
+            vfs_set_root(fat_root);
+            kprintf("boot: root on FAT32 (/dev/hd0): %u/%u clusters free, "
+                    "%u MiB, ramfs keeps /dev /tmp /var\n",
+                    fat32_free_clusters(sb), fat32_total_clusters(sb),
+                    ata_sector_count() / 2048);
+        } else {
+            kprintf("boot: root=/dev/hd0 but no FAT32 volume -- staying on ramfs\n");
+            if (sb) fat32_unmount(sb);
+        }
+    }
+
+    /* v0.9.0: FAT carries no permission bits -- correct the inode cache
+     * (exec bits, /etc/shadow 0600, /home ownership) before anything runs */
+    fs_perm_fixup();
 
     /* early group with interrupts off: the paging test swaps CR3 */
     if (ktest_run_early() != 0) {
@@ -221,8 +406,8 @@ void kmain(uint32_t magic, struct multiboot_info *mbi) {
 
     __asm__ volatile("sti");
     kprintf("boot: interrupts on (GDT64+TSS64+IDT64, APIC mode, %d cpu(s))\n", ncpu);
-    kprintf("boot: C+Rust kernel up (paging.rs four-level), ramfs mounted, %u free pages\n",
-            pmm_free_pages());
+    kprintf("boot: C+Rust kernel up (paging.rs four-level), root on %s, %u free pages\n",
+            fat32_mounted() ? "FAT32" : "ramfs", pmm_free_pages());
 
     /* kmain *is* the idle task (pid 0): sleep until something happens */
     for (;;) halt();

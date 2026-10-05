@@ -39,8 +39,8 @@
 | 0.5.0 | 信号与用户堆（已完成 2026-09） | M | sbrk+malloc/free（合并式空闲链）、信号三段式（生成/投递/sigreturn 蹦床）+sigprocmask 屏蔽+Ctrl+C SIGINT、管道（ringbuf+EOF/EPIPE）、waitpid WNOHANG；自测 27/27、DESIGN.md 定契约 |
 | 0.6.0 | 按需分页与交换（已完成 2026-09） | L | VMA 地址空间 + 按需分页（内核态缺页同路径解析）+ 交换（PMM 预留槽池 + kswapd 时钟算法）+ 匿名 mmap/munmap + `mem -v`；自测 30/30、shell 42 |
 | 0.7.0 | SMP 多核（已完成 2026-10） | L | MP 拓扑解析、AP 启动蹦床、自旋锁+锁次序、全局就绪队列+on_cpu 任务所有权、LAPIC timer/IPI、TLB shootdown；自测 34/34、shell 45/45 |
-| 0.8.0 | 磁盘与驱动框架 | L | ATA、FAT32、设备模型、RTC |
-| 0.9.0 | 用户与登录 | M | /etc/passwd+shadow、getty/login、uid 权限贯穿 |
+| 0.8.0 | 磁盘与驱动框架（已完成 2026-10） | L | ATA PIO（LBA28+MBR）、FAT32 读写（LFN 读写）、统一设备模型（/dev 注册表）、RTC 墙钟+`date`、`root=/dev/hd0` rootfs 切换（挂载表+遮蔽+readdir 合并）、断电语义测试（独立实例重挂）；自测 38/38、shell 50/50 |
+| 0.9.0 | 用户与登录（已完成 2026-10） | M | uid/gid/ruid 身份层 + 11 系统调用、VFS 权限检查（root 旁路+POSIX 三选一）、FAT32 权限补正、SUID exec、getty→login→sh 登录链（inittab respawn）、salted SHA-256 密码三份同算法、id/whoami/who/passwd/useradd 命令；自测 41/41、shell 66/66 |
 | 1.0.0 | "真实 OS" 里程碑 | M | 裸机引导、sh、init、ISO |
 
 规模：S ≈ 数天、M ≈ 1-2 周、L ≈ 2-4 周（个人业余节奏）。
@@ -828,20 +828,38 @@ ATA 磁盘 + FAT32 读写 + 统一驱动模型 + RTC 墙钟。
 5. **RTC**（`drivers/rtc.c`）：CMOS 0x70/0x71，BCD→bin，
    `date` 命令 + uptime 起点
 
-### 任务分解
-- [ ] `drivers/ata.c`：IDENTIFY + 读写扇区 + 分区表（MBR）解析
-- [ ] `fs/fat32.c`：挂载/读/写/创建/删除（LFN 读支持）
-- [ ] `drivers/driver.c` + `/dev` 设备表
-- [ ] `kmain`：rootfs 切换逻辑；`build.py` 生成 FAT 镜像接线
-- [ ] `drivers/rtc.c` + `date` 命令
-- [ ] `ktest.c`：32「FAT 读写往返」、33「断电语义」（卸载重挂后数据在）
-- [ ] `tools/mkfatimg.py`：构建期制作 FAT32 镜像（放 busybox 风格工具集）
+### 任务分解（✅ 全部完成，2026-10）
+- [x] `drivers/ata.c`：IDENTIFY + 读写扇区 + 分区表（MBR）解析
+      （浮总线嗅探判在场、写后 FLUSH CACHE、`ata_lock` 整命令串行）
+- [x] `fs/fat32.c`：挂载/读/写/创建/删除（LFN 读支持）
+      ——**超出计划**：LFN 写也做了（小写名生成 8.3 别名+LFN 项，
+      否则 readdir 吐大写别名）；mkdir/空目录 unlink、append 尺寸
+      回写、per-instance 锁与 bounce 缓冲、mount/unmount 实例拆除
+- [x] `drivers/driver.c` + `/dev` 设备表
+      （probe→init→注册表→`ramfs_mknod` 发布；console/null/zero/hd0）
+- [x] `kmain`：rootfs 切换逻辑；`build.py` 生成 FAT 镜像接线
+      （`root=/dev/hd0` → FAT 根 + ramfs 钉 /dev /tmp；挂载表在
+      `namei.c`：lookup 遮蔽、`..` 爬出、readdir 合并挂载点、
+      `vfs_unmount`；无卷诚实回退 ramfs）
+- [x] `drivers/rtc.c` + `date` 命令
+      （UIP 等待+双读秒值稳定性、BCD 按 DM 位、年=2000+yy）
+- [x] `ktest.c`：32「FAT 读写往返」、33「断电语义」（卸载重挂后数据在）
+      ——外加 31 dev_registry、34 rtc_wallclock，共 +4 例（34→38），
+      gate H；往返测试附**空闲簇账目**断言（一文件一簇、删光归还）
+- [x] `tools/mkfatimg.py`：构建期制作 FAT32 镜像
+      （**计划修订**：不放 busybox 风格工具集，放 /bin 全部用户
+      程序 + novix.txt 标记文件；MBR + LBA 2048 分区 + LFN 项）
 
 ### 验收标准
-1. 写文件 → QEMU 重启（镜像持久）→ 文件仍在且内容一致
-2. `/bin` 可来自 FAT32；ramfs 仅存 /tmp 与 /dev
-3. `date` 与宿主机一致；设备统一走 `/dev` 打开
-4. 自测 33/33 通过
+1. ✅ 写文件 → QEMU 重启（镜像持久）→ 文件仍在且内容一致
+   ——以更严格的 `fat_powercycle` 成立：同进程内起**独立第二
+   挂载实例**读同一张盘（RAM 状态骗不过重挂），shell 测试亦有
+   FAT 根上 write→read→rm 往返
+2. ✅ `/bin` 可来自 FAT32；ramfs 仅存 /tmp 与 /dev（且 FILE 页
+   缺页直接从 FAT32 inode 读入，exec/spawn 全跑在磁盘上）
+3. ✅ `date` 与宿主机一致（QEMU `-rtc base=localtime`，CMOS 即
+   本地时间）；设备统一走 `/dev` 打开（hd0 为 `<blk>` 裸块设备）
+4. ✅ 自测 38/38 通过（计划写 33/33，实际交付 38 例）
 
 ### 依赖与风险
 - 依赖：0.2.0 VFS、0.6.0 页缓存（FAT 文件页复用缺页路径）
@@ -921,31 +939,62 @@ kmain
 8. **root 初始密码**：构建期生成并打印在 README（教学系统约定）；
    `passwd` 命令可改
 
-### 任务分解
-- [ ] `task.h/c`：uid/gid 字段 + 继承规则 + spawn 传参
-- [ ] `syscall.c`：GETUID/SETUID/GETGID/CHDIR/IOCTL(echo)
-- [ ] `fs/vfs.c`：open/write/unlink 权限检查接入（root 旁路 +
-      rwx 位比对）
-- [ ] `lib/sha256.c` + `ulib` 同款：哈希原语
-- [ ] `os/user/getty.c`：issue 打印、用户名读取、login 拉起、收尸循环
-- [ ] `os/user/login.c`：passwd/shadow 解析、密码校验、setuid 链
-- [ ] `os/user/id.c`、`who.c`、`passwd.c`（改密）、`useradd.c`（root 专用）
-- [ ] `tools/mkpasswd.py`：构建期生成 root 随机密码写镜像
-- [ ] `tools/mkfatimg.py`：/etc 四件套 + /home/alice 预置示例用户
-- [ ] `kmain.c`：init 改为 spawn getty（内核 shell 保留为
-      `console=debug` 启动参数时的调试后门）
-- [ ] `ktest.c`：34「setuid 权限边界」（非 root 调 setuid 返回 EPERM）、
-      35「shadow 哈希往返」、36「alice 写 /bin 被拒」
-- [ ] `test_shell.py`：登录序列冒烟（自动登录调试模式 + 手工密码路径）
+### 任务分解（✅ 全部完成，2026-10）
+- [x] `task.h/c`：uid/gid/ruid 字段 + 继承规则 + spawn 传参
+- [x] `syscall.c`：GETUID/SETUID/GETGID/SETGID/GETRUID/CHDIR/
+      GETCWD/IOCTL(echo)/MKDIR/CHOWN/POWEROFF 共 +11；
+      SYS_SPAWN/SYS_EXEC 扩参 argv/argc（ELF 加载器压栈，
+      `main(argc, argv)` 真正可用）
+- [x] `fs/vfs.c`：open/unlink/mkdir 权限检查接入
+      （`vfs_permitted`：root 旁路 + owner/group/world 三选一，
+      POSIX 语义；新文件属主=创建者）
+- [x] `lib/sha256.c` + ulib 同款 + `tools/mkpasswd.py`：哈希原语
+      三份同算法（内核 shadow_roundtrip、用户态 login/passwd、
+      构建期镜像烤制）
+- [x] `os/user/getty.c`：issue 打印、用户名读取、exec login
+      （同 pid 换程序的链式设计，logout 即整链归零）
+- [x] `os/user/login.c`：passwd/shadow 解析、密码校验（统一报
+      "Login incorrect"）、setuid 降落链、utmp 写入
+- [x] `os/user/sh.c` 用户态 shell + `id.c`、`whoami.c`、`who.c`、
+      `passwd.c`（系统唯一 SUID 二进制）、`useradd.c`（root 专用）、
+      `cat.c`、`touch.c`、`uidtest.c`
+- [x] `tools/mkpasswd.py`：构建期生成 root/alice 随机密码
+      （记录 build/etc-passwd.txt）+ ktest 固定密码做测试锚点
+- [x] `tools/mkfatimg.py`：/etc 四件套（passwd/shadow/inittab/
+      issue）+ /root + /home/alice + /home/ktest + /var/run
+      （utmp 落点）；shadow 另烤 shadow-only `kck` 锚点行——
+      passwd 改密永不触碰它，shadow_roundtrip 在被改过密码的
+      镜像上依然逐字节可校验（session 3 gate E 的保绿基础）
+- [x] `kmain.c`：init 改为 getty_loop（读 /etc/inittab、收尸
+      respawn——SysV 规则）；内核 shell 保留为 `console=debug`
+      调试后门；boot 期 `fs_perm_fixup`（/bin +x、passwd SUID、
+      shadow 0600、/home chown——FAT 不存 Unix 位）
+- [x] `ktest.c`：39「setuid_boundary」（uidtest 程序边界漫步：
+      argv 传递+root 降级+凡人回不去）、40「shadow_roundtrip」
+      （构建期哈希==内核哈希）、41「perm_boundary」（alice 三向：
+      /bin 拒、shadow 拒、home 可写）——**超出计划**：argv 漫步
+      并进 39 一例证明
+- [x] `test_shell.py`：三会话——session 1 `console=debug` 内核
+      shell 全量回归（50 项）；session 2 登录冒烟（13 项：错密码
+      拒绝、ktest 登录、id/whoami/who、shadow 拒读、passwd 改密
+      回环、logout→getty respawn→再登录→poweroff）；session 3
+      断电存续（3 项：新密码活过关机 + 恢复 ktest-pass 保幂等）
 
-### 验收标准
-1. 冷启动：getty → root + 正确密码 → shell，`id` 显示 uid=0
-2. alice（uid 100）登录后：读 /etc/shadow 被拒、写 /bin 下文件被拒、
-   写 /home/alice 成功
-3. 错误密码连试 3 次：每次 "Login incorrect"，第 3 次后有可感知延时
-4. `passwd` 改 alice 密码 → 重启（FAT32 持久）→ 新密码可登录
-5. shell 退出后 getty 重新出现（init 收尸循环正确）
-6. 自测 36/36 通过
+### 验收标准（实测）
+1. ✅ 冷启动：getty → 用户名+正确密码 → sh，`id` 显示 uid
+   （自动测试以 ktest 证明全链：uid=200(ktest) gid=200(ktest)；
+   root/alice 同链路，root 密码记录在 build/etc-passwd.txt）
+2. ✅ alice（uid 100）三向：写 /bin 拒、读 /etc/shadow 拒、
+   写 /home/alice 成——ktest perm_boundary 直接断言（此前实装
+   期发现家目录错归 root，测试抓出后修 fs_perm_fixup）
+3. ✅ 错误密码：每次 "Login incorrect"（错误用户名同报，不泄露
+   账户存在性）；3 次失败 usleep(3000) 刹车（login.c attempt
+   循环；自动测试覆盖单次错误路径）
+4. ✅ `passwd` 改密 → 重启（FAT32 持久）→ 新密码可登录且旧密码
+   即死——test_shell session 3 专项（session 2 已先验证改密回环）
+5. ✅ shell 退出后 getty 重新出现（init 收尸 respawn；banner
+   出现次数 = 2 的计数断言）
+6. ✅ 自测 41/41 通过（计划写 36/36，实际交付 41 例 + gate I）
 
 ### 依赖与风险
 - 依赖：0.2.0（文件系统+mode 位）、0.4.0（fork/exec）、
@@ -964,20 +1013,25 @@ kmain
 脱离 QEMU 依赖可引导；有 shell、用户、init、文档的完整操作系统。
 
 ### 任务分解
-- [ ] **引导**：`grub-mkrescue` 生成 `novix.iso`（GRUB multiboot 菜单；
-      若 0.3.0 已采用 ISO 方案则此处仅剩真机清单）；
-      真机验证清单（USB 启动、已知硬件白名单）
-- [ ] **sh 脚本化**（`osh` 用户态程序，替换内核 shell）：
-      重定向 `>`/`>>`/`<`、管道 `|`、后台 `&`、`wait`、
-      环境变量 `$VAR`、`exit`、注释 `#`——基于 0.2-0.5 的全部系统调用
-- [ ] **用户体系收尾**（基于 0.9.0）：root/普通用户双账户
+- [x] **引导**：`build.py iso` 用 `grub-mkrescue` 生成 `novix.iso`
+      （GRUB multiboot1 菜单，`grub.cfg` 入库；宿主缺 grub-pc-bin/
+      xorriso 时如实报因跳过——Windows 工具链不含，QEMU `-kernel`
+      仍是受测路径）。真机验证清单（USB 启动、硬件白名单）留 1.x
+- [x] **osh 脚本化**（`user/osh.c`，替换 v0.9.0 的 sh）：
+      管道 `|`（fork+exec+dup2 接线）、重定向 `>`/`>>`/`<`、
+      后台 `&` + `jobs`/`wait`、变量 `NAME=value`/`$VAR`/`$?`/
+      `$pid`、注释 `#`——新增 38 号 DUP2 支撑。边界：无引号/转义、
+      变量不导出、无 Ctrl-C 路由（CHANGELOG 诚实边界）
+- [x] **用户体系收尾**（基于 0.9.0）：root/alice/ktest 三账户
       预置进发行镜像；/etc/motd 登录后展示
-- [ ] **init**：pid 1 用户态化，读 `/etc/init` 脚本逐行 exec
-- [ ] **文档**：DESIGN.md 中英双语版、`docs/driver-writer-guide.md`
-      （驱动编写指南）、`docs/syscall.md`（编号表，对标原
-      `docs/api.md`）
-- [ ] **发布**：tag v1.0.0、CHANGELOG 全量整理、
-      novix.iso 与 novix.img 产物入 CI
+- [x] **init**：内核 pid 1 监督用户态 `/bin/init`，读 `/etc/init`
+      脚本逐行 exec（一次性行 + 首个 respawn 行监督到底）
+- [x] **文档**：`docs/DESIGN.en.md`（英文版）、
+      `docs/driver-writer-guide.md`（驱动编写指南）、
+      `docs/syscall.md`（38 项编号表 + tools/check_syscalls.py
+      随构建比对头文件——验收 #4 的校验机制）
+- [ ] **发布**：tag v1.0.0、novix.iso 与 novix-hd.img 产物入 CI
+      （本地验证已全绿；等维护者打 tag / 接 CI runner）
 
 ### 验收标准
 1. 裸机（或另一台虚拟化平台）从 ISO 引导 → GRUB → init 脚本 →
