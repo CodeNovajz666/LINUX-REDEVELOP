@@ -192,13 +192,23 @@ void smp_tlb_shootdown_handler(void) {
 
 uint32_t smp_tlb_ipis_sent(void) { return tlb_broadcasts; }
 
-void smp_dump_cpus(void) {
-    kprintf("CPU  APIC  ONLINE  CURRENT\n");
+/* v1.0.0: the `cpus` report, streamed through a caller sink -- the kernel
+ * debug shell prints via shell_emit_console; sys_cpus appends the same
+ * lines into a user buffer. */
+void smp_report_cpus(shell_emit_t emit, void *ctx) {
+    static const char hdr[] = "CPU  APIC  ONLINE  CURRENT\n";
+    emit(hdr, (int)sizeof(hdr) - 1, ctx);
     for (int i = 0; i < SMP_MAX; i++) {
         struct cpu *c = &cpus[i];
         if (i >= ncpu && !c->online) continue;
-        kprintf("%-4d %-5d %-7s %s\n", i, c->apic_id,
-                c->online ? "yes" : "no",
-                c->current ? c->current->name : "-");
+        char row[96];
+        int n = ksnprintf(row, sizeof(row), "%-4d %-5d %-7s %s\n", i, c->apic_id,
+                          c->online ? "yes" : "no",
+                          c->current ? c->current->name : "-");
+        emit(row, n, ctx);
     }
+}
+
+void smp_dump_cpus(void) {
+    smp_report_cpus(shell_emit_console, 0);
 }

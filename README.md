@@ -30,16 +30,18 @@ Novix 1.0.0 -- a real OS, grown out of a kernel module
 | Interrupts | ✅ | IDT64 gates, IOAPIC/LAPIC delivery (8259 parked), LAPIC timer as per-core preemption source (PIT stays as the BSP calibration base) |
 | Memory | ✅ | Bitmap physical allocator with page refcounts, free-list kernel heap, **four-level page tables (a Rust module)**, demand paging (FILE/ANON/swap-in fault paths), copy-on-write `fork`, clock-algorithm swap driven by a kswapd kernel thread, anonymous `mmap`/`munmap` |
 | Multitasking | ✅ | Preemptive on every core; one global runqueue under `sched_lock`; 5 policies (PRIORITY / RR / FCFS / EDF / RMS) switchable at runtime; aging anti-starvation; sleep/wait/zombie states |
-| User space | ✅ | ring3 ELF64 loader, per-process address spaces, `sbrk` heap + user-space malloc/free, `int 0x80` syscalls (38, incl. `dup2`), argv/argc on the user stack, `waitpid`/zombie reaping, orphan reparenting |
+| User space | ✅ | ring3 ELF64 loader, per-process address spaces, `sbrk` heap + user-space malloc/free, `int 0x80` syscalls (44, incl. `dup2`/`getdents`/`unlink`/`datetime`), argv/argc on the user stack, `waitpid`/zombie reaping, orphan reparenting |
 | IPC & signals | ✅ | signals 1..31 (catch / block / sigreturn trampoline, SIGKILL unblockable), pipes (ring buffer + EOF/EPIPE), shell Ctrl+C → SIGINT |
-| File system | ✅ | VFS (inode/file/file_operations split), ramfs, devfs (`/dev/console`, `/dev/null`), mount table (shadowing + readdir merge), **FAT32 persistent root** (LFN read+write) booted via `root=/dev/hd0`, per-task fd table + per-task cwd, initrd-packed `/bin` (24 programs) |
+| File system | ✅ | VFS (inode/file/file_operations split), ramfs, devfs (`/dev/console`, `/dev/null`), mount table (shadowing + readdir merge), **FAT32 persistent root** (LFN read+write) booted via `root=/dev/hd0`, per-task fd table + per-task cwd, initrd-packed `/bin` (33 programs) |
 | Storage, drivers & clock (v0.8.0) | ✅ | ATA PIO disk (IDENTIFY, LBA28, MBR partitions, FLUSH CACHE), unified driver model (probe → init → `/dev` registry: console/null/zero/hd0), CMOS RTC wall clock + `date`; the power-cycle test re-mounts the disk in a fresh instance to prove data reached the platter |
 | Users & login (v0.9.0) | ✅ | uid/gid/ruid identity in the PCB (fork inherits, exec keeps), POSIX owner/group/world permission checks in the VFS (root bypass), boot-time permission fixup for FAT32, SUID exec (`/bin/passwd` is the one SUID binary), the login chain init→getty→login→sh driven by `/etc/inittab` (respawn on logout), salted-SHA-256 `/etc/passwd`+`/etc/shadow` password verification with terminal echo off via TCGETS/TCSETS ioctl, `id`/`whoami`/`who`/`passwd`/`useradd` commands; password changes survive poweroff on the FAT32 disk |
+| Out-of-box registration (v1.0.0) | ✅ | the disk image ships **zero accounts**; getty detects the empty `/etc/passwd` and runs the two-step wizard instead of login — set the root password, then create the first user (uid ≥ 100, empty name = root-only system). Credentials are created by the first person to boot the machine, survive poweroff on the FAT32 disk, and the wizard never runs again |
 | Fault isolation | ✅ | ring3 exceptions kill the offending process (Unix `128+signo` exit status) instead of panicking; kernel-mode #PF on user pages resolves COW/demand faults for both privilege levels |
 | Shell | ✅ | Interactive kernel shell over serial/keyboard (Backspace, Tab completion, ↑/↓ history, Ctrl+C) kept as the `console=debug` back door; the login world runs **osh** (v1.0.0) |
-| osh scripting (v1.0.0) | ✅ | User-space shell with pipelines `|` (fork+exec+dup2 wiring), redirections `>` `>>` `<`, background jobs `&` + `jobs`/`wait`, shell variables `$VAR`/`$?`/`$pid`, `#` comments; the acceptance line `cat /etc/motd | grep Novix > /tmp/x` runs end to end |
-| init & userspace infra (v1.0.0) | ✅ | `/bin/init` reads `/etc/init` (one-shot lines + one supervised `respawn` service, SysV rule), `/etc/motd` after login, `echo`/`grep` in /bin; ISO build target (`build.py iso`, grub multiboot menu, host-tool gated); docs set: `docs/syscall.md` (38 entries, CI-checked against the header), `docs/driver-writer-guide.md`, `docs/DESIGN.en.md` |
-| Testing | ✅ | 43/43 kernel self-tests (run on 2 CPUs **and** re-run on 1 CPU for regression) + 71/71 automated shell checks over three live sessions: kernel-shell regression, login/scripting/password smoke test, password persistence across poweroff |
+| osh scripting (v1.0.0) | ✅ | User-space shell with pipelines `|` (fork+exec+dup2 wiring), redirections `>` `>>` `<`, background jobs `&` + `jobs`/`wait`, shell variables `$VAR`/`$?`/`$pid`, `#` comments; debug built-ins `ps`/`cpus`/`mem [-v]`/`upt`/`kill` over read-only syscalls 39-41; the acceptance line `cat /etc/motd | grep Novix > /tmp/x` runs end to end |
+| Interactive toolbox (v1.1.0) | ✅ | the everyday file/system commands live in `/bin` and run straight from osh: `ls` (SYS_GETDENTS — byte-identical to the kernel shell's listing, directory R checked at the boundary), `pwd`, `rm` (SYS_UNLINK), `cp`, `mv` (copy+unlink, honestly no rename(2)), `date` (SYS_DATETIME, kernel-formatted RTC line), `sleep`, `uname`, `clear` (ioctl TCCLEAR); osh gained a `history` built-in and a truthful `help` |
+| init & userspace infra (v1.0.0) | ✅ | `/bin/init` reads `/etc/init` (one-shot lines + one supervised `respawn` service, SysV rule), `/etc/motd` after login, `echo`/`grep` in /bin; ISO build target (`build.py iso`, grub multiboot menu, host-tool gated); docs set: `docs/syscall.md` (44 entries, CI-checked against the header), `docs/driver-writer-guide.md`, `docs/DESIGN.en.md` |
+| Testing | ✅ | 46/46 kernel self-tests (run on 2 CPUs **and** re-run on 1 CPU for regression) + 93/93 automated shell checks over three live sessions: kernel-shell regression, first-boot registration + login/scripting/toolbox smoke test, persistence of the registered accounts across poweroff |
 
 Tests verify observable behavior, not print statements: scheduling
 *order* under four policies, cross-CPU execution proofs (six threads
@@ -63,23 +65,39 @@ tools under `tools/`.
 cd os
 
 python build.py              # build kernel + user programs + 64 MiB FAT32 disk image
-python build.py test         # headless self-test: 43 tests, 2 CPUs, exit 1 on pass
+python build.py test         # headless self-test: 46 tests, 2 CPUs, exit 1 on pass
 python build.py test -smp 1  # single-CPU regression run
 python build.py run          # interactive: boot into the login world (getty)
-python tools/test_shell.py   # 71 automated checks over three live serial sessions
+python tools/test_shell.py   # 93 automated checks over three live serial sessions
 python build.py iso          # novix.iso via grub-mkrescue (needs grub-pc-bin + xorriso)
 ```
 
-Accounts baked into the image: `root` (password printed at build time and
-recorded in `os/build/etc-passwd.txt`), `alice`, and `ktest` (password
-`ktest-pass`). Log in as `root` for the full user-space shell
-(`cd`, `logout`, `/bin` programs). Booting with the kernel argument
-`console=debug` skips getty and drops into the kernel debug shell instead
-(that is what session 1 of the shell test drives).
+The image ships **no accounts**. The first boot drops into a two-step
+registration wizard: set the root password, then create your user
+(an empty name leaves a root-only system). After registration the
+normal login world runs — log in as `root` or your user for the full
+shell (`cd`, `logout`, `/bin` programs). Booting with the kernel
+argument `console=debug` skips getty and drops into the kernel debug
+shell instead (that is what session 1 of the shell test drives).
 
-Sample interactive session (`python build.py run`, 2 CPUs):
+Sample first boot (`python build.py run`, 2 CPUs):
 
 ```
+This is a fresh Novix system -- no user accounts exist yet.
+
+Registration sets the administrator (root) password, then
+creates your first user account.
+
+New password for root:
+Retype new password:
+register: root password set
+
+Choose a username (empty for a root-only system): ktest
+New password:
+Retype new password:
+register: account 'ktest' created (uid 100, home /home/ktest)
+
+Registration complete. Please log in.
 Novix 1.0.0 (tty1) -- authorized users only
 
 login: ktest
@@ -87,7 +105,7 @@ Password:
 Novix 1.0.0 -- a real OS, grown out of a kernel module
 osh: pipelines a|b, redirects a>b a>>b a<b, jobs a&, $VAR $?
 ktest@novix:/home/ktest$ id
-uid=200(ktest) gid=200(ktest)
+uid=100(ktest) gid=100(ktest)
 ktest@novix:/home/ktest$ cat /etc/motd | grep Novix > /tmp/x
 ktest@novix:/home/ktest$ cat /tmp/x
 Novix 1.0.0 -- a real OS, grown out of a kernel module
@@ -210,7 +228,7 @@ subsystems rather than keeping them):
 | IPC & signals | signals, pipes, shared memory, sockets | signals + pipes done; no shm/sockets |
 | SMP & locking | per-CPU runqueues, RCU, preemptible kernel | one global runqueue (fine at this scale); spinlocks only; kernel not preemptible in the strict sense |
 | Device drivers | unified driver model, disk, network, USB, GPU | VGA text, COM1, PS/2, PIT/LAPIC, ATA disk, RTC behind one unified driver model (/dev registry); no network/USB/GPU |
-| Syscalls | 300+ | 38 |
+| Syscalls | 300+ | 44 |
 | Security | users, permissions, capabilities, LSM, ASLR | users & login done (uid/gid/ruid, SUID exec, POSIX permission checks, salted SHA-256 login chain); no capabilities/LSM/ASLR, single uid per process (no euid split), no slow-hash KDF |
 | Platform | UEFI/ACPI, real hardware | QEMU `-kernel` is the tested path; `build.py iso` emits a GRUB multiboot ISO (host-tool gated, untested on bare metal); `poweroff` relies on the isa-debug-exit device |
 | Network | full TCP/IP stack | none |

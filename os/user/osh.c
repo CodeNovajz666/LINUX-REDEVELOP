@@ -11,7 +11,11 @@
  *   - variables are shell-local; they are NOT exported to children
  *   - no Ctrl-C routing to foreground jobs (the kernel debug shell has it;
  *     this shell has no line-discipline hook yet) and no Ctrl-D/EOF
- *   - globs, here-docs, conditionals are 1.x territory */
+ *   - globs, here-docs, conditionals are 1.x territory
+ *
+ * v1.0.0: the kernel debug shell's read-only reports (ps/cpus/mem) are
+ * merged in as built-ins over syscalls 39-41; the kernel shell itself
+ * stays as the console=debug rescue path. */
 
 #define OSH_LINE_MAX   128
 #define OSH_EXP_MAX    256
@@ -33,13 +37,20 @@ struct osh_redir {
 };
 
 struct osh_stage {
-    const char *argv[OSH_ARGV_MAX];
+    /* +1: parse_stages NUL-terminates argv[argc] -- argc may legally be
+     * OSH_ARGV_MAX, so the sentinel needs its own slot (writing argv[8]
+     * of an 8-slot array clobbered the adjacent argc field) */
+    const char *argv[OSH_ARGV_MAX + 1];
     int argc;
     struct osh_redir r;
 };
 
 struct osh_job {
-    int pid;
+    /* every pipeline stage's pid, not just the last: middle stages are
+     * osh's children too and need reaping, or each background pipeline
+     * leaks zombie slots until the shell exits */
+    int pid[OSH_STAGE_MAX];
+    int npids;
     char cmd[48];
     bool used;
     bool done;
@@ -54,6 +65,20 @@ static struct osh_job jobs[OSH_JOB_MAX];
 static struct osh_var vars[OSH_VAR_MAX];
 static int nvars;
 static int last_status;                         /* $? */
+
+/* v1.1.0: command history -- a plain ring of raw (pre-expansion) lines;
+ * `history` lists them. Up/Down recall is 1.x line-discipline territory. */
+#define OSH_HIST_MAX 32
+static char history[OSH_HIST_MAX][OSH_LINE_MAX];
+static int nhist;
+
+static void hist_add(const char *line) {
+    if (!line[0]) return;                       /* blank lines not recorded */
+    int slot = nhist < OSH_HIST_MAX ? nhist : OSH_HIST_MAX - 1;
+    if (nhist < OSH_HIST_MAX) nhist++;
+    ustrncpy(history[slot], line, OSH_LINE_MAX - 1);
+    history[slot][OSH_LINE_MAX - 1] = 0;
+}
 
 /* operator token? ('|' '<' '>' '&' or the two-char '>>') */
 static bool tok_is_op(const struct osh_tok *t) {
@@ -127,21 +152,25 @@ static int var_value(const char *name, int len, char *out, int cap) {
     return n;
 }
 
+/* v1.0.1: strict bounds -- every write checks o < cap - 1 first, so the
+ * final out[o] = 0 always lands on a free byte (the old loop could run
+ * one to two bytes past the buffer on a maximally expanding line). A
+ * lone '$' at end-of-line breaks instead of advancing past the NUL. */
 static int expand_line(const char *in, char *out, int cap) {
     int o = 0;
     for (const char *p = in; *p; p++) {
-        if (*p != '$' || o >= cap - 1) {
-            out[o++] = *p;
-            if (o >= cap - 1) {                 /* truncate: rest dropped */
-                while (*p) p++;
-                break;
-            }
+        if (*p != '$') {
+            if (o < cap - 1) out[o++] = *p;
             continue;
         }
         p++;                                    /* past '$' */
         if (*p == '{') {                        /* ${NAME} */
             const char *e = ustrchr(p + 1, '}');
-            if (!e) { out[o++] = '$'; out[o++] = '{'; continue; }
+            if (!e) {
+                if (o < cap - 1) out[o++] = '$';
+                if (o < cap - 1) out[o++] = '{';
+                continue;
+            }
             int n = var_value(p + 1, (int)(e - (p + 1)), out + o, cap - 1 - o);
             o += n;
             p = e;
@@ -152,7 +181,12 @@ static int expand_line(const char *in, char *out, int cap) {
         if (*p == '?' || *p == '_') p++;
         else while ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') ||
                     (*p >= '0' && *p <= '9') || *p == '_') p++;
-        if (p == s) { out[o++] = '$'; if (o < cap - 1 && *s) out[o++] = *s; continue; }
+        if (p == s) {                           /* lone '$' or '$<other>' */
+            if (o < cap - 1) out[o++] = '$';
+            if (*s && o < cap - 1) out[o++] = *s;
+            if (!*s) break;                     /* '$' ended the line */
+            continue;
+        }
         o += var_value(s, (int)(p - s), out + o, cap - 1 - o);
         p--;                                    /* the for-loop re-advances */
     }
@@ -259,6 +293,19 @@ static void kill_stage_pids(const int *pids, int n) {
     }
 }
 
+/* strict decimal parse: every char a digit, value capped -- a long digit
+ * run must not wrap into a valid pid. -1 on any malformed input. */
+static int parse_pid(const char *s) {
+    if (!*s) return -1;
+    long v = 0;
+    for (; *s; s++) {
+        if (*s < '0' || *s > '9') return -1;
+        v = v * 10 + (*s - '0');
+        if (v > 1000000) return -1;
+    }
+    return (int)v;
+}
+
 static int run_pipeline(struct osh_stage *stages, int nstages, bool background) {
     int pipe_r = -1, pipe_w = -1;
     int pids[OSH_STAGE_MAX] = { 0 };
@@ -290,7 +337,11 @@ static int run_pipeline(struct osh_stage *stages, int nstages, bool background) 
         for (int j = 0; j < OSH_JOB_MAX; j++) {
             if (jobs[j].used && jobs[j].done) jobs[j].used = false;
             if (!jobs[j].used) {
-                jobs[j].pid = pids[nstages - 1];
+                /* every stage joins the job: middle stages are osh's
+                 * children and would zombie forever otherwise */
+                jobs[j].npids = 0;
+                for (int i = 0; i < nstages; i++)
+                    jobs[j].pid[jobs[j].npids++] = pids[i];
                 jobs[j].used = true;
                 jobs[j].done = false;
                 char *o = jobs[j].cmd;
@@ -302,7 +353,7 @@ static int run_pipeline(struct osh_stage *stages, int nstages, bool background) 
                         *o++ = *w++;
                 }
                 *o = 0;
-                uprintf("[%d] pid %d\n", j + 1, jobs[j].pid);
+                uprintf("[%d] pid %d\n", j + 1, jobs[j].pid[jobs[j].npids - 1]);
                 return 0;
             }
         }
@@ -322,27 +373,39 @@ static int run_pipeline(struct osh_stage *stages, int nstages, bool background) 
 static bool stage_is_builtin(const struct osh_stage *st) {
     if (!st->argc || st->r.in_file || st->r.out_file) return false;
     static const char *names[] =
-        { "cd", "exit", "logout", "help", "poweroff", "wait", "jobs", 0 };
+        { "cd", "exit", "logout", "help", "history", "poweroff", "wait",
+          "jobs", "ps", "cpus", "mem", "kill", "upt", "uptime", 0 };
     for (int i = 0; names[i]; i++)
         if (ustrcmp(st->argv[0], names[i]) == 0) return true;
     return false;
 }
 
 static void reap_finished_jobs(void) {
-    /* best effort: WNOHANG's 0 is ambiguous with "exited 0", so an exit-0
-     * job may stay listed until `wait` collects it (blocking wait is exact) */
+    /* poll every stage pid of every live job. WNOHANG's 0 is ambiguous
+     * ("alive" vs "reaped, exited 0"), so an exit-0 stage resolves one
+     * poll later: the next nohang returns -1 (no such child) and the
+     * job flips to done. Blocking `wait` is exact; this is best effort. */
     for (int j = 0; j < OSH_JOB_MAX; j++) {
         if (!jobs[j].used || jobs[j].done) continue;
-        int r = uwaitpid_nohang(jobs[j].pid);
-        if (r != 0) jobs[j].done = true;
+        bool all_gone = true;
+        for (int i = 0; i < jobs[j].npids; i++) {
+            if (jobs[j].pid[i] <= 0) continue;
+            int r = uwaitpid_nohang(jobs[j].pid[i]);
+            if (r != 0) jobs[j].pid[i] = 0;     /* reaped (r > 0) or gone */
+            else all_gone = false;              /* still (or just) alive */
+        }
+        jobs[j].done = all_gone;
     }
 }
 
 static void kill_all_jobs(void) {
     for (int j = 0; j < OSH_JOB_MAX; j++) {
         if (!jobs[j].used) continue;
-        ukill(jobs[j].pid, U_SIGKILL);
-        uwaitpid(jobs[j].pid);                  /* reap so no zombie leaks */
+        for (int i = 0; i < jobs[j].npids; i++) {
+            if (jobs[j].pid[i] <= 0) continue;
+            ukill(jobs[j].pid[i], U_SIGKILL);
+            uwaitpid(jobs[j].pid[i]);           /* reap so no zombie leaks */
+        }
         jobs[j].used = false;
     }
 }
@@ -367,12 +430,20 @@ static int run_builtin(struct osh_stage *st) {
         return 0;
     }
     if (ustrcmp(cmd, "help") == 0) {
-        uputs("osh built-ins: cd DIR, exit, logout, help, poweroff, wait, jobs\n"
+        uputs("osh built-ins: cd DIR, exit, logout, help, history, poweroff,\n"
+              "               wait, jobs, ps, cpus, mem [-v], upt, kill PID [SIGNO]\n"
               "scripting: a|b, a>b a>>b a<b, a&, $VAR ${VAR} $? $pid,\n"
               "           NAME=value assignments, # comments\n"
-              "everything else runs from /bin (cat grep echo ls-class tools,\n"
-              "id whoami who passwd useradd hello ...)\n"
-              "limits: no quoting, vars are not exported, no Ctrl-C to jobs\n");
+              "/bin tools: ls pwd cat cp mv rm touch echo grep date sleep\n"
+              "            uname clear id whoami who passwd useradd hello ...\n"
+              "limits: no quoting, vars are not exported, no Ctrl-C to jobs,\n"
+              "        built-ins are single-stage (no pipe/redirect)\n");
+        last_status = 0;
+        return 0;
+    }
+    if (ustrcmp(cmd, "history") == 0) {
+        for (int i = 0; i < nhist; i++)
+            uprintf("  %d  %s\n", i + 1, history[i]);
         last_status = 0;
         return 0;
     }
@@ -382,21 +453,84 @@ static int run_builtin(struct osh_stage *st) {
     }
     if (ustrcmp(cmd, "wait") == 0) {
         for (int j = 0; j < OSH_JOB_MAX; j++) {
-            if (!jobs[j].used || jobs[j].done) continue;
-            uwaitpid(jobs[j].pid);              /* exact status; we keep $? */
-            jobs[j].done = true;
+            if (!jobs[j].used) continue;
+            for (int i = 0; i < jobs[j].npids; i++)
+                if (jobs[j].pid[i] > 0) uwaitpid(jobs[j].pid[i]);
             jobs[j].used = false;
         }
         last_status = 0;
         return 0;
     }
     if (ustrcmp(cmd, "jobs") == 0) {
+        reap_finished_jobs();
         for (int j = 0; j < OSH_JOB_MAX; j++) {
             if (!jobs[j].used) continue;
-            reap_finished_jobs();
             uprintf("[%d] %s pid %d %s\n", j + 1, jobs[j].cmd,
-                    jobs[j].pid, jobs[j].done ? "done" : "running");
+                    jobs[j].npids > 0 ? jobs[j].pid[jobs[j].npids - 1] : 0,
+                    jobs[j].done ? "done" : "running");
         }
+        last_status = 0;
+        return 0;
+    }
+    /* ---- v1.0.0: debug reports (kernel syscalls 39-41, read-only).
+     * Same tables the kernel debug shell prints, streamed into osh's
+     * buffers; buffers are static so the stacks stay small. */
+    if (ustrcmp(cmd, "ps") == 0) {
+        static char ps_buf[8192];               /* 64 tasks x ~80 bytes fit */
+        int n = ups(ps_buf, (int)sizeof(ps_buf) - 1);
+        if (n < 0) { uputs("ps: report failed\n"); last_status = 1; }
+        else { ps_buf[n] = 0; uputs(ps_buf); last_status = 0; }
+        return 0;
+    }
+    if (ustrcmp(cmd, "cpus") == 0) {
+        static char cpus_buf[1024];
+        int n = ucpus(cpus_buf, (int)sizeof(cpus_buf) - 1);
+        if (n < 0) { uputs("cpus: report failed\n"); last_status = 1; }
+        else { cpus_buf[n] = 0; uputs(cpus_buf); last_status = 0; }
+        return 0;
+    }
+    if (ustrcmp(cmd, "mem") == 0) {
+        static char mem_buf[1024];
+        int v = st->argc > 1 && ustrcmp(st->argv[1], "-v") == 0;
+        int n = umeminfo(mem_buf, (int)sizeof(mem_buf) - 1, v);
+        if (n < 0) { uputs("mem: report failed\n"); last_status = 1; }
+        else { mem_buf[n] = 0; uputs(mem_buf); last_status = 0; }
+        return 0;
+    }
+    if (ustrcmp(cmd, "upt") == 0 || ustrcmp(cmd, "uptime") == 0) {
+        uprintf("uptime: %u ms\n", (unsigned)uuptime());
+        last_status = 0;
+        return 0;
+    }
+    if (ustrcmp(cmd, "kill") == 0) {
+        if (st->argc < 2 || st->argc > 3) {
+            uputs("usage: kill PID [SIGNO]\n");
+            last_status = 2;
+            return 0;
+        }
+        /* v1.0.1: strict numeric parse -- the old loop parsed any prefix
+         * and defaulted to pid 0 (the idle task) on garbage input */
+        int pid = parse_pid(st->argv[1]);
+        if (pid <= 0) {
+            uprintf("kill: bad pid '%s'\n", st->argv[1]);
+            last_status = 2;
+            return 0;
+        }
+        int sig = U_SIGTERM;                    /* v0.5.0: optional signal */
+        if (st->argc > 2) {
+            sig = parse_pid(st->argv[2]);
+            if (sig < 1 || sig > 31) {
+                uprintf("kill: bad signal %d\n", sig);
+                last_status = 1;
+                return 0;
+            }
+        }
+        if (ukill(pid, sig) != 0) {
+            uprintf("kill: no such task (pid %d)\n", pid);
+            last_status = 1;
+            return 0;
+        }
+        uprintf("killed pid %d with sig%d\n", pid, sig);
         last_status = 0;
         return 0;
     }
@@ -478,6 +612,7 @@ int main(int argc, char **argv) {
         reap_finished_jobs();
         prompt();
         ureadline(line, sizeof(line));
+        hist_add(line);                         /* v1.1.0: raw line, pre-expansion */
         expand_line(line, exp, sizeof(exp));
 
         bool background = false;

@@ -17,12 +17,17 @@ the 8.3 alias is generated with ~N deduplication when the name does not
 fit ("fault_div" -> "FAULT_~1").
 
 v0.9.0: the image also carries /etc (passwd, shadow, inittab, issue),
-/root, /home/<user> and /var/run directories. The root and alice
-passwords are generated per build and recorded next to the image in
-etc-passwd.txt (README documents the convention); the "ktest" account
-uses the fixed password "ktest-pass" the login smoke test uses, and a
-shadow-only "kck" anchor entry holds the build-time digest the
-shadow_roundtrip ktest verifies (passwd never rewrites it).
+/root, /home and /var/run directories.
+
+v1.0.0: the OUT-OF-BOX image ships ZERO accounts -- /etc/passwd is empty
+and /home is empty, so the first boot runs the registration wizard
+(getty detects the empty passwd). /etc/shadow holds only a shadow-only
+"kck" anchor entry: its build-time digest is what the shadow_roundtrip
+ktest verifies against the kernel's own SHA-256, and it is not an
+account, so it never triggers (nor blocks) registration. Account
+credentials and home directories are created at runtime by /bin/register
+and useradd -- nothing is pre-generated, and there is no password ledger
+to keep.
 
 Usage: mkfatimg.py out.img [/path/name=srcfile ...]
        a pair "dir/" with no '=' creates an empty directory
@@ -242,33 +247,25 @@ def boot_sector():
     return bs
 
 def etc_files():
-    """v0.9.0 /etc content: passwd/shadow/inittab/issue plus the empty
-    home directories. Returns (extra_pairs, password_ledger_text)."""
+    """v1.0.0 /etc content for the OUT-OF-BOX image: ZERO accounts. passwd
+    ships empty and shadow holds only the "kck" build-time anchor (a
+    shadow-only line is not an account -- getty's empty-passwd check runs
+    the registration wizard instead of login). /home ships empty too:
+    register and useradd create home directories at runtime. Returns the
+    (path, bytes) pairs."""
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from mkpasswd import random_token, shadow_line
+    from mkpasswd import shadow_line
 
-    root_pw = random_token()
-    alice_pw = random_token()
-
-    passwd = (
-        "root:x:0:0:root:/root:/bin/osh\n"
-        "alice:x:100:100:Alice:/home/alice:/bin/osh\n"
-        "ktest:x:200:200:Ktest:/home/ktest:/bin/osh\n"
-    )
+    passwd = ""                        # no accounts: first boot registers
     # kck: shadow-only anchor (no passwd entry, never a login target).
     # passwd rewrites only the target user's line, so kck's digest stays at
     # its build-time value on every boot of every image generation -- the
     # shadow_roundtrip ktest verifies the host-tool vs kernel hash contract
-    # against it even when ktest's password was changed at runtime.
-    shadow = (
-        shadow_line('root', root_pw) + "\n"
-        + shadow_line('alice', alice_pw) + "\n"
-        + shadow_line('ktest', 'ktest-pass') + "\n"
-        + shadow_line('kck', 'ktest-pass') + "\n"
-    )
+    # against it even when registered passwords were changed at runtime.
+    shadow = shadow_line('kck', 'ktest-pass') + "\n"
     inittab = "tty1:getty\n"
     issue = "Novix 1.0.0 (tty1) -- authorized users only\n"
-    # v1.0.0: the user-space init script (/bin/init reads it; the first
+    # the user-space init script (/bin/init reads it; the first
     # "respawn" line is the supervised tty service) and the post-login
     # banner login(1) prints before exec'ing the shell.
     init = (
@@ -288,13 +285,11 @@ def etc_files():
         ('/etc/issue', issue.encode()),
         ('/etc/init', init.encode()),
         ('/etc/motd', motd.encode()),
-        ('/root/', None),
-        ('/home/alice/', None),
-        ('/home/ktest/', None),
+        ('/root/', None),                  # root's home
+        ('/home/', None),                  # empty: register/useradd fill it
         ('/var/run/', None),               # utmp lives here (who/login)
     ]
-    ledger = f"root: {root_pw}\nalice: {alice_pw}\n"
-    return pairs, ledger, root_pw
+    return pairs
 
 
 def emit(files, out_path):
@@ -307,8 +302,8 @@ def emit(files, out_path):
                    b'Files written here survive poweroff.\n')
     root.children.append(marker)
 
-    # v0.9.0 login world: /etc + home directories
-    etc_pairs, ledger, root_pw = etc_files()
+    # v0.9.0 login world / v1.0.0 zero-account out-of-box image
+    etc_pairs = etc_files()
     files = list(files) + etc_pairs
 
     for path, src in files:
@@ -336,12 +331,6 @@ def emit(files, out_path):
     vol = FatVolume()
     place(root, vol, True)
     fill(root, vol, None, set())
-
-    # record the generated passwords next to the image (README contract)
-    ledger_path = os.path.join(os.path.dirname(out_path), 'etc-passwd.txt')
-    with open(ledger_path, 'w') as f:
-        f.write(ledger)
-    print(f'  fat image: root password {root_pw} (also in {os.path.basename(ledger_path)})')
 
     regions = list(vol.regions)
 

@@ -8,9 +8,45 @@ static char kqueue[KQ_SIZE];
 static int q_head, q_count;
 static spinlock_t kq_lock = SPINLOCK_INIT;   /* v0.7.0: IRQ4 (BSP) vs readers */
 
+/* i8042 status port bits */
+#define KST_OBF 0x01            /* output buffer full */
+#define KST_IBF  0x02            /* input buffer full */
+#define KST_AUX  0x20            /* byte came from the aux (mouse) port */
+
+static void i8042_flush(void) {
+    for (int i = 0; i < 64; i++) {
+        if ((inb(0x64) & KST_OBF) == 0) return;
+        (void)inb(0x60);
+    }
+}
+
+static void i8042_wait_ibf(void) {
+    for (int i = 0; i < 100000; i++)
+        if ((inb(0x64) & KST_IBF) == 0) return;
+}
+
 void keyboard_init(void) {
     q_head = q_count = 0;
     outb(0x3F9, 0x01);      /* COM1 IER: enable received-data interrupt */
+
+    /* i8042: QEMU's BIOS happens to leave the controller scanning with
+     * set-1 translation; VMware (and real boards) may power up with the
+     * keyboard clock gated and/or translation off, leaving port 0x60
+     * silent forever.  Program the state we rely on instead of hoping
+     * the firmware agrees with us. */
+    i8042_flush();
+    outb(0x64, 0xAD);       /* disable kbd port while reconfiguring */
+    outb(0x64, 0xA7);       /* disable aux port */
+    i8042_flush();
+    i8042_wait_ibf();
+    outb(0x64, 0x60);       /* write controller command byte */
+    i8042_wait_ibf();
+    outb(0x60, 0x65);       /* IRQ1 on, IRQ12 off, system flag, kbd clock
+                               enabled, aux clock gated, set-1 translation on */
+    outb(0x64, 0xAE);       /* re-enable kbd port */
+    i8042_wait_ibf();
+    outb(0x60, 0xF4);       /* kbd: enable scanning */
+    i8042_flush();          /* drain the 0xFA ACK (and anything stale) */
 }
 
 static void kq_put(char c) {
@@ -36,8 +72,7 @@ static const char sc_to_ascii[128] = {
     '*', 0, ' ', 0,
 };
 
-void keyboard_irq(void) {
-    uint8_t sc = inb(0x60);
+static void kbd_push_scancode(uint8_t sc) {
     if (sc & 0x80) return;              /* break code */
     /* up/down arrows become the ESC sequences serial terminals already
      * send, so the shell parses one grammar on both input paths */
@@ -48,6 +83,23 @@ void keyboard_irq(void) {
     char c = sc < 128 ? sc_to_ascii[sc] : 0;
     if (c) kq_put(c);
     spin_unlock_irqrestore(&kq_lock, f);
+}
+
+void keyboard_irq(void) {
+    kbd_push_scancode(inb(0x60));
+}
+
+/* PS/2 poll-drain: mirrors the serial LSR poll below.  Catches keys even
+ * when IRQ1 routing is absent -- VMware's MP/IOAPIC tables differ from
+ * QEMU's, so the keyboard_irq path cannot be assumed to fire. */
+static void keyboard_ps2_drain(void) {
+    for (int i = 0; i < 16; i++) {
+        uint8_t st = inb(0x64);
+        if (!(st & KST_OBF)) return;
+        uint8_t d = inb(0x60);
+        if (st & KST_AUX) continue;     /* mouse byte: not ours, drop */
+        kbd_push_scancode(d);
+    }
 }
 
 /* COM1 receive: terminal input under QEMU -serial stdio arrives here.
@@ -68,6 +120,7 @@ void keyboard_serial_irq(void) {
 
 int keyboard_trychar(void) {
     keyboard_serial_drain();            /* poll RX: catches bytes even if an IRQ raced */
+    keyboard_ps2_drain();               /* poll PS/2: catches keys even if IRQ1 is unrouted */
     irq_flags_t f; spin_lock_irqsave(&kq_lock, &f);
     int c = kq_get();
     spin_unlock_irqrestore(&kq_lock, f);

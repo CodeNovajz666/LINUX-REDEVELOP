@@ -14,6 +14,7 @@
 #include "smp.h"
 #include "spinlock.h"
 #include "driver.h"
+#include "ata.h"
 #include "fat32.h"
 #include "rtc.h"
 #include "sha256.h"
@@ -56,11 +57,15 @@ static void run_cases(const char *phase, const struct ktest_case *cases, int n) 
     }
 }
 
-/* reap a child and verify its exit status */
+/* reap a child and verify its exit status. v1.0.1: waitpid returns the
+ * reaped child's pid and hands the status out through a pointer -- check
+ * both, they are the new ABI contract. */
 static void reap_expect(struct task *t, int expect) {
-    int st = task_waitpid(t->pid, 0);
-    if (st != expect) {
-        kprintf("  exit status: got %d want %d (%s:%d)\n", st, expect, __FILE__, __LINE__);
+    int st = -1;
+    int pid = task_waitpid(t->pid, 0, &st);
+    if (pid != t->pid || st != expect) {
+        kprintf("  reap: got pid %d status %d, want pid %d status %d (%s:%d)\n",
+                pid, st, t->pid, expect, __FILE__, __LINE__);
         cur_failed = 1;
     }
 }
@@ -291,9 +296,11 @@ static void test_fault_div(void) {
         cur_failed = 1;
         return;
     }
-    /* divide-by-zero in ring3 must kill the process (128+SIGFPE), not panic */
+    /* divide-by-zero in ring3 must kill the process (128+SIGFPE), not panic.
+     * (v1.0.1) the slot is provably reclaimed -- reap_expect returned --
+     * and reading t->state after the reap would race a slot-recycling
+     * create on another CPU: the old assert was a use-after-reap read. */
     reap_expect(t, 128 + SIGFPE);
-    KT_ASSERT(t->state == TASK_UNUSED);           /* fully reaped */
 }
 
 static void test_fault_segv(void) {
@@ -358,7 +365,6 @@ static void test_exec_replace(void) {
         return;
     }
     reap_expect(t, 42);
-    KT_ASSERT(t->state == TASK_UNUSED);
 }
 
 /* test 22: pid reuse -- a reaped slot hands its pid back; an unreaped
@@ -475,6 +481,46 @@ static void test_sig_mask(void) {
     reap_expect(t, 44);
 }
 
+/* test 28 (v1.0.1): WNOHANG exactness. "Child alive" (returns 0, status
+ * untouched) must be distinguishable from "child exited 0" (returns the
+ * child's PID), and a reaped/unknown pid is -1 -- the old ABI returned
+ * the exit status itself, so an exited-0 child and a live child both
+ * read 0 and no poller could tell them apart. */
+static void test_waitpid_nohang(void) {
+    sched_set_policy(SCHED_PRIORITY);
+
+    /* a live child: hello sleeps ~600 ms, so an immediate poll has
+     * nothing to reap */
+    struct task *t = task_spawn_path("/bin/hello");
+    KT_ASSERT(t != NULL);
+    int hpid = t->pid;
+    int st = 12345;
+    KT_ASSERT(task_waitpid(hpid, WNOHANG, &st) == 0);
+    KT_ASSERT(st == 12345);                    /* untouched for a live child */
+
+    /* blocking wait: exact pid, exact status through the pointer */
+    KT_ASSERT(task_waitpid(hpid, 0, &st) == hpid);
+    KT_ASSERT(st == 42);
+
+    /* after the reap the child is gone for this parent */
+    KT_ASSERT(task_waitpid(hpid, 0, &st) == -1);
+    KT_ASSERT(task_waitpid(hpid, WNOHANG, &st) == -1);
+
+    /* exit-0 child (forker self-checks pass -> exit 0): the reaped side
+     * returns the PID, never 0 */
+    struct task *e = task_spawn_path("/bin/forker");
+    KT_ASSERT(e != NULL);
+    int epid = e->pid;
+    int est = -1;
+    int r = 0;
+    uint64_t deadline = timer_ticks() + 5 * TICK_HZ;
+    while ((r = task_waitpid(-1, WNOHANG, &est)) == 0 && timer_ticks() < deadline) {
+        task_sleep_until(current_task(), timer_ticks() + 1);
+        kyield();
+    }
+    KT_ASSERT(r == epid && est == 0);
+}
+
 static const struct ktest_case mt_cases[] = {
     { "priority_order", test_priority_order },
     { "round_robin", test_round_robin },
@@ -495,6 +541,7 @@ static const struct ktest_case mt_cases[] = {
     { "sig_catch_resume", test_sig_catch_resume },
     { "pipe_eof", test_pipe_eof },
     { "sig_mask", test_sig_mask },
+    { "waitpid_nohang", test_waitpid_nohang },
 };
 
 int ktest_run_mt(void) {
@@ -955,17 +1002,23 @@ int ktest_run_smp(void) {
  */
 
 static void test_dev_registry(void) {
-    /* every built-in driver brought its device up and published it */
+    /* always-on drivers brought their devices up and published them */
     KT_ASSERT(device_present("console"));
     KT_ASSERT(device_present("null"));
     KT_ASSERT(device_present("zero"));
-    KT_ASSERT(device_present("hd0"));
 
     struct stat st;
     KT_ASSERT(vfs_stat("/dev/console", &st) == 0);
     KT_ASSERT((st.st_mode & S_IFMT) == S_IFCHR);
-    KT_ASSERT(vfs_stat("/dev/hd0", &st) == 0);
-    KT_ASSERT((st.st_mode & S_IFMT) == S_IFBLK);     /* v0.8.0: block device */
+
+    /* the disk parts only mean anything when a disk answered IDENTIFY:
+     * the no-volume ramfs boot (the v0.2-0.7 configuration) is a legal
+     * fallback, and hd0 simply does not exist there */
+    if (ata_present()) {
+        KT_ASSERT(device_present("hd0"));
+        KT_ASSERT(vfs_stat("/dev/hd0", &st) == 0);
+        KT_ASSERT((st.st_mode & S_IFMT) == S_IFBLK); /* v0.8.0: block device */
+    }
 
     /* null swallows, zero reads zeros */
     struct file *n = vfs_open("/dev/null", O_WRONLY);
@@ -1134,12 +1187,24 @@ static void test_shadow_roundtrip(void) {
     KT_ASSERT(strncmp(got, c2 + 1, 64) == 0);
 }
 
-/* case 3 -- alice (uid 100) against the VFS: /bin and /etc/shadow are
- * closed to her, her own /home/alice is not. The uid flip is direct (this
- * is the boot-time root context) and is restored before any assert can
+/* case 3 -- uid 100 against the VFS: /bin and /etc/shadow are closed to
+ * her, her own home is not. v1.0.0: the out-of-box image ships zero
+ * accounts (first-boot registration owns them now), so the fixture is
+ * self-provisioned -- /home/alice is created here and chowned to 100,
+ * the same runtime path register/useradd take. The uid flip is direct
+ * (boot-time root context) and is restored before any assert can
  * return, so a failure can never leak uid 100 into the boot task. */
 static void test_perm_boundary(void) {
-    if (!namei("/home/alice")) { kprintf("  (no /home/alice -- skipped)\n"); return; }
+    if (!namei("/home/alice")) {
+        if (vfs_mkdir("/home/alice") != 0) {
+            kprintf("  (cannot create /home/alice -- skipped)\n");
+            return;
+        }
+    }
+    struct inode *home_ino = namei("/home/alice");
+    KT_ASSERT(home_ino != NULL);
+    uint16_t h_uid = home_ino->uid, h_gid = home_ino->gid;
+    home_ino->uid = 100; home_ino->gid = 100;      /* alice owns her home */
     struct task *cur = current_task();
     uint16_t s_uid = cur->uid, s_gid = cur->gid;
     cur->uid = 100; cur->gid = 100;
@@ -1149,6 +1214,7 @@ static void test_perm_boundary(void) {
     bool home_ok = f != NULL;
     if (home_ok) vfs_close(f);
     cur->uid = s_uid; cur->gid = s_gid;            /* restore FIRST */
+    home_ino->uid = h_uid; home_ino->gid = h_gid;  /* fixture back too */
 
     KT_ASSERT(bin_denied);
     KT_ASSERT(shadow_denied);
@@ -1194,9 +1260,87 @@ static void test_scripting_toolkit(void) {
     KT_ASSERT(namei("/etc/motd") != NULL);
 }
 
+/* v1.0.0: the debug reports behind sys_ps/sys_cpus/sys_meminfo. The
+ * syscall glue is a bounded copy-out (same trust model as pipe's), so
+ * here we assert the kernel-side builders the three syscalls stream:
+ * table headers, one row per online CPU, sane memory numbers. The full
+ * user path is covered by the shell harness's osh session. */
+struct ktest_sbuf { char *p; int cap; int n; };
+
+static void emit_capture(const char *s, int len, void *ctx) {
+    struct ktest_sbuf *b = ctx;
+    for (int i = 0; i < len && b->n < b->cap - 1; i++)
+        b->p[b->n++] = s[i];
+    b->p[b->n] = 0;
+}
+
+static void test_debug_syscalls(void) {
+    char buf[2048];
+    struct ktest_sbuf sb = { buf, (int)sizeof(buf), 0 };
+
+    task_report_table(emit_capture, &sb);
+    KT_ASSERT(strstr(buf, "PID   PPID") != NULL);
+    KT_ASSERT(strstr(buf, "idle") != NULL);        /* per-CPU idle rows */
+    KT_ASSERT(strstr(buf, "init") != NULL);        /* the boot task */
+
+    sb.n = 0; buf[0] = 0;
+    smp_report_cpus(emit_capture, &sb);
+    KT_ASSERT(strstr(buf, "CPU  APIC") != NULL);
+    int lines = 0;
+    for (const char *p = buf; (p = strchr(p, '\n')) != NULL; p++) lines++;
+    KT_ASSERT(lines == smp_cpus_online() + 1);
+
+    sb.n = 0; buf[0] = 0;
+    shell_report_mem(emit_capture, &sb, 0);
+    KT_ASSERT(strstr(buf, "physical:") != NULL);
+    KT_ASSERT(strstr(buf, "kernel heap:") != NULL);
+    KT_ASSERT(pmm_free_pages() > 0);
+
+    sb.n = 0; buf[0] = 0;
+    shell_report_mem(emit_capture, &sb, 1);
+    KT_ASSERT(strstr(buf, "swap") != NULL);        /* verbose adds mm/swap */
+}
+
+/* v1.1.0: the builders behind sys_getdents/sys_unlink/sys_datetime. The
+ * syscall glue checks the same user-buffer bounds as the debug reports
+ * (sys_report_prep), so here we assert the kernel side: a full ls listing
+ * of /bin, an unlink round trip on the ramfs /tmp, and a sane RTC date.
+ * The full user path (ls/rm/date inside osh) is the shell harness's job. */
+static void test_user_toolbox(void) {
+    char buf[4096];
+    struct ktest_sbuf sb = { buf, (int)sizeof(buf), 0 };
+
+    shell_report_dir(emit_capture, &sb, "/bin");
+    KT_ASSERT(sb.n > 0);
+    KT_ASSERT(strstr(buf, "entries") != NULL);      /* the listing tail */
+    KT_ASSERT(strstr(buf, "osh") != NULL);          /* a known /bin program */
+
+    /* unlink round trip in the ramfs scratch dir (boot task: uid 0) */
+    if (namei("/tmp") == NULL) vfs_mkdir("/tmp");
+    struct file *f = vfs_open("/tmp/ktest_ut", O_WRONLY | O_CREAT);
+    KT_ASSERT(f != NULL);
+    vfs_close(f);
+
+    sb.n = 0; buf[0] = 0;
+    shell_report_dir(emit_capture, &sb, "/tmp");
+    KT_ASSERT(strstr(buf, "ktest_ut") != NULL);     /* listed before unlink */
+
+    KT_ASSERT(vfs_unlink("/tmp/ktest_ut") == 0);
+    sb.n = 0; buf[0] = 0;
+    shell_report_dir(emit_capture, &sb, "/tmp");
+    KT_ASSERT(strstr(buf, "ktest_ut") == NULL);     /* gone after unlink */
+
+    /* the date report: QEMU's -rtc base=localtime must read back sane */
+    sb.n = 0; buf[0] = 0;
+    KT_ASSERT(shell_report_date(emit_capture, &sb) == 0);
+    KT_ASSERT(strstr(buf, "local") != NULL);
+}
+
 static const struct ktest_case shell_cases[] = {
     { "dup2_osh",          test_dup2_osh },
     { "scripting_toolkit", test_scripting_toolkit },
+    { "debug_syscalls",    test_debug_syscalls },
+    { "user_toolbox",      test_user_toolbox },
 };
 
 int ktest_run_shell(void) {

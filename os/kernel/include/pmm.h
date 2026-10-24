@@ -13,4 +13,10 @@ uint32_t pmm_ref_get(uint64_t pa);    /* extra refs: 0 = exclusively owned */
 uint32_t pmm_free_pages(void);
 uint32_t pmm_total_pages(void);
 
+/* v1.0.1 (F5): COW-fault serialization (held by paging.rs across the whole
+ * refcount-sample/copy/ref-drop/PTE-rebase sequence). Returns the EFLAGS
+ * to pass back to cow_lock_leave. */
+uint32_t cow_lock_enter(void);
+void cow_lock_leave(uint32_t flags);
+
 #endif /* PMM_H */

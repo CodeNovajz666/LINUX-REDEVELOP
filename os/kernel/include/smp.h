@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include "novix.h"
 #include "percpu.h"
+#include "shell.h"                             /* shell_emit_t (smp_report_cpus) */
 
 /* interrupt vector layout (v0.7.0):
  *   0x00-0x1F  CPU exceptions
@@ -52,5 +53,7 @@ uint32_t smp_tlb_ipis_sent(void);
 
 /* shell "cpus" command */
 void smp_dump_cpus(void);
+/* v1.0.0: the same `cpus` report streamed to a caller sink (sys_cpus) */
+void smp_report_cpus(shell_emit_t emit, void *ctx);
 
 #endif /* SMP_H */

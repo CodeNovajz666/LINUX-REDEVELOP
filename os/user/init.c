@@ -15,7 +15,10 @@
 #define INIT_ARGV_MAX  8
 
 struct init_entry {
-    const char *argv[INIT_ARGV_MAX];
+    /* +1: parse_line may legally fill INIT_ARGV_MAX words and then
+     * NUL-terminates argv[argc] -- the sentinel needs its own slot
+     * (argv[8] of an 8-slot array would clobber the adjacent argc) */
+    const char *argv[INIT_ARGV_MAX + 1];
     int argc;
     bool respawn;
 };

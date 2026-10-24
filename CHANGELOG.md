@@ -3,10 +3,57 @@
 版本号约定见 ROADMAP.md：次版本号递增 = 交付一个完整子系统；
 修订号递增 = 稳定性/小改进。
 
-## v1.0.0 —— 里程碑：脚本化 shell、用户态 init 与 ISO（2026-10）
+## v1.1.0 —— 交互工具箱：ls/rm/date 进 /bin，osh 学会 history（2026-10）
+
+v1.0.0 之后的第一课：把"用户与 OS 的交互"补成完整的工具箱。
+此前 osh 的 help 写着 "ls-class tools"，/bin 里却没有 ls；删除、
+复制、移动、日期、清屏全要切内核 debug shell。现在常用的
+文件与系统操作全部在用户态 shell 内直接可用。
+
+**新增**
+- 42 号 GETDENTS（+ ulib `ugetdents`）：目录枚举报告——内核
+  shell 的 ls 提炼为共享报告函数 `shell_report_dir`（emit 回调
+  模式，与 39-41 同源），/bin/ls 拿到与内核 shell 逐字一致的
+  列表；syscall 边界检查目录 R 权限（Unix：列目录须可读），
+  内核 shell 走 root 路径不受检
+- 43 号 UNLINK（+ `uunlink`）：直接暴露 VFS 既有删除能力
+  （拒绝目录、父目录 W 在 VFS 内检查）——/bin/rm
+- 44 号 DATETIME（+ `udatetime`）：RTC 墙钟行，内核 shell 的
+  date 提炼为 `shell_report_date` 共享（RTC 不 sane 返 −1）——
+  /bin/date
+- ioctl 33 号扩 TCCLEAR=2 请求（清屏回位，无 flags 指针）——
+  /bin/clear；转义序列不进用户态（VGA console 非 ANSI 驱动）
+- 新程序九件（进入 initrd/FAT 镜像，osh 直接可跑）：
+  `ls`（默认 cwd，4 KiB 截断缓冲）、`pwd`、`rm`（多文件）、
+  `cp`（open/read/write 循环）、`mv`（cp+unlink 教学简化，
+  无 rename(2)，如实注明）、`date`、`sleep`（严格十进制解析，
+  0-60 秒）、`uname`、`clear`
+- osh 新内建 `history`：32 条环形记录（原始行，展开前），
+  编号列出；↑/↓ 检索属 1.x 行规程范围，如实注明
+- osh help 修正：不再谎称 "ls-class tools"——完整列出内建、
+  脚本特性与 /bin 工具清单
+
+**测试**
+- ktest gate J 增 `user_toolbox`（45→46）：/bin 列表断言（含
+  entries 尾行与已知程序名）、/tmp 上 unlink 往返（列见→删→
+  列不见）、RTC 日期行 sane——smp=2/1 双跑全绿
+- shell 会话 2 增 9 项（93 项）：ls 的 `<dir>` 标签、pwd 打印
+  登录家目录、cd 后 prompt 跟随 cwd、touch→ls、cp+mv 内容
+  往返（cat 证明）、rm 失败路径文案、date 的 local 行、
+  uname 版本、history 编号列出
+- 会话 1 时序竞态修复：spawn fault_div/fault_segv 后改
+  wait_for(异常报告) 事件驱动——盲 sleep 曾让一次运行在
+  spawner 子进程 + 异常报告的输出洪峰期丢输入字节（6 项
+  needle 假失败）；重跑 96/96 全绿
+- docs/syscall.md 增 42-44 行（CI check_syscalls.py 门禁通过）
+
+## v1.0.0 —— 里程碑：脚本化 shell、用户态 init、ISO 与开箱注册（2026-10）
 
 README 里那句 "a real OS" 的完整兑现：osh（管道/重定向/后台/变量）、
-用户态 init 读 /etc/init、/etc/motd、grub ISO 目标、文档四件套。
+用户态 init 读 /etc/init、/etc/motd、grub ISO 目标、文档四件套；
+以及开机体验的最后一课——第一次进入系统完成的是**注册**而不是
+登录：出厂镜像零账户，首次开机由 getty 引导进入注册向导，
+之后才回到熟悉的登录链。
 
 **新增**
 - osh（`user/osh.c`，替代 v0.9.0 的 sh）：基于 0.2-0.9 全部系统
@@ -20,6 +67,14 @@ README 里那句 "a real OS" 的完整兑现：osh（管道/重定向/后台/变
   管道/重定向全靠它。ktest 新增 osh 套件（gate J，41→43）：
   dup2_osh（iotest 载体证明管道接线/边界语义/文件重定向）+
   scripting_toolkit（/bin/osh echo grep init 与 /etc/init motd 在镜像）
+- osh 调试内建（39-41 号系统调用 PS/CPUS/MEMINFO + ulib
+  `ups`/`ucpus`/`umeminfo`）：内核 debug shell 的 ps/cpus/mem 以
+  只读报告并入 osh（`ps`、`cpus`、`mem [-v]`、`upt`、`kill
+  PID [SIGNO]`）——报告由内核 shell 与系统调用共享同一套流式
+  格式化函数（`ksnprintf` + emit 回调），截断式写入；内核 shell
+  保留为 console=debug 急救路径。gate J 增至 44（debug_syscalls
+  断言报告内容），shell 会话 2 增至 84 项中的 32 项
+  （osh 端到端敲 ps/cpus/mem/upt/kill）
 - 用户态 init（`user/init.c`）：内核 pid 1 监督 /bin/init；init 读
   /etc/init 逐行执行——一次性行顺序跑，首个 `respawn` 行监督到底
   （SysV respawn 规则，logout 即回登录屏）；无 /etc/init 时回退
@@ -35,8 +90,37 @@ README 里那句 "a real OS" 的完整兑现：osh（管道/重定向/后台/变
 - 文档四件套：`docs/syscall.md`（38 项编号表，tools/check_syscalls.py
   随构建比对头文件——ROADMAP 验收 #4）、`docs/driver-writer-guide.md`、
   `docs/DESIGN.en.md`（英文版设计文档，与中文版并列）
+- 出厂镜像零账户（mkfatimg.py）：`/etc/passwd` 出厂为空、
+  `/home` 出厂为空，`/etc/shadow` 只保留 shadow-only 的 "kck"
+  锚点行（它不是账户，gate I 的 shadow_roundtrip 仍可验证宿主
+  工具与内核 SHA-256 逐字节一致）。密码不再构建期生成，
+  `build/etc-passwd.txt` 账本随之取消——凭据只来自开机时的
+  注册向导
+- `/bin/register`（`user/register.c`）：首启注册向导，两步——
+  ① 设 root 密码（没有管理员的系统 useradd 永远无人能跑）；
+  ② 创建首个普通用户（uid 自 etc_max_uid()+1 起、下限 100；
+  空用户名 = 跳过，仅 root 系统同样合法）。密码两次输入、
+  关回显，不匹配/为空三轮刹车（与 login 同款预算）；写入
+  **shadow 先行**——中断后重跑只留下可按名替换的 shadow 行，
+  绝不会留下"有 passwd 条目却无法登录"的半成品；root 的
+  passwd 条目先查重再 append（重跑不产生重复行）。完成退出，
+  init respawn getty，下一轮循环看到账户即给出登录提示
+- getty 空账户分支（`user/getty.c`）：开机先问 `etc_user_count()`
+  （etc.c 新增，与 passwd_scan 同有效性规则计 /etc/passwd 行数）
+  ——为 0 就同 pid exec /bin/register 而不是打印登录提示；
+  注册后的链路自动落回 init→getty→login→osh
+- etc.c：`etc_valid_name` 把 useradd/register 共用的账户名规则
+  （1-23 字符、不含 ':'）收拢成一份实现；
+  `etc_passwd_append` 补 O_CREAT——镜像里第一次 append 就是
+  注册向导写 root 行
 
 **修复**
+- `test_dev_registry` 无条件断言 `hd0` 存在——v0.8.0 起无盘 ramfs
+  回退模式（`-append` 不带 `root=`、无 `-drive`）下该套件必红，
+  GATES-FAILED、退出码 3，与套件注释"无盘应跳过而不失败"自相矛盾。
+  现 hd0 相关断言以 `ata_present()` 为门，console/null/zero 的
+  常驻断言保留；修复后无盘启动 43/43 + NOVIX-BOOT-OK，有盘路径
+  的 gate H 断言不变
 - `elf_load` argv 压栈 8 字节错位（v0.9.0 埋雷，osh 首次踩中）：
   `arr_beg ≡ 0 (mod 16)` 时 16 字节对齐在 rsp 与 argv 数组之间
   留出 8 字节空洞——exec 出的程序读到 argv[0]=(null)、
@@ -49,17 +133,43 @@ README 里那句 "a real OS" 的完整兑现：osh（管道/重定向/后台/变
   syntax error）；tokenizer 只记 (指针,长度) 未 NUL 落地导致
   argv[0] 吞整行——改为词槽 arena 规范化；作业表满时旧实现漏杀
   中间阶段进程
+- ktest perm_boundary 自建 fixture：镜像不再预置 /home/alice，
+  测试自己 `vfs_mkdir` + chown 100（与 register/useradd 的
+  运行期路径完全一致），uid 套件与镜像内容解耦，断言前后
+  双向恢复现场
+- keyboard.c 显式初始化 i8042（VMware 键盘死亡）：QEMU 的 BIOS
+  开机已配好控制器，VMware 上电时扫描/翻译/IRQ1 路由均处于未知
+  状态，keyboard_init 从未编程控制器——真机与 VMware 上键盘无
+  响应。现在开机主动编程：清输出缓冲、停用 kbd/aux 后写命令字
+  节 0x65（IRQ1 开 + set-1 翻译开）、0xF4 启用扫描；并新增 PS/2
+  轮询兜底（keyboard_trychar 同时 poll 串口 LSR 与 i8042 状态口，
+  覆盖 IRQ1 未路由的场景），鼠标字节（AUX 位）照旧丢弃
+- 无盘 ISO 启动注册死循环：FAT 镜像才携带 /etc（mkfatimg.py），
+  initrd 只打包 /bin/*——纯 ISO 引导时根目录没有 /etc，register
+  以 O_CREAT 打开 /etc/shadow 因父目录不存在必失败，向导无限
+  重启。修复为 initrd 同样打包 etc_files() 的零账户 /etc 内容
+  （与 FAT 镜像同一来源，build.py）；顺带修掉 ramfs_mount_initrd
+  对 0 字节文件调 kmalloc(0)（返回 NULL，被误判分配失败导致整
+  个 initrd 拒载）的陷阱，并在无盘路径补建 /root、/home（FAT
+  镜像自带、ramfs 无人创建）。修复后无盘 ISO 全链路冒烟通过：
+  注册 root+用户 → 登录 uid=100 → poweroff 关机
 
 **测试**
-- 内核自测 43/43（-smp 2 与 -smp 1 双跑），shell 自动化 71/71
-  （50 内核 shell + 18 登录/脚本化/改密 + 3 断电存续）；门禁
-  C-J 全绿；check_syscalls 38/38 对齐
+- 内核自测 43/43（-smp 2 与 -smp 1 双跑），shell 自动化 78/78
+  （50 内核 shell + 26 首启注册/登录/脚本化/改密 + 2 断电存续）；
+  门禁 C-J 全绿；check_syscalls 38/38 对齐。test_shell.py 启动时
+  自行重建零账户镜像（从 build/user 重打包，秒级、无需重新编译）
+  ——会话 2 必然踩中首次注册流程；会话 3 证明注册结果断电存续且
+  向导不重跑（等待裸 login: 提示本身就是该断言）
 
 **诚实边界**（教学取舍，1.x 再还）
 - ISO 目标在缺 grub 工具链的宿主上跳过（本仓库 Windows 工具链
   不含 grub-pc-bin/xorriso），真机引导清单留 1.x
 - osh 无引号/转义、变量不导出、无 Ctrl-C 到前台作业；/tmp 无
   sticky 位；/etc/init 只支持一个 respawn 服务
+- register 对 root 密码无强度/复杂度检查（长度上限同
+  ETC_PW_MAX=40）；无 userdel（注销账户留 1.x）；磁盘上残留的
+  /home 目录由向导收养并 chown，不视为错误
 - v0.9.0 的边界（SHA-256 无慢因子、FAT 权限位重启重建、单 tty、
   logout 不清 utmp）原样继承
 

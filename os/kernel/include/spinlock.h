@@ -14,10 +14,13 @@
  *
  * LOCK ORDER (acquire in this order only, release in reverse):
  *
- *   sched_lock  >  fs_lock / pipe locks  >  pmm_lock / heap_lock  >  console_lock
+ *   sched_lock  >  fs_lock / pipe locks  >  cow_lock  >  pmm_lock / heap_lock  >  console_lock
  *
  * sched_lock guards task state, the per-CPU runqueues and the task list.
- * pmm/heap/console are leaves: they never acquire another lock. A caller
+ * cow_lock (v1.0.1) serializes COW fault resolution: a #PF raised inside
+ * an fs/pipe critical section (copyout to a COW page) resolves under it,
+ * and the fault's allocator/free calls put pmm below it. pmm/heap/console
+ * are leaves: they never acquire another lock. A caller
  * may hold sched_lock and then take any other lock; the reverse is a
  * deadlock. Violations are easier to audit than to debug -- keep it linear.
  */

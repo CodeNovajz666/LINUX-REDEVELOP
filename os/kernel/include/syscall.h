@@ -47,10 +47,21 @@
  * (both 0 = "no arguments", argv[0] defaults to the path) */
 /* v1.0.0 -- osh scripting plumbing */
 #define SYS_DUP2        38      /* rdi = oldfd, rsi = newfd -> newfd */
+/* v1.0.0 -- osh debug reports: the kernel debug shell's ps/cpus/mem as
+ * read-only syscalls; truncating append into buf, return bytes stored */
+#define SYS_PS          39      /* rdi = buf, rsi = len -> bytes stored */
+#define SYS_CPUS        40      /* rdi = buf, rsi = len -> bytes stored */
+#define SYS_MEMINFO     41      /* rdi = buf, rsi = len, rdx = verbose */
+/* v1.1.0 -- user-space toolbox: ls/rm/date plumbing so the interactive
+ * programs live in /bin instead of the kernel shell */
+#define SYS_GETDENTS    42      /* rdi = path, rsi = buf, rdx = len -> bytes stored */
+#define SYS_UNLINK      43      /* rdi = path (parent must grant W) */
+#define SYS_DATETIME    44      /* rdi = buf, rsi = len -> bytes stored */
 
 /* ioctl requests (TCGETS/TCSETS subset; flags word: bit 0x8 = ECHO) */
 #define TCGETS 0
 #define TCSETS 1
+#define TCCLEAR 2              /* v1.1.0: clear the screen + home cursor */
 #define TC_ECHO 0x0008
 
 void syscall_dispatch(struct pt_regs *r);

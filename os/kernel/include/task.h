@@ -7,6 +7,7 @@
 #include "novix.h"
 #include "isr.h"
 #include "vfs.h"
+#include "shell.h"                             /* shell_emit_t (task_report_table) */
 
 struct mm;                                     /* mm.h: address-space VMAs */
 
@@ -87,7 +88,9 @@ int task_exec(struct pt_regs *r, const char *path,
 void task_exit(int status) __attribute__((noreturn));
 void task_kill(int signo) __attribute__((noreturn));  /* kill current task */
 void task_kill_task(struct task *t, int signo);       /* kill another task */
-int task_waitpid(int pid, int flags);                   /* blocking; status or -1 */
+/* v1.0.1: >0 = reaped child's pid (exit status -> *status_out when
+ * non-NULL), 0 = WNOHANG and nothing reapable yet, -1 = no such child */
+int task_waitpid(int pid, int flags, int *status_out);
 void task_sleep_until(struct task *t, uint64_t tick);
 
 /* v0.7.0: wake a sleeping/waiting task under sched_lock; returns true when
@@ -103,5 +106,7 @@ struct task *task_next(struct task *t);
 const char *task_state_name(task_state_t s);
 int task_count(void);
 void task_dump_table(void);
+/* v1.0.0: the same `ps` table streamed to a caller sink (sys_ps) */
+void task_report_table(shell_emit_t emit, void *ctx);
 
 #endif /* TASK_H */

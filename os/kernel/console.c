@@ -92,7 +92,7 @@ void console_clear(void) {
 /* Emit [s, s+n) in ONE locked pass: a whole kprintf message lands
  * contiguously in the serial log even when the caller is preempted or a
  * second CPU prints concurrently. */
-static void console_write(const char *s, size_t n) {
+void console_write(const char *s, size_t n) {
     irq_flags_t f;
     if (!console_panicking) spin_lock_irqsave(&console_lock, &f);
     for (size_t i = 0; i < n; i++) {
@@ -132,14 +132,24 @@ void console_puts(const char *s) { console_write(s, strlen(s)); }
 struct putbuf {
     char b[256];
     size_t n;
+    /* string-sink mode (ksnprintf): append into out[0..cap); n keeps
+     * counting everything emitted, bytes past cap are dropped */
+    char *out;
+    size_t cap;
 };
 
 static void pb_flush(struct putbuf *pb) {
+    if (pb->out) return;                        /* string sink: no flushing */
     console_write(pb->b, pb->n);
     pb->n = 0;
 }
 
 static void pb_putc(struct putbuf *pb, char c) {
+    if (pb->out) {
+        if (pb->n < pb->cap) pb->out[pb->n] = c;
+        pb->n++;
+        return;
+    }
     if (pb->n == sizeof(pb->b)) pb_flush(pb);
     pb->b[pb->n++] = c;
 }
@@ -173,11 +183,11 @@ static void print_str(struct putbuf *pb, const char *s, int width, bool left) {
     if (left) for (int p = len; p < width; p++) pb_putc(pb, ' ');
 }
 
-void kvprintf(const char *fmt, va_list ap) {
-    struct putbuf pb;
-    pb.n = 0;
+/* the shared format engine: console sink (kprintf) or string sink
+ * (ksnprintf) -- both go through the same pb_putc */
+static void kfmt(struct putbuf *pb, const char *fmt, va_list ap) {
     for (; *fmt; fmt++) {
-        if (*fmt != '%') { pb_putc(&pb, *fmt); continue; }
+        if (*fmt != '%') { pb_putc(pb, *fmt); continue; }
         fmt++;
         bool left = false;
         int width = 0;
@@ -192,24 +202,29 @@ void kvprintf(const char *fmt, va_list ap) {
         while (*fmt == 'l') { longs++; fmt++; }
         switch (*fmt) {
         case 'd': case 'i':
-            print_int(&pb, longs ? va_arg(ap, long) : va_arg(ap, int), 10, width, pad, left);
+            print_int(pb, longs ? va_arg(ap, long) : va_arg(ap, int), 10, width, pad, left);
             break;
         case 'u':
-            print_uint(&pb, longs ? va_arg(ap, unsigned long) : va_arg(ap, unsigned int), 10, width, pad, left);
+            print_uint(pb, longs ? va_arg(ap, unsigned long) : va_arg(ap, unsigned int), 10, width, pad, left);
             break;
         case 'x':
-            print_uint(&pb, longs ? va_arg(ap, unsigned long) : va_arg(ap, unsigned int), 16, width, pad, left);
+            print_uint(pb, longs ? va_arg(ap, unsigned long) : va_arg(ap, unsigned int), 16, width, pad, left);
             break;
-        case 'p': pb_putc(&pb, '0'); pb_putc(&pb, 'x');
-            print_uint(&pb, (unsigned long)va_arg(ap, void *), 16, 8, '0', false); break;
-        case 's': print_str(&pb, va_arg(ap, const char *), width, left); break;
-        case 'c': pb_putc(&pb, (char)va_arg(ap, int)); break;
-        case '%': pb_putc(&pb, '%'); break;
-        case '\0': pb_flush(&pb); return;
-        default: pb_putc(&pb, '%'); pb_putc(&pb, *fmt); break;
+        case 'p': pb_putc(pb, '0'); pb_putc(pb, 'x');
+            print_uint(pb, (unsigned long)va_arg(ap, void *), 16, 8, '0', false); break;
+        case 's': print_str(pb, va_arg(ap, const char *), width, left); break;
+        case 'c': pb_putc(pb, (char)va_arg(ap, int)); break;
+        case '%': pb_putc(pb, '%'); break;
+        case '\0': pb_flush(pb); return;
+        default: pb_putc(pb, '%'); pb_putc(pb, *fmt); break;
         }
     }
-    pb_flush(&pb);
+    pb_flush(pb);
+}
+
+void kvprintf(const char *fmt, va_list ap) {
+    struct putbuf pb = { .n = 0, .out = NULL, .cap = 0 };
+    kfmt(&pb, fmt, ap);
 }
 
 void kprintf(const char *fmt, ...) {
@@ -217,4 +232,19 @@ void kprintf(const char *fmt, ...) {
     va_start(ap, fmt);
     kvprintf(fmt, ap);
     va_end(ap);
+}
+
+/* v1.0.0: bounded formatting for the shared debug reports -- the same
+ * %-syntax as kprintf, appended truncating into out[0..cap) with a NUL.
+ * Returns the byte count that fit (NUL excluded). */
+int ksnprintf(char *out, size_t cap, const char *fmt, ...) {
+    if (!out || cap == 0) return 0;
+    struct putbuf pb = { .n = 0, .out = out, .cap = cap - 1 };
+    va_list ap;
+    va_start(ap, fmt);
+    kfmt(&pb, fmt, ap);
+    va_end(ap);
+    size_t n = pb.n < pb.cap ? pb.n : pb.cap;
+    out[n] = 0;
+    return (int)n;
 }

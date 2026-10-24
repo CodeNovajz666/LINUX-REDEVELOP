@@ -28,6 +28,13 @@ int etc_getpwnam(const char *name, struct pwent *out);
 int etc_getpwuid(int uid, struct pwent *out);
 int etc_max_uid(void);                        /* highest uid in /etc/passwd */
 
+/* v1.0.0: how many accounts /etc/passwd holds. getty treats 0 as "fresh
+ * machine" and runs the registration wizard instead of login. */
+int etc_user_count(void);
+/* account-name rule shared by useradd and the register wizard: fits
+ * pwent.name and contains no ':' */
+bool etc_valid_name(const char *name);
+
 /* shadow: name:salt:sha256hex */
 int etc_shadow_lookup(const char *name, char salt[9], char hash[65]);
 /* 0 = password matches, 1 = no such account, 2 = mismatch */

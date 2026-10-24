@@ -15,7 +15,12 @@ int etc_read_file(const char *path, char *buf, int max) {
 
 int etc_write_file(const char *path, const char *buf, int len) {
     /* O_CREAT: /var/run/utmp does not exist until the first login
-     * writes it -- shadow rewrites rely on the file already being there */
+     * writes it -- shadow rewrites rely on the file already being there.
+     * Known window (teaching scope): the O_TRUNC hits the target in
+     * place, so a crash mid-write loses the old contents. Callers order
+     * writes so the survivable state is shadow-only (register's rule);
+     * a rename-based atomic replace needs a VFS rename that does not
+     * exist yet. */
     int fd = uopen(path, U_O_WRONLY | U_O_CREAT | U_O_TRUNC);
     if (fd < 0) return -1;
     int n = uwrite_fd(fd, buf, len);
@@ -47,7 +52,11 @@ static int app_int(char *out, int olen, int cap, int v) {
 
 static char pw_buf[2048];
 
-/* one parser, three questions: lookup by name, lookup by uid, max uid */
+/* one parser, three questions: lookup by name, lookup by uid, max uid.
+ * The match and the struct fill are independent (v1.0.1 fix): a lookup
+ * with out == NULL (useradd's duplicate check, passwd's target probe)
+ * must still report "found" -- the old code only cleared `found` inside
+ * the fill guard, so every out == NULL lookup returned -1. */
 static int passwd_scan(struct pwent *out, const char *want_name, int want_uid,
                        int *max_uid) {
     if (etc_read_file("/etc/passwd", pw_buf, sizeof(pw_buf)) < 0) return -1;
@@ -65,19 +74,24 @@ static int passwd_scan(struct pwent *out, const char *want_name, int want_uid,
         if (f[0] && f[2] && f[3]) {
             int uid = parse_int(f[2]);
             if (max_uid && uid > *max_uid) *max_uid = uid;
-            if (out && f[5] && f[6] &&
-                ((want_name && ustrcmp(f[0], want_name) == 0) ||
-                 (!want_name && uid == want_uid))) {
-                ustrncpy(out->name, f[0], sizeof(out->name) - 1);
-                out->name[sizeof(out->name) - 1] = 0;
-                out->uid = uid;
-                out->gid = parse_int(f[3]);
-                ustrncpy(out->home, f[5], sizeof(out->home) - 1);
-                out->home[sizeof(out->home) - 1] = 0;
-                const char *sh = f[6][0] ? f[6] : "/bin/osh";
-                ustrncpy(out->shell, sh, sizeof(out->shell) - 1);
-                out->shell[sizeof(out->shell) - 1] = 0;
-                found = 0;
+            if ((want_name && ustrcmp(f[0], want_name) == 0) ||
+                (!want_name && uid == want_uid)) {
+                found = 0;                      /* match regardless of out */
+                if (out) {
+                    ustrncpy(out->name, f[0], sizeof(out->name) - 1);
+                    out->name[sizeof(out->name) - 1] = 0;
+                    out->uid = uid;
+                    out->gid = parse_int(f[3]);
+                    /* a short line may lack home/shell: default them
+                     * instead of failing the match (mangled lines are
+                     * still found -- callers decide what to do) */
+                    const char *home = (f[5] && f[5][0]) ? f[5] : "/home";
+                    ustrncpy(out->home, home, sizeof(out->home) - 1);
+                    out->home[sizeof(out->home) - 1] = 0;
+                    const char *sh = (f[6] && f[6][0]) ? f[6] : "/bin/osh";
+                    ustrncpy(out->shell, sh, sizeof(out->shell) - 1);
+                    out->shell[sizeof(out->shell) - 1] = 0;
+                }
             }
         }
         line = nl ? nl + 1 : 0;
@@ -97,6 +111,36 @@ int etc_max_uid(void) {
     int max = 0;
     passwd_scan(0, 0, 0, &max);
     return max;
+}
+
+int etc_user_count(void) {
+    /* same validity rule as passwd_scan (name:..:uid:gid:..): blank and
+     * mangled lines are not accounts. A missing file also reads as 0 --
+     * an unreadable passwd means nobody can log in, same as an empty one */
+    if (etc_read_file("/etc/passwd", pw_buf, sizeof(pw_buf)) < 0) return 0;
+    int n = 0;
+    for (char *line = pw_buf; line && *line; ) {
+        char *nl = ustrchr(line, '\n');
+        if (nl) *nl = 0;
+        char *p = line;
+        int fields = 0;
+        while (p) {
+            fields++;
+            char *c = ustrchr(p, ':');
+            if (c) { *c = 0; p = c + 1; } else p = 0;
+        }
+        if (line[0] && fields >= 4) n++;
+        line = nl ? nl + 1 : 0;
+    }
+    return n;
+}
+
+bool etc_valid_name(const char *name) {
+    /* the name must survive every consumer intact: pwent.name is 24 bytes,
+     * and a ':' would split the passwd/shadow line early (getpwnam would
+     * then disagree with shadow_lookup and the account could never log in) */
+    unsigned long n = ustrlen(name);
+    return n > 0 && n < sizeof(((struct pwent *)0)->name) && !ustrchr(name, ':');
 }
 
 int etc_shadow_lookup(const char *name, char salt[9], char hash[65]) {
@@ -186,7 +230,9 @@ int etc_passwd_append(const struct pwent *e) {
     olen = app_str(line, olen, sizeof(line), "::");
     olen = app_str(line, olen, sizeof(line), e->home);
     olen = app_str(line, olen, sizeof(line), ":/bin/osh\n");
-    int fd = uopen("/etc/passwd", U_O_WRONLY | U_O_APPEND);
+    /* O_CREAT: the out-of-box image ships an empty /etc/passwd -- the
+     * first append ever is the registration wizard writing root's line */
+    int fd = uopen("/etc/passwd", U_O_WRONLY | U_O_APPEND | U_O_CREAT);
     if (fd < 0) return -1;
     int w = uwrite_fd(fd, line, olen);
     uclose(fd);

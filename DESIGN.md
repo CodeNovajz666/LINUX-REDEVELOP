@@ -116,12 +116,28 @@ v0.3.0 移植定基，v0.5.0 随 sbrk 固化，v0.6.0 mmap 区启用。**写死�
 | 35 | mkdir | path | 0（父目录须授 W） |
 | 36 | chown | path, uid, gid | 0（仅 root；只改 inode 缓存） |
 | 37 | getruid | — | ruid（SUID exec 后仍记调用者） |
+| 38 | dup2 | oldfd, newfd | newfd（v1.0.0：并入 oldfd 的打开文件描述、共享偏移；newfd 已开先隐式关闭） |
+| 39 | ps | buf*, len | 字节数（v1.0.0：任务表报告流式写入 buf，截断） |
+| 40 | cpus | buf*, len | 字节数（v1.0.0：每 CPU 一行，截断） |
+| 41 | meminfo | buf*, len, verbose | 字节数（v1.0.0：内存统计，verbose≠0 附加 mm/swap 行） |
+| 42 | getdents | path, buf*, len | 字节数（v1.1.0：目录枚举报告，目录须授 R；内核 shell ls 同源） |
+| 43 | unlink | path | 0（v1.1.0：拒绝目录；父目录 W 在 VFS 内检查） |
+| 44 | datetime | buf*, len | 字节数（v1.1.0：RTC 墙钟行；RTC 不 sane 返 −1） |
 
 约定：错误统一 −1（sign-extend）；pipe 的"请稍后重试"是 −2
 （`EAGAIN_RETRY`，仅 pipe 返回，ulib 包装成阻塞语义）。
 v0.9.0：SYS_SPAWN/SYS_EXEC 扩参——rsi = char\*\* argv、
 rdx = argc，ELF 加载器把 argv 数组压上用户栈（`main(argc, argv)`）；
 exec 同名不换 uid/gid/cwd（POSIX），SUID 例外见 §6.2。
+v1.0.0：新增 38 号 DUP2——osh 管道/重定向的接线，语义见上表；
+新增 39-41 号只读调试报告（ps/cpus/meminfo）——内核 debug shell 的
+同名命令经共享报告函数流式写入用户缓冲，osh 以内建命令呈现，
+内核 shell 保留为 console=debug 急救路径。
+v1.1.0：新增 42-44 号——/bin 交互工具箱的接线（ls/rm/date）。
+ls 列表与 RTC 日期行继续走共享报告函数模式（shell_report_dir /
+shell_report_date，内核 shell 与 syscall 同源逐字一致）；43 号
+unlink 直接暴露 VFS 既有删除能力（父目录 W 检查在 VFS 内）。
+ioctl 33 号扩 TCCLEAR=2 请求（清屏回位，无 flags 指针）。
 
 ## 4. 版本测试账目
 
@@ -135,6 +151,8 @@ exec 同名不换 uid/gid/cwd（POSIX），SUID 例外见 §6.2。
 | v0.7.0 | 34（smp=2 与 smp=1 双跑） | 45（会话跑在 2 CPU） |
 | v0.8.0 | 38（gate H 磁盘套件，smp=2/1 双跑） | 50（FAT 根上的持久化检查） |
 | v0.9.0 | 41（gate I uid 套件，smp=2/1 双跑） | 66（50 内核 shell + 13 登录/passwd 回环 + 3 断电密码存续） |
+| v1.0.0 | 44（gate J osh 套件含调试报告，smp=2/1 双跑） | 84（50 内核 shell + 32 首启注册/登录回环 + 2 断电注册存续） |
+| v1.1.0 | 46（gate J 增 user_toolbox：目录枚举/unlink 往返/RTC sane，smp=2/1 双跑） | 93（50 内核 shell + 41 首启注册/登录/交互工具箱 + 2 断电注册存续） |
 
 `python build.py test`（自测）与 `python tools/test_shell.py`
 （串口自动化）双双全绿是收版的硬门槛；页账目零回退由 gate C/D/E
@@ -142,9 +160,12 @@ exec 同名不换 uid/gid/cwd（POSIX），SUID 例外见 §6.2。
 起 SMP 套件由 gate G 把关（断言随在线核数自适应，`-smp 1` 亦全绿），
 v0.8.0 起磁盘套件由 gate H 把关（FAT 根读写往返 + 独立实例重挂的
 断电语义），v0.9.0 起身份套件由 gate I 把关（setuid 边界漫步 +
-shadow 哈希往返 + alice 三向权限）。shell 测试自 v0.9.0 起为
-三会话：console=debug 内核 shell 全量回归、登录链冒烟（含 passwd
-改密回环）、断电后新密码存续（shadow 在 FAT 盘上）。
+shadow 哈希往返 + alice 三向权限），v1.0.0 起 osh 套件由
+gate J 把关（DUP2 接线 + 脚本化工具箱 + 调试报告内核侧断言）。shell 测试自 v0.9.0 起
+为三会话，v1.0.0 起会话语义随开箱注册更新：console=debug 内核
+shell 全量回归、首启注册向导 + 登录世界（两步注册、错误密码、
+passwd 改密、osh 脚本特性）、断电后注册账户与新密码存续
+（shadow 在 FAT 盘上）。
 
 ## 5. SMP 契约（v0.7.0 定基）
 

@@ -39,8 +39,16 @@
 #define SYS_CHOWN       36
 #define SYS_GETRUID     37
 #define SYS_DUP2        38
+#define SYS_PS          39
+#define SYS_CPUS        40
+#define SYS_MEMINFO     41
+/* v1.1.0 -- user-space toolbox */
+#define SYS_GETDENTS    42
+#define SYS_UNLINK      43
+#define SYS_DATETIME    44
 #define TCGETS          0
 #define TCSETS          1
+#define TCCLEAR         2
 
 /* pipe read/write "blocking, retry" marker (see kernel fs/pipe.c) */
 #define EAGAIN_RETRY (-2L)
@@ -65,7 +73,14 @@ int ugetpid(void) { return (int)_sys3(SYS_GETPID, 0, 0, 0); }
 int uyield(void) { return (int)_sys3(SYS_YIELD, 0, 0, 0); }
 int usleep(int ms) { return (int)_sys3(SYS_SLEEP, ms, 0, 0); }
 int uspawn(const char *name) { return (int)_sys3(SYS_SPAWN, (long)name, 0, 0); }
-int uwaitpid(int pid) { return (int)_sys3(SYS_WAITPID, pid, 0, 0); }
+/* v1.0.1: the kernel returns the reaped child's pid and hands the exit
+ * status out through a pointer; uwaitpid keeps its historical contract
+ * (returns the status, or -1) so its callers don't change. */
+int uwaitpid(int pid) {
+    int st = 0;
+    if (_sys3(SYS_WAITPID, pid, 0, (long)&st) < 0) return -1;
+    return st;
+}
 int ugetchar(void) { return (int)_sys3(SYS_GETCHAR, 0, 0, 0); }
 void uexit(int status) { _sys3(SYS_EXIT, status, 0, 0); for (;;) __asm__ volatile("hlt"); }
 
@@ -76,6 +91,9 @@ int ufork(void) { return (int)_sys3(SYS_FORK, 0, 0, 0); }
 int ukill(int pid, int sig) { return (int)_sys3(SYS_KILL, pid, sig, 0); }
 long usbrk(long inc) { return _sys3(SYS_SBRK, inc, 0, 0); }
 int upipe(int fds[2]) { return (int)_sys3(SYS_PIPE, (long)fds, 0, 0); }
+/* WNOHANG poll (v1.0.1): >0 = reaped that child's pid, 0 = kids still
+ * alive, -1 = no such child. The reaped side used to return the exit
+ * status itself, so "exited 0" was indistinguishable from "alive". */
 int uwaitpid_nohang(int pid) { return (int)_sys3(SYS_WAITPID, pid, U_WNOHANG, 0); }
 
 /* sigreturn trampoline: the kernel pushes this address as the handler's
@@ -219,6 +237,29 @@ unsigned long uuptime(void) { return (unsigned long)_sys3(SYS_UPTIME, 0, 0, 0); 
 void upoweroff(void) {
     _sys3(SYS_POWEROFF, 0, 0, 0);
     for (;;) __asm__ volatile("hlt");
+}
+
+/* debug reports (v1.0.0): kernel-formatted ps/cpus/mem tables, appended
+ * truncating into buf; return bytes stored, -1 on a bad buffer/len */
+int ups(char *buf, int len) { return (int)_sys3(SYS_PS, (long)buf, len, 0); }
+int ucpus(char *buf, int len) { return (int)_sys3(SYS_CPUS, (long)buf, len, 0); }
+int umeminfo(char *buf, int len, int verbose) {
+    return (int)_sys3(SYS_MEMINFO, (long)buf, len, verbose);
+}
+
+/* v1.1.0 -- user-space toolbox: the /bin programs (ls/rm/date/clear) are
+ * thin clients of these; the kernel formats listings and the date line. */
+int ugetdents(const char *path, char *buf, int len) {
+    return (int)_sys3(SYS_GETDENTS, (long)path, (long)buf, len);
+}
+int uunlink(const char *path) {
+    return (int)_sys3(SYS_UNLINK, (long)path, 0, 0);
+}
+int udatetime(char *buf, int len) {
+    return (int)_sys3(SYS_DATETIME, (long)buf, len, 0);
+}
+int uclear(void) {
+    return (int)_sys3(SYS_IOCTL, 1, TCCLEAR, 0);
 }
 
 /* terminal echo: TCGETS/TCSETS on fd 0. login turns echo off before the

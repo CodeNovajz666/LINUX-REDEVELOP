@@ -1,4 +1,4 @@
-# Novix 系统调用参考（v1.0.0）
+# Novix 系统调用参考（v1.1.0）
 
 对标原内核模块的 `docs/api.md`。编号在 `kernel/include/syscall.h`
 定义、`kernel/syscall.c syscall_dispatch` 分发、`user/ulib.c` 封装。
@@ -39,12 +39,18 @@
 | 30 | SETGID | gid | 0 | 同 SETUID 规则 |
 | 31 | CHDIR | path | 0 | 目录需要 X 位 |
 | 32 | GETCWD | buf / len | strlen | len≥2 |
-| 33 | IOCTL | fd(0-2) / req / u16* flags | 0 | TCGETS=0 TCSETS=1，位 0x8=ECHO |
+| 33 | IOCTL | fd(0-2) / req / u16* flags | 0 | TCGETS=0 TCSETS=1（位 0x8=ECHO）；v1.1.0 增 TCCLEAR=2（清屏回位，无 flags） |
 | 34 | POWEROFF | — | — | isa-debug-exit 退出 QEMU |
 | 35 | MKDIR | path | 0 | 父目录需要 W+X |
 | 36 | CHOWN | path / uid / gid | 0 | 仅 root；FAT 下只改 inode 缓存 |
 | 37 | GETRUID | — | ruid | SUID exec 后仍是调用者 |
 | 38 | DUP2 | oldfd / newfd | newfd | v1.0.0：osh 重定向/管道接线 |
+| 39 | PS | buf / len | 字节数 | v1.0.0：osh 内建 ps；任务表报告，截断式写入 |
+| 40 | CPUS | buf / len | 字节数 | v1.0.0：osh 内建 cpus；每 CPU 一行，截断式写入 |
+| 41 | MEMINFO | buf / len / verbose | 字节数 | v1.0.0：osh 内建 mem；verbose≠0 附加 mm/swap 行 |
+| 42 | GETDENTS | path / buf / len | 字节数 | v1.1.0：/bin/ls；目录须授 R；内核 shell 同源报告，截断式写入 |
+| 43 | UNLINK | path | 0 | v1.1.0：/bin/rm；拒绝目录；父目录 W 在 VFS 内检查 |
+| 44 | DATETIME | buf / len | 字节数 | v1.1.0：/bin/date；RTC 墙钟（与内核 shell date 同行格式）；RTC 不 sane 返 -1 |
 
 ## ABI 约定
 

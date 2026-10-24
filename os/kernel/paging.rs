@@ -52,6 +52,14 @@ extern "C" {
     fn pmm_free(pa: u64); // refcount-aware since v0.4.0
     fn pmm_ref_inc(pa: u64);
     fn pmm_ref_get(pa: u64) -> u32;
+
+    // v1.0.1 (F5): COW-fault serialization (pmm.c) -- held across the whole
+    // refcount-sample/copy/ref-drop/PTE-rebase sequence below so two CPUs
+    // can never fault the same shared frame concurrently. enter returns the
+    // EFLAGS to hand back to leave (irqsave lock: the fault path runs with
+    // IF=0, but a stray caller with IF=1 must not self-deadlock).
+    fn cow_lock_enter() -> u32;
+    fn cow_lock_leave(flags: u32);
     fn rust_panic_msg(msg: *const u8) -> !; // kernel/kpanic.c
 }
 
@@ -403,16 +411,23 @@ pub extern "C" fn paging_cow_fault(pml4_pa: u64, va: u64) -> i32 {
         if e1 & P_COW == 0 { return -1; }             // not ours to fix
 
         let frame = e1 & ADDR_MASK;
+        // v1.0.1 (F5): the sample-decide-copy-drop-rebase sequence is now
+        // atomic across CPUs (see cow_lock in pmm.c).
+        let lock_flags = cow_lock_enter();
         if pmm_ref_get(frame) == 0 {
             // last owner: keep the frame, re-grant write
             pte_p.write_volatile(e1 | P_RW);
         } else {
             let copy = pmm_alloc();
-            if copy == 0 { return -1; }
+            if copy == 0 {
+                cow_lock_leave(lock_flags);
+                return -1;
+            }
             core::ptr::copy_nonoverlapping(frame as *const u8, copy as *mut u8, 4096);
             pmm_free(frame);                          // refcount-aware drop
             pte_p.write_volatile(copy | (e1 & !ADDR_MASK & !P_COW) | P_RW);
         }
+        cow_lock_leave(lock_flags);
         core::arch::asm!("invlpg [{}]", in(reg) va, options(preserves_flags));
     }
     0

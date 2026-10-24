@@ -69,7 +69,31 @@ void pmm_ref_inc(uint64_t pa) {
 }
 
 uint32_t pmm_ref_get(uint64_t pa) {
-    return refcount[page_to_bit_index(pa)];
+    irq_flags_t f; spin_lock_irqsave(&pmm_lock, &f);
+    uint32_t r = refcount[page_to_bit_index(pa)];
+    spin_unlock_irqrestore(&pmm_lock, f);
+    return r;
+}
+
+/* v1.0.1 (F5): serializes the whole COW fault decision -- refcount sample,
+ * frame copy, ref drop, PTE rebase -- across CPUs. Before, two CPUs could
+ * COW-fault the same shared frame concurrently and each act on a stale
+ * refcount sample: one CPU's pmm_free could free the frame (or the other's
+ * memcpy could read from a frame that had just been released and handed
+ * back out) while this CPU was mid-fault. Nesting: cow_lock > pmm_lock
+ * (the fault allocates and frees while holding it); nothing takes
+ * cow_lock while holding pmm_lock, so the order stays acyclic. The #PF
+ * path runs with interrupts off (interrupt gates), but keep the lock
+ * irqsave so a stray caller with IF=1 cannot self-deadlock. */
+static spinlock_t cow_lock = SPINLOCK_INIT;
+
+uint32_t cow_lock_enter(void) {
+    irq_flags_t f; spin_lock_irqsave(&cow_lock, &f);
+    return f;
+}
+
+void cow_lock_leave(uint32_t f) {
+    spin_unlock_irqrestore(&cow_lock, f);
 }
 
 void pmm_free(uint64_t pa) {

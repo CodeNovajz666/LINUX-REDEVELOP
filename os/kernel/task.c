@@ -8,6 +8,7 @@
 #include "vfs.h"
 #include "isr.h"
 #include "console.h"
+#include "shell.h"
 #include "timer.h"
 #include "percpu.h"
 #include "smp.h"
@@ -175,7 +176,6 @@ struct task *task_create_kernel(const char *name, void (*entry)(void *), void *a
         struct task *cur = current_task();
         t->ppid = cur ? cur->pid : -1;
     }
-    t->state = TASK_RUNNABLE;
     t->kstack_base = (uint64_t)(uintptr_t)kmalloc(KSTACK_SIZE);
     if (!t->kstack_base) { spin_unlock_irqrestore(&sched_lock, f); return NULL; }
     t->kstack_top = t->kstack_base + KSTACK_SIZE;
@@ -183,6 +183,11 @@ struct task *task_create_kernel(const char *name, void (*entry)(void *), void *a
     t->kfn = entry;
     t->karg = arg;
     build_first_frame(t, (uint64_t)(uintptr_t)kthread_trampoline, 0, false);
+    /* v1.0.1 (F7): publish the task only once every allocation succeeded.
+     * RUNNABLE before the kstack kmalloc turned an OOM into a leaked slot:
+     * it was on no list (invisible to the scheduler and task_find) yet
+     * never TASK_UNUSED again, so task_slot could not reclaim it. */
+    t->state = TASK_RUNNABLE;
     task_list_add(t);
     spin_unlock_irqrestore(&sched_lock, f);
     sched_notify_new_task(t);
@@ -222,10 +227,8 @@ struct task *task_create_user(const char *name, struct inode *elf_ino,
         struct task *cur = current_task();
         t->ppid = cur ? cur->pid : -1;
     }
-    t->state = TASK_RUNNABLE;
     t->is_user = true;
     t->brk = brk;
-    t->mm = mm;
     t->kstack_base = (uint64_t)(uintptr_t)kmalloc(KSTACK_SIZE);
     if (!t->kstack_base) {
         spin_unlock_irqrestore(&sched_lock, f);
@@ -237,6 +240,7 @@ struct task *task_create_user(const char *name, struct inode *elf_ino,
     t->page_dir = pd;
     t->mm = mm;
     build_first_frame(t, entry, uesp, true);
+    t->state = TASK_RUNNABLE;        /* F7: after all allocations */
     task_list_add(t);
     spin_unlock_irqrestore(&sched_lock, f);
     sched_notify_new_task(t);
@@ -307,7 +311,6 @@ struct task *task_fork(struct pt_regs *parent_regs) {
     t->priority = t->base_priority = parent->base_priority;
     t->pid = (int)(t - tasks);
     t->ppid = parent->pid;
-    t->state = TASK_RUNNABLE;
     t->on_cpu = -1;                /* parked from birth (memset skipped task_fill) */
     t->is_user = true;
     /* v0.9.0: identity and working directory are inherited across fork
@@ -345,6 +348,7 @@ struct task *task_fork(struct pt_regs *parent_regs) {
     t->brk = parent->brk;
 
     task_list_add(t);
+    t->state = TASK_RUNNABLE;        /* F7: after all allocations */
     spin_unlock_irqrestore(&sched_lock, f);
     sched_notify_new_task(t);
     return t;
@@ -494,7 +498,15 @@ void task_kill_task(struct task *t, int signo) {
     smp_resched_others();        /* victim's CPU drops it at the next tick */
 }
 
-int task_waitpid(int pid, int flags) {
+/* v1.0.1: POSIX-exact waitpid. Returns the reaped child's PID and hands
+ * its exit status out through *status_out (when non-NULL); 0 means
+ * WNOHANG was set and nothing was reapable yet; -1 means the caller has
+ * no such child. The old ABI returned the status itself, which made
+ * WNOHANG ambiguous: "child alive" and "child exited 0" both read 0, so
+ * a poller could never tell a live job from a finished one. WNOHANG also
+ * no longer sleeps out the "killed remotely, still draining" window -- a
+ * poll reports 0 and the next poll reaps. */
+int task_waitpid(int pid, int flags, int *status_out) {
     for (;;) {
         irq_flags_t f;
         bool executing_zombie = false;
@@ -520,6 +532,7 @@ int task_waitpid(int pid, int flags) {
              * The slot stays ZOMBIE until every resource is back so a racing
              * task_create can not memset it under our feet. */
             int status = zombie->exit_status;
+            int zpid = zombie->pid;
             bool was_user = zombie->is_user;
             uint64_t kstack = zombie->kstack_base;
             task_list_remove(zombie);
@@ -528,14 +541,17 @@ int task_waitpid(int pid, int flags) {
             kfree((void *)(uintptr_t)kstack);
             if (was_user) mm_release(zombie);
             zombie->state = TASK_UNUSED;            /* slot recyclable now */
-            return status;
+            if (status_out) *status_out = status;
+            return zpid;
         }
         spin_unlock_irqrestore(&sched_lock, f);
 
         if (!have_child) return -1;
+        if (flags & WNOHANG) return 0;      /* children alive (or still draining) */
         if (executing_zombie) {
             /* killed remotely, still draining on some CPU: retry after a
-             * tick instead of WAITING (nothing will ever wake us) */
+             * tick instead of WAITING (nothing will ever wake us). Only
+             * blocking waiters sleep here -- WNOHANG bailed out above. */
             task_sleep_until(current_task(), timer_ticks() + 1);
             kyield();
             continue;
@@ -552,35 +568,33 @@ int task_waitpid(int pid, int flags) {
     }
 }
 
-/* small int-to-string helper (no snprintf in the kernel yet) */
-static const char *itoa_dec(int v, char *end) {
-    char *p = end;
-    *--p = '\0';
-    unsigned u = (v < 0) ? -(unsigned)v : (unsigned)v;
-    if (u == 0) *--p = '0';
-    while (u) { *--p = '0' + (u % 10); u /= 10; }
-    if (v < 0) *--p = '-';
-    return p;
-}
+/* v1.0.0: the `ps` table report, streamed through a caller sink. The
+ * kernel debug shell prints via shell_emit_console; sys_ps appends the
+ * same lines into a user buffer. */
+static const char task_report_hdr[] =
+    "PID   PPID  STATE     PRI  CPU  UID   TICKS  USER  EXIT      NAME\n";
 
-void task_dump_table(void) {
-    kprintf("PID   PPID  STATE     PRI  CPU  UID   TICKS  USER  EXIT      NAME\n");
+void task_report_table(shell_emit_t emit, void *ctx) {
+    emit(task_report_hdr, (int)sizeof(task_report_hdr) - 1, ctx);
     for (struct task *t = task_list; t; t = t->next) {
-        char exit_buf[12];
+        char exit_buf[16];
         const char *exit_str = "-";
         if (t->state == TASK_ZOMBIE) {
-            char num[12];
-            const char *np = itoa_dec(t->kill_signo ? t->kill_signo : t->exit_status,
-                                       num + sizeof(num));
-            char *o = exit_buf;
-            if (t->kill_signo) { *o++ = 's'; *o++ = 'i'; *o++ = 'g'; }
-            while (*np) *o++ = *np++;
-            *o = '\0';
+            ksnprintf(exit_buf, sizeof(exit_buf),
+                      t->kill_signo ? "sig%d" : "%d",
+                      t->kill_signo ? t->kill_signo : t->exit_status);
             exit_str = exit_buf;
         }
-        kprintf("%-5d %-5d %-9s %-3d %-4d %-5u %-6u %-5s %-9s %s\n",
+        char row[96];
+        int n = ksnprintf(row, sizeof(row),
+                "%-5d %-5d %-9s %-3d %-4d %-5u %-6u %-5s %-9s %s\n",
                 t->pid, t->ppid, task_state_name(t->state),
                 t->priority, t->cpu, t->uid, (unsigned)t->ticks_run,
                 t->is_user ? "yes" : "no", exit_str, t->name);
+        emit(row, n, ctx);
     }
+}
+
+void task_dump_table(void) {
+    task_report_table(shell_emit_console, 0);
 }

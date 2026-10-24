@@ -116,8 +116,14 @@ USER_PROGRAMS = ['hello', 'spawner', 'fault_div', 'fault_segv', 'filetest',
                  # v0.9.0: users & login
                  'getty', 'login', 'id', 'whoami', 'who',
                  'passwd', 'useradd', 'cat', 'touch', 'uidtest',
+                 # v1.0.0: first-boot registration wizard
+                 'register',
                  # v1.0.0: osh scripting world (osh replaces sh)
-                 'osh', 'echo', 'grep', 'init', 'iotest']
+                 'osh', 'echo', 'grep', 'init', 'iotest',
+                 # v1.1.0: interactive toolbox (ls/rm/date/clear plumbing:
+                 # SYS_GETDENTS/UNLINK/DATETIME + ioctl TCCLEAR)
+                 'ls', 'pwd', 'rm', 'cp', 'mv', 'date',
+                 'sleep', 'uname', 'clear']
 
 def run(cmd, **kw):
     printable = ' '.join(str(c) for c in cmd)
@@ -191,6 +197,23 @@ def build_ramfs_image(binaries):
     """pack user binaries into the ramfs image embedded in the kernel"""
     out = os.path.join(BUILD, 'ramfs_img.c')
     pairs = ['/bin/%s=%s' % (os.path.basename(b), b) for b in binaries]
+    # v1.0.0: the no-disk boot (grub ISO) serves /etc from the initrd too --
+    # the same zero-account content as the FAT image (single source:
+    # mkfatimg.etc_files). Without it /etc does not exist at all, the
+    # first-boot wizard cannot create /etc/shadow and the machine loops at
+    # registration forever. Empty-dir entries (/root/, /home/) are skipped:
+    # kmain creates those on the ramfs fallback.
+    sys.path.insert(0, os.path.join(ROOT, 'tools'))
+    from mkfatimg import etc_files
+    etc_dir = os.path.join(BUILD, 'etc')
+    os.makedirs(etc_dir, exist_ok=True)
+    for path, data in etc_files():
+        if data is None:
+            continue
+        src = os.path.join(etc_dir, path.strip('/').replace('/', '_'))
+        with open(src, 'wb') as f:
+            f.write(data)
+        pairs.append('%s=%s' % (path, src))
     run([sys.executable, os.path.join(ROOT, 'tools', 'mkramfs.py'), out] + pairs)
     return out
 
@@ -317,9 +340,10 @@ def qemu_cmd(smp=2, append='root=/dev/hd0'):
 def cmd_run(argv):
     smp, _ = parse_smp(argv)
     build_kernel()
-    print(f'booting with {smp} cpu(s) (gates C-I run in the init task, '
-          f'then getty asks you to log in; the root password was printed '
-          f'above and lives in build/etc-passwd.txt)...')
+    print(f'booting with {smp} cpu(s) (gates C-J run in the init task, '
+          f'then a fresh system runs first-boot registration -- you set '
+          f'the root password and create your user; later boots ask you '
+          f'to log in)...')
     cmd = qemu_cmd(smp, 'root=/dev/hd0 interactive') + ['-serial', 'stdio']
     try:
         rc = subprocess.call(cmd)

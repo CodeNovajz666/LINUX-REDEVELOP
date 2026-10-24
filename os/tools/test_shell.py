@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
 """Drive the Novix interactive shell over QEMU's -serial stdio.
 
-Three sessions (v0.9.0):
+Three sessions (v1.0.0):
   session 1 -- console=debug boots straight into the kernel shell: the
                full command battery (v0.2.0 .. v0.8.0 regression).
-  session 2 -- the default boot now hands the machine to the login world
-               (init -> getty -> login -> sh). Login smoke test as the
-               fixed "ktest" account (password "ktest-pass"; the separate
-               shadow-only "kck" anchor keeps the shadow_roundtrip ktest
-               byte-exact on this same image -- see mkfatimg.py):
+  session 2 -- the default boot of a FRESH image: getty finds zero
+               accounts and runs first-boot registration (root password,
+               then the "ktest" user with password "ktest-pass"), which
+               exits back into the respawn and the login world:
                wrong password rejected, shadow unreadable, passwd
                roundtrip, logout -> getty respawn, old password dead.
-  session 3 -- fresh boot: only the new password works (the shadow lives
-               on the FAT32 disk), then ktest-pass is restored so the
-               run stays idempotent against the same image.
+               (The shadow-only "kck" anchor keeps the shadow_roundtrip
+               ktest byte-exact on this same image -- see mkfatimg.py.)
+  session 3 -- fresh boot: the registered accounts survive poweroff
+               (/etc lives on the FAT32 disk) and the registration wizard
+               does NOT re-run -- straight to the login prompt, and only
+               the password changed in session 2 works.
+The disk image is regenerated at startup: session 2 must see the
+zero-account first boot, and a previous run left registered accounts on
+the disk (they survive poweroff -- that is the point).
 """
 import os, sys, subprocess, time, threading
 
@@ -32,6 +37,21 @@ if not QEMU:
     sys.exit('qemu-system-x86_64 not found')
 
 COMMANDS = []
+
+# ---- regenerate a fresh zero-account disk image ----
+# The v1.0.0 out-of-box image ships no accounts: session 2 must land in
+# the first-boot registration wizard. A previous run of this script left
+# registered accounts on the disk (they survive poweroff -- that is the
+# feature under test), so rebuild the image from build/user (mkfatimg
+# needs no compiler; it takes seconds).
+_user_dir = os.path.join(ROOT, 'build', 'user')
+if not os.path.exists(KERNEL) or not os.path.isdir(_user_dir):
+    sys.exit('build/kernel.elf or build/user missing -- run `python build.py` first')
+_progs = sorted(f for f in os.listdir(_user_dir) if '.' not in f)
+_mk = os.path.join(ROOT, 'tools', 'mkfatimg.py')
+_pairs = ['/bin/%s=%s' % (p, os.path.join(_user_dir, p)) for p in _progs]
+subprocess.run([sys.executable, _mk, DISK] + _pairs, check=True)
+print('fresh zero-account image: %s' % DISK)
 
 EXPECT = [
     ('help',        'commands:'),
@@ -104,14 +124,32 @@ COUNT_EXPECT = [
     ('tab forker rerun', 'COW-ISOLATION-OK', 2),
 ]
 
-# session 2 (v0.9.0): the login world, including the passwd roundtrip
+# session 1: text that must NOT appear anywhere in the log
+ABSENT_EXPECT = [
+    # v1.0.1 (F3): the kernel shell reaps exited `spawn` children before
+    # each prompt and again before each dispatched command, so no `ps` in
+    # the session can ever catch a ZOMBIE row. Before the fix every
+    # exited child stayed a zombie forever, holding its slot and pid.
+    ('no zombie rows in ps', 'ZOMBIE'),
+]
+
+# session 2 (v1.0.0): first-boot registration, then the login world
 LOGIN_EXPECT = [
+    # the registration wizard (fresh image: zero accounts in /etc/passwd)
+    ('firstboot banner',     'no user accounts exist yet'),
+    ('register root prompt', 'New password for root: '),
+    ('register root set',    'register: root password set'),
+    ('register name prompt', 'Choose a username (empty for a root-only system): '),
+    ('register user pw',     'New password: '),
+    ('register user created', "register: account 'ktest' created (uid 100, home /home/ktest)"),
+    ('register done',        'Registration complete. Please log in.'),
+    # then the normal login flow
     ('login issue',        'authorized users only'),
     ('login prompt',       'login: '),
     ('password prompt',    'Password: '),
     ('bad password',       'Login incorrect'),
     ('login shell prompt', 'ktest@novix:/home/ktest$'),
-    ('id shows ktest',     'uid=200(ktest) gid=200(ktest)'),
+    ('id shows ktest',     'uid=100(ktest) gid=100(ktest)'),
     ('whoami',             '\nktest\r'),   # guest serial emits CRLF; a Windows
                                            # host QEMU doubles the CR (0D 0D 0A),
                                            # so anchor on the CR the OS sent
@@ -123,8 +161,34 @@ LOGIN_EXPECT = [
     ('osh exit status',    'code=1'),
     ('osh background job', '[1] pid '),
     ('osh comments',       'cc-comment'),
+    # v1.0.0: osh debug reports (syscalls 39-41 -> ps/cpus/mem/upt/kill)
+    ('osh ps header',      'PID   PPID  STATE'),
+    ('osh ps shell row',   'osh\r\n'),      # getty exec'd login exec'd osh
+    ('osh cpus header',    'CPU  APIC  ONLINE'),
+    ('osh mem lines',      'pages free'),
+    ('osh upt',            'uptime: '),
+    ('osh kill no task',   'kill: no such task (pid 999)'),
+    # v1.0.1: strict parse (pid 0 is not a pid, rejected client-side) and
+    # the uid check in sys_kill: ktest (uid 100) may not signal kswapd
+    # (pid 2, a uid-0 kernel thread -- before the check this killed it)
+    ('osh kill bad pid',   "kill: bad pid '0'"),
+    ('osh kill mortal guard', 'kill: no such task (pid 2)'),
+    # v1.1.0: interactive toolbox (SYS_GETDENTS/UNLINK/DATETIME + TCCLEAR)
+    ('osh ls dir tag',       '<dir>'),          # `ls /` entry-type tags
+    ('osh pwd home',         '/home/ktest\r\n'), # login home via SYS_GETCWD
+    ('osh cd tmp prompt',    '@novix:/tmp$'),    # the prompt tracks the cwd
+    ('osh touch ls',         'tb0.txt'),        # created, then listed
+    ('osh cp+mv roundtrip',  'toolbox-line'),   # cp wrote it, mv moved it, cat
+                                                # proves the content travelled
+    ('osh rm missing',       'rm: no-such-file: failed'),
+    ('osh date local',       'local (unix'),    # the RTC line, kernel-formatted
+    ('osh uname',            'Novix 1.1.0'),    # only uname prints the new
+                                                # version (banners stay 1.0.0)
+    ('osh history',          '  1  id'),        # the first osh line, numbered
 ]
 LOGIN_COUNT_EXPECT = [
+    # register's own retype prompt, then passwd's roundtrip one
+    ('register retypes', 'Retype new password: ', 3),
     # logout unwinds the getty->login->sh chain back to init, which
     # respawns getty: the banner prints a second time
     ('getty respawn', 'authorized users only', 2),
@@ -140,13 +204,12 @@ LOGIN_COUNT_EXPECT = [
     ('osh var+pipe+redirect', 'zz-pipe', 2),
 ]
 
-# session 3 (v0.9.0): fresh boot -- the password change survived poweroff
-# (shadow lives on the FAT32 disk); restore ktest-pass so the run is
-# idempotent against the same image
+# session 3 (v1.0.0): fresh boot -- the accounts registered in session 2
+# survived poweroff (/etc lives on the FAT32 disk); the wizard must not
+# re-run and only the password changed in session 2 works
 PERSIST_EXPECT = [
     ('new password after reboot', 'ktest@novix:/home/ktest$'),
-    ('id after reboot',           'uid=200(ktest) gid=200(ktest)'),
-    ('passwd restored',           'passwd: password updated for ktest'),
+    ('id after reboot',           'uid=100(ktest) gid=100(ktest)'),
 ]
 
 # v0.7.0: run the shell session on 2 CPUs -- sockets=N so SeaBIOS reports
@@ -212,11 +275,18 @@ send_typed('cpus')
 send_typed('spawn spawner', wait=3.0)
 send_typed('ps')
 send_typed('spawn fault_div', wait=1.0)
+# v1.1.0: event-driven sequencing -- a burst-during-burst race was observed
+# once (the exception reports plus spawner's children flooded the guest
+# serial while these commands were typed: 'kill 999' arrived as 'k...' and
+# six needles lost their text). Wait for each fault's report instead of
+# trusting a fixed sleep.
+wait_for(out, b'killed by sig8')
 send_typed('spawn fault_segv', wait=1.0)
-send_typed('kill 999')
-send_typed('kill 0')
-send_typed('kill 1')
-send_typed('policy 1')
+wait_for(out, b'killed by SIGSEGV')
+send_typed('kill 999', wait=0.8)
+send_typed('kill 0', wait=0.8)
+send_typed('kill 1', wait=0.8)
+send_typed('policy 1', wait=0.8)
 # Tab completion: 'upt<Tab>' -> 'uptime ' (unique match)
 send_typed('upt', enter=False, wait=0.2)
 send('\t', wait=0.3)
@@ -293,11 +363,26 @@ text1 = bytes(out).decode('utf-8', 'replace')
 with open(os.path.join(ROOT, 'build', 'shell_session.log'), 'w') as f:
     f.write(text1)
 
-# ---- session 2: the login world (getty -> login -> sh) ----
+# ---- session 2: first-boot registration, then the login world ----
 proc, out, reader_done = start_qemu('root=/dev/hd0 interactive')
 PROMPT = b'ktest@novix:/home/ktest$'
 
-# gates C-I run first, then init respawns getty which prints the banner
+# gates C-J run first, then init respawns getty, which finds the empty
+# /etc/passwd and execs the registration wizard instead of login
+wait_for(out, b'no user accounts exist yet')
+wait_for(out, b'New password for root: ')
+send_typed('root-smoke-1', wait=0.8)              # step 1: root's password
+wait_for(out, b'Retype new password: ')
+send_typed('root-smoke-1', wait=0.8)
+wait_for(out, b'Choose a username (empty for a root-only system): ')
+send_typed('ktest', wait=0.6)                     # step 2: the first user
+wait_for(out, b'New password: ')                  # not the root prompt: it
+send_typed('ktest-pass', wait=0.8)                # has " for root" in between
+wait_for(out, b'Retype new password: ', count=2)
+send_typed('ktest-pass', wait=1.2)
+wait_for(out, b'Registration complete. Please log in.')
+
+# the wizard exited -> init respawns getty -> the issue banner + login
 wait_for(out, b'login: ')
 send_typed('ktest', wait=0.6)                     # username (echoed)
 send_typed('wrong-pass', wait=1.2)                # attempt 1: rejected
@@ -328,6 +413,33 @@ send_typed('echo $c-comment # gone', wait=0.8)
 send_typed('hello &', wait=0.8)
 wait_for(out, b'[1] pid ')
 send_typed('wait', wait=2.0)
+# ---- v1.0.0: osh debug reports (kernel syscalls 39-41) ----
+send_typed('ps', wait=0.8)
+send_typed('cpus', wait=0.8)
+send_typed('mem', wait=0.8)
+send_typed('upt', wait=0.8)
+send_typed('kill 999', wait=0.8)
+send_typed('kill 0', wait=0.8)
+send_typed('kill 2', wait=0.8)
+# ---- v1.1.0: interactive toolbox (/bin tools over the new syscalls) ----
+send_typed('ls /', wait=0.8)                 # <dir> tags via SYS_GETDENTS
+send_typed('pwd', wait=0.5)                  # /home/ktest: login's chdir
+send_typed('cd /tmp', wait=0.5)
+send_typed('touch tb0.txt', wait=0.5)        # relative paths land in the cwd
+send_typed('echo toolbox-line > tb1.txt', wait=0.8)
+send_typed('cp tb1.txt tb2.txt', wait=0.8)
+send_typed('mv tb2.txt tb3.txt', wait=0.8)
+send_typed('cat tb3.txt', wait=0.8)          # toolbox-line: cp+mv delivered
+send_typed('rm tb0.txt', wait=0.5)
+send_typed('rm no-such-file', wait=0.5)      # the error path reads cleanly
+send_typed('ls', wait=0.8)                   # default listing: the cwd (/tmp)
+send_typed('date', wait=0.5)
+send_typed('uname', wait=0.5)
+send_typed('sleep 1', wait=2.0)
+send_typed('clear', wait=0.5)                # ioctl TCCLEAR: no serial bytes,
+                                             # the next command proves survival
+send_typed('history', wait=0.8)
+send_typed('cd /home/ktest', wait=0.6)       # home again for passwd/logout
 # passwd roundtrip: ktest execs the SUID binary and changes its own password
 send_typed('passwd')
 wait_for(out, b'Current password: ')
@@ -358,9 +470,9 @@ text2 = bytes(out).decode('utf-8', 'replace')
 with open(os.path.join(ROOT, 'build', 'shell_login.log'), 'w') as f:
     f.write(text2)
 
-# ---- session 3: fresh boot -- the password change survived poweroff ----
-# (/etc/shadow lives on the FAT32 disk; session 3 also restores ktest-pass
-# so the run stays idempotent against the same image)
+# ---- session 3: fresh boot -- the registration survived poweroff ----
+# (/etc/passwd and /etc/shadow live on the FAT32 disk; the wizard must NOT
+# re-run -- waiting for the bare login prompt is itself that assertion)
 proc, out, reader_done = start_qemu('root=/dev/hd0 interactive')
 
 wait_for(out, b'login: ')
@@ -368,14 +480,6 @@ send_typed('ktest', wait=0.6)
 send_typed('smoke-pw-77', wait=1.5)               # only the new password works
 wait_for(out, PROMPT)
 send_typed('id')
-send_typed('passwd')                              # restore the build default
-wait_for(out, b'Current password: ')
-send_typed('smoke-pw-77', wait=0.8)
-wait_for(out, b'New password: ')
-send_typed('ktest-pass', wait=0.8)
-wait_for(out, b'Retype new password: ')
-send_typed('ktest-pass', wait=1.5)
-wait_for(out, b'passwd: password updated for ktest')
 send_typed('poweroff', wait=1.0)
 
 try:
@@ -390,7 +494,7 @@ with open(os.path.join(ROOT, 'build', 'shell_persist.log'), 'w') as f:
     f.write(text3)
 
 # ---- checks ----
-def run_checks(text, expect, count_expect):
+def run_checks(text, expect, count_expect, absent=()):
     failed = 0
     for label, needle in expect:
         ok = needle in text
@@ -401,6 +505,10 @@ def run_checks(text, expect, count_expect):
         ok = got >= want
         print(f"[{'ok' if ok else 'FAIL'}] {label} (x{got}/{want})")
         failed += 0 if ok else 1
+    for label, needle in absent:
+        ok = needle not in text
+        print(f"[{'ok' if ok else 'FAIL'}] {label}")
+        failed += 0 if ok else 1
     return failed
 
 print('---- session 1 (kernel shell) ----')
@@ -410,11 +518,11 @@ print(text2)
 print('---- session 3 (password survives poweroff) ----')
 print(text3)
 print('---- checks ----')
-failed = run_checks(text1, EXPECT, COUNT_EXPECT)
+failed = run_checks(text1, EXPECT, COUNT_EXPECT, ABSENT_EXPECT)
 failed += run_checks(text2, LOGIN_EXPECT, LOGIN_COUNT_EXPECT)
 failed += run_checks(text3, PERSIST_EXPECT, [])
 
-total = (len(EXPECT) + len(COUNT_EXPECT)
+total = (len(EXPECT) + len(COUNT_EXPECT) + len(ABSENT_EXPECT)
          + len(LOGIN_EXPECT) + len(LOGIN_COUNT_EXPECT)
          + len(PERSIST_EXPECT))
 print(f'\nshell test: {total - failed}/{total} checks passed')

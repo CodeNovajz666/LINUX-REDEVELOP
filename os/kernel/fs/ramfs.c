@@ -273,12 +273,19 @@ int ramfs_mount_initrd(const void *img, uint32_t size) {
         if ((n->mode & S_IFMT) != S_IFREG) continue;
 
         irq_flags_t fl = irq_save();
-        uint8_t *nd = kmalloc(e[i].size);
-        if (!nd) { irq_restore(fl); return -1; }
-        memcpy(nd, blob + e[i].offset, e[i].size);
-        if (n->data) kfree(n->data);
-        n->data = nd;
-        n->cap = n->size = e[i].size;
+        if (e[i].size == 0) {              /* empty file: kmalloc(0) is NULL,
+                                            * not an allocation failure */
+            if (n->data) kfree(n->data);
+            n->data = NULL;
+            n->cap = n->size = 0;
+        } else {
+            uint8_t *nd = kmalloc(e[i].size);
+            if (!nd) { irq_restore(fl); return -1; }
+            memcpy(nd, blob + e[i].offset, e[i].size);
+            if (n->data) kfree(n->data);
+            n->data = nd;
+            n->cap = n->size = e[i].size;
+        }
         inode_sync(n);
         irq_restore(fl);
         count++;

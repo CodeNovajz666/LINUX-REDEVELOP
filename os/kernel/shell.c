@@ -64,21 +64,45 @@ static void cmd_spawn(const char *name) {
     kprintf("spawned pid %d (%s)\n", t->pid, t->name);
 }
 
-static void cmd_mem(const char *arg) {
-    kprintf("physical: %u/%u pages free (%u MiB total managed)\n",
-            pmm_free_pages(), pmm_total_pages(), pmm_total_pages() * PAGE_SIZE >> 20);
-    kprintf("kernel heap: %u used, %u free of %u KiB\n",
+/* v1.0.0: the streaming sink for the kernel debug shell -- reports print
+ * straight to the console. sys_ps/sys_cpus/sys_meminfo use their own
+ * user-buffer sink with the exact same report builders. */
+void shell_emit_console(const char *s, int len, void *ctx) {
+    (void)ctx;
+    console_write(s, len);
+}
+
+/* v1.0.0: the `mem` report shared by the kernel shell and sys_meminfo
+ * (all counters are globals, so the builder lives here beside the shell) */
+void shell_report_mem(shell_emit_t emit, void *ctx, int verbose) {
+    char row[128];
+    int n = ksnprintf(row, sizeof(row),
+            "physical: %u/%u pages free (%u MiB total managed)\n",
+            pmm_free_pages(), pmm_total_pages(),
+            pmm_total_pages() * PAGE_SIZE >> 20);
+    emit(row, n, ctx);
+    n = ksnprintf(row, sizeof(row),
+            "kernel heap: %u used, %u free of %u KiB\n",
             (unsigned)(heap_used_bytes() >> 10),
             (unsigned)(heap_free_bytes() >> 10),
             (unsigned)((HEAP_END - HEAP_START) >> 10));
-    if (arg[0] == '-' && arg[1] == 'v') {       /* v0.6.0: mm accounting */
-        kprintf("mm: file-in %u anon %u swap-in %u cow %u\n",
+    emit(row, n, ctx);
+    if (verbose) {                              /* v0.6.0: mm accounting */
+        n = ksnprintf(row, sizeof(row),
+                "mm: file-in %u anon %u swap-in %u cow %u\n",
                 g_mmstat.fault_file, g_mmstat.fault_anon,
                 g_mmstat.fault_swapin, g_mmstat.fault_cow);
-        kprintf("    swap-out %u file-drop %u, %u/%u swap slots free\n",
+        emit(row, n, ctx);
+        n = ksnprintf(row, sizeof(row),
+                "    swap-out %u file-drop %u, %u/%u swap slots free\n",
                 g_mmstat.swap_out, g_mmstat.file_drop,
                 swap_free_slots(), swap_total_slots());
+        emit(row, n, ctx);
     }
+}
+
+static void cmd_mem(const char *arg) {
+    shell_report_mem(shell_emit_console, 0, arg[0] == '-' && arg[1] == 'v');
 }
 
 static void cmd_reboot(void) {
@@ -89,14 +113,24 @@ static void cmd_reboot(void) {
 }
 
 /* v0.8.0: the hardware wall clock, verbatim (QEMU runs -rtc base=localtime
- * so the CMOS holds local time; no timezone machinery, honestly) */
-static void cmd_date(void) {
+ * so the CMOS holds local time; no timezone machinery, honestly).
+ * v1.1.0: extracted as the shared builder behind cmd_date and sys_datetime. */
+int shell_report_date(shell_emit_t emit, void *ctx) {
     struct rtc_time t;
-    if (rtc_read(&t) != 0) { kprintf("date: RTC not sane\n"); return; }
-    kprintf("%04u-%02u-%02u %02u:%02u:%02u local (unix %llu, up %u ms)\n",
+    if (rtc_read(&t) != 0) return -1;
+    char row[96];
+    int n = ksnprintf(row, sizeof(row),
+            "%04u-%02u-%02u %02u:%02u:%02u local (unix %llu, up %u ms)\n",
             t.year, t.mon, t.day, t.hour, t.min, t.sec,
             (unsigned long long)rtc_unix_seconds(),
             (unsigned)timer_uptime_ms());
+    emit(row, n, ctx);
+    return 0;
+}
+
+static void cmd_date(void) {
+    if (shell_report_date(shell_emit_console, NULL) != 0)
+        kprintf("date: RTC not sane\n");
 }
 
 static void cmd_kill(const char *arg) {
@@ -123,43 +157,64 @@ static void cmd_kill(const char *arg) {
 
 /* ---- filesystem commands ---- */
 
-static void cmd_ls(const char *path) {
+/* v1.1.0: the `ls` listing as a streaming report -- the same bytes go to
+ * the kernel debug shell's console and to the /bin/ls program's buffer via
+ * sys_getdents (which also checks the caller's read permission on the
+ * directory; the kernel shell runs as root and does not). */
+void shell_report_dir(shell_emit_t emit, void *ctx, const char *path) {
     if (!path[0]) path = "/";
     struct stat st;
     if (vfs_stat(path, &st) != 0) {
-        kprintf("ls: %s: no such file or directory\n", path);
+        char row[96];
+        int n = ksnprintf(row, sizeof(row),
+                          "ls: %s: no such file or directory\n", path);
+        emit(row, n, ctx);
         return;
     }
     if ((st.st_mode & S_IFMT) != S_IFDIR) {
-        kprintf("%s  %u bytes\n", path, st.st_size);
+        char row[96];
+        int n = ksnprintf(row, sizeof(row), "%s  %u bytes\n",
+                          path, st.st_size);
+        emit(row, n, ctx);
         return;
     }
 
     char full[96];
     uint32_t dlen = strlen(path);
-    if (dlen >= sizeof(full) - 34) { kprintf("ls: path too long\n"); return; }
+    if (dlen >= sizeof(full) - 34) {
+        emit("ls: path too long\n", 18, ctx);
+        return;
+    }
     memcpy(full, path, dlen);
     if (dlen && full[dlen - 1] != '/') full[dlen++] = '/';
 
     char name[32];
+    char row[64];
     int n = 0;
     for (int i = 0; vfs_readdir(path, i, name, sizeof(name)) == 0; i++) {
         strcpy(full + dlen, name);
         struct stat es;
-        if (vfs_stat(full, &es) != 0) {
-            kprintf("  %-24s ?\n", name);
-        } else if ((es.st_mode & S_IFMT) == S_IFDIR) {
-            kprintf("  %-24s <dir>\n", name);
-        } else if ((es.st_mode & S_IFMT) == S_IFCHR) {
-            kprintf("  %-24s <chr>\n", name);
-        } else if ((es.st_mode & S_IFMT) == S_IFBLK) {
-            kprintf("  %-24s <blk>\n", name);
-        } else {
-            kprintf("  %-24s %u bytes\n", name, es.st_size);
-        }
+        int w;
+        if (vfs_stat(full, &es) != 0)
+            w = ksnprintf(row, sizeof(row), "  %-24s ?\n", name);
+        else if ((es.st_mode & S_IFMT) == S_IFDIR)
+            w = ksnprintf(row, sizeof(row), "  %-24s <dir>\n", name);
+        else if ((es.st_mode & S_IFMT) == S_IFCHR)
+            w = ksnprintf(row, sizeof(row), "  %-24s <chr>\n", name);
+        else if ((es.st_mode & S_IFMT) == S_IFBLK)
+            w = ksnprintf(row, sizeof(row), "  %-24s <blk>\n", name);
+        else
+            w = ksnprintf(row, sizeof(row), "  %-24s %u bytes\n",
+                          name, es.st_size);
+        emit(row, w, ctx);
         n++;
     }
-    kprintf("%d entr%s\n", n, n == 1 ? "y" : "ies");
+    int w = ksnprintf(row, sizeof(row), "%d entr%s\n", n, n == 1 ? "y" : "ies");
+    emit(row, w, ctx);
+}
+
+static void cmd_ls(const char *path) {
+    shell_report_dir(shell_emit_console, NULL, path);
 }
 
 static void cmd_cat(const char *path) {
@@ -350,10 +405,23 @@ static void tab_complete(char *line, int *n, int cap) {
     for (int i = 0; i < *n; i++) console_putchar(line[i]);
 }
 
+/* v1.0.1 (F3): reap children the moment they are zombies. `spawn` leaves
+ * tasks running while the shell returns to the prompt; without this sweep
+ * every exited child stayed a ZOMBIE forever, holding its slot (and pid)
+ * until TASK_MAX ran dry. Runs before each prompt and again before each
+ * dispatched command, so `ps` never shows the shell's own stale zombies. */
+static void shell_reap_children(void) {
+    int st;
+    int pid;
+    while ((pid = task_waitpid(-1, WNOHANG, &st)) > 0)
+        if (pid == fg_pid) fg_pid = -1;  /* never Ctrl+C a recycled pid */
+}
+
 void shell_run(void) {
     char line[64];
     kprintf("\nnovix shell -- type 'help'\n");
     for (;;) {
+        shell_reap_children();
         kprintf("novix> ");
         int n = 0;
         for (;;) {
@@ -403,6 +471,7 @@ void shell_run(void) {
             }
         }
         hist_pos = hist_count;
+        shell_reap_children();   /* v1.0.1 (F3): deaths since the prompt */
         shell_parse(line);
     }
 }

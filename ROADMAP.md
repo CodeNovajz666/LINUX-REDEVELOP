@@ -23,9 +23,10 @@
 
 0.6.0 ──► 0.7.0 ──► 0.8.0 ──► 0.9.0 ──► 1.0.0
 按需分页    SMP     磁盘/FAT32 用户与登录   里程碑
-             │                  │
+             │                  │            │
              │                  ├─► 登录链依赖 fork/exec（0.4.0）+ ELF 加载（0.2.0）
              │                  └─► /etc/passwd 持久化依赖 FAT32（0.8.0）
+             │                                 └─► 注册依赖登录链（0.9.0）+ 持久化（0.8.0）
              └─► SMP 依赖 0.6.0 的 TLB shootdown 语义
 ```
 
@@ -41,7 +42,7 @@
 | 0.7.0 | SMP 多核（已完成 2026-10） | L | MP 拓扑解析、AP 启动蹦床、自旋锁+锁次序、全局就绪队列+on_cpu 任务所有权、LAPIC timer/IPI、TLB shootdown；自测 34/34、shell 45/45 |
 | 0.8.0 | 磁盘与驱动框架（已完成 2026-10） | L | ATA PIO（LBA28+MBR）、FAT32 读写（LFN 读写）、统一设备模型（/dev 注册表）、RTC 墙钟+`date`、`root=/dev/hd0` rootfs 切换（挂载表+遮蔽+readdir 合并）、断电语义测试（独立实例重挂）；自测 38/38、shell 50/50 |
 | 0.9.0 | 用户与登录（已完成 2026-10） | M | uid/gid/ruid 身份层 + 11 系统调用、VFS 权限检查（root 旁路+POSIX 三选一）、FAT32 权限补正、SUID exec、getty→login→sh 登录链（inittab respawn）、salted SHA-256 密码三份同算法、id/whoami/who/passwd/useradd 命令；自测 41/41、shell 66/66 |
-| 1.0.0 | "真实 OS" 里程碑 | M | 裸机引导、sh、init、ISO |
+| 1.0.0 | "真实 OS" 里程碑（已完成 2026-10） | M | osh 脚本化 shell（管道/重定向/后台/变量 + DUP2）、用户态 init 读 /etc/init、/etc/motd、ISO 目标（grub-mkrescue）、文档四件套、**开箱注册**（出厂零账户镜像、/bin/register 首启注册向导 root 密码+首个用户、getty 空账户分支、ktest fixture 自建）；自测 43/43、shell 78/78 |
 
 规模：S ≈ 数天、M ≈ 1-2 周、L ≈ 2-4 周（个人业余节奏）。
 
@@ -1010,7 +1011,9 @@ kmain
 ## v1.0.0 —— 里程碑：README 里那句 "a real OS" 的完整兑现
 
 ### 目标
-脱离 QEMU 依赖可引导；有 shell、用户、init、文档的完整操作系统。
+脱离 QEMU 依赖可引导；有 shell、用户、init、文档的完整操作系统；
+第一次开机完成的是**注册**而不是登录——凭据由第一次开机的人
+自己创建，而不是报出一个镜像里预置的身份。
 
 ### 任务分解
 - [x] **引导**：`build.py iso` 用 `grub-mkrescue` 生成 `novix.iso`
@@ -1022,10 +1025,29 @@ kmain
       后台 `&` + `jobs`/`wait`、变量 `NAME=value`/`$VAR`/`$?`/
       `$pid`、注释 `#`——新增 38 号 DUP2 支撑。边界：无引号/转义、
       变量不导出、无 Ctrl-C 路由（CHANGELOG 诚实边界）
-- [x] **用户体系收尾**（基于 0.9.0）：root/alice/ktest 三账户
-      预置进发行镜像；/etc/motd 登录后展示
+- [x] **开箱注册**（替代原"三账户预置进镜像"方案，需求原话：
+      "用户第一次进入此系统应该完成用户注册，而不是上来就是
+      登录"）：
+      - 出厂零账户镜像（mkfatimg.py）：/etc/passwd 空、/home 空、
+        shadow 只留 shadow-only 的 kck 锚点（gate I shadow_roundtrip
+        的哈希契约仍可验，而它不是账户、不触发注册）；构建期
+        密码生成与 etc-passwd.txt 账本取消
+      - `/bin/register` 注册向导（`user/register.c`）：第一步设
+        root 密码（无管理员则 useradd 永远无人能跑）；第二步创建
+        首个普通用户（uid=etc_max_uid()+1、下限 100；空用户名
+        跳过 = 仅 root 系统合法）。两次输入关回显、三轮失败刹车；
+        写入 shadow 先行（中断重跑只留可替换的 shadow 行）；
+        root 条目查重后再 append；/etc/motd 登录后展示
+      - getty 空账户分支（`user/getty.c` + etc.c `etc_user_count`）：
+        /etc/passwd 有效行为 0 → 同 pid exec /bin/register；注册
+        退出回 init respawn，下一轮循环自然给出登录提示
 - [x] **init**：内核 pid 1 监督用户态 `/bin/init`，读 `/etc/init`
       脚本逐行 exec（一次性行 + 首个 respawn 行监督到底）
+- [x] **测试**：ktest perm_boundary 自建 /home/alice fixture
+      （vfs_mkdir + chown 100，uid 套件与镜像内容解耦）；
+      test_shell.py 会话 2 首启注册（root 密码 + ktest/ktest-pass）
+      → 登录链全量冒烟，会话 3 证明注册断电存续且向导不重跑；
+      脚本启动时自行重建零账户镜像（从 build/user 重打包，秒级）
 - [x] **文档**：`docs/DESIGN.en.md`（英文版）、
       `docs/driver-writer-guide.md`（驱动编写指南）、
       `docs/syscall.md`（38 项编号表 + tools/check_syscalls.py
@@ -1034,11 +1056,58 @@ kmain
       （本地验证已全绿；等维护者打 tag / 接 CI runner）
 
 ### 验收标准
-1. 裸机（或另一台虚拟化平台）从 ISO 引导 → GRUB → init 脚本 →
-   getty 登录 → sh（0.9.0 登录链在真机上复现）
-2. sh 中：`cat /etc/motd | grep Novix > /tmp/x` 全链路正确
-3. 普通用户写 /bin 下文件被拒（权限位生效，源自 0.9.0）
-4. 文档四件套齐备且与代码一致（CI 校验系统调用编号表）
+1. 全新镜像开机：不出现 login: 提示，出现注册向导横幅
+   "no user accounts exist yet"；完成 root 密码 + 用户 ktest 注册后
+   自动回到登录提示，注册凭据成功登录，id 报 uid=100(ktest)
+2. poweroff 后再开机：注册的账户仍在（FAT32 存续）、注册向导
+   不再出现
+3. osh 中：`cat /etc/motd | grep Novix > /tmp/x` 全链路正确
+4. 普通用户写 /bin 下文件被拒（权限位生效，源自 0.9.0）
+5. 文档四件套齐备且与代码一致（CI 校验系统调用编号表）
+6. 裸机（或另一台虚拟化平台）从 ISO 引导 → GRUB → init 脚本 →
+   getty → 注册/登录链在真机上复现（真机验证清单留 1.x）
+
+## v1.1.0 —— 交互工具箱：常用的文件与系统操作全部进用户态 shell
+
+v1.0.0 留下的明显缺口：osh 的 help 宣称 "ls-class tools" 而
+/bin 里没有 ls；删除、复制、移动、日期、清屏都要切内核 debug
+shell。这一版把"用户与 OS 的交互"补齐——常用操作在 osh 内
+直接可用，内核 shell 回归纯粹的急救路径。
+
+- [x] **GETDENTS（42 号）**：目录枚举报告——内核 shell 的 ls
+      提炼为共享报告函数 `shell_report_dir`（emit 回调模式，与
+      39-41 同源逐字一致）；syscall 边界检查目录 R（Unix：列
+      目录须可读），内核 shell root 路径不受检
+- [x] **UNLINK（43 号）**：暴露 VFS 既有删除（拒绝目录、父目录
+      W 在 VFS 内查）——/bin/rm
+- [x] **DATETIME（44 号）**：RTC 墙钟行共享 `shell_report_date`
+      （不 sane 返 −1）——/bin/date
+- [x] **ioctl TCCLEAR=2**：清屏回位（无 flags 指针，VGA console
+      非 ANSI 驱动，转义序列不进用户态）——/bin/clear
+- [x] **新程序九件**（initrd/FAT 双打包，osh 直接可跑）：
+      ls（默认 cwd）、pwd、rm（多文件）、cp（读写循环）、
+      mv（cp+unlink，无 rename(2) 如实注明）、date、sleep
+      （严格解析 0-60 秒）、uname、clear
+- [x] **osh history 内建**：32 条环形记录（展开前原始行），
+      编号列出；↑/↓ 检索留 1.x 行规程
+- [x] **osh help 修正**：完整列出内建、脚本特性与 /bin 工具
+- [x] **测试**：ktest gate J 增 user_toolbox（45→46，/bin 列表
+      + /tmp unlink 往返 + RTC sane）；test_shell.py 会话 2
+      增 9 项（84→93：ls 标签、pwd 家目录、prompt 跟随 cwd、
+      touch/ls、cp+mv 内容往返、rm 失败文案、date local 行、
+      uname、history）；docs/syscall.md 增 42-44（CI 门禁绿）
+- [ ] **发布**：tag v1.1.0（本地三门禁已全绿，等维护者打 tag）
+
+### 验收标准
+1. osh 中 `ls /bin` 列出全部程序（与内核 debug shell 的 ls 逐字
+   一致，含 "N entries" 尾行）；`ls` 无参默认列 cwd
+2. touch → cp → mv → cat 内容往返全链正确；rm 删除后 ls 不再
+   列出；rm 不存在的文件给出干净错误而非静默
+3. date 输出 RTC 墙钟行（"…local (unix …)"）；clear 后 shell
+   继续工作；uname 报 1.1.0
+4. history 列出本会话命令（编号）；help 不再宣称不存在的工具
+5. 普通用户列无 R 权限的目录被拒（42 号边界检查生效）
+6. 三门禁全绿：build.py test（smp=2 与 smp=1）+ test_shell.py
 
 ---
 
@@ -1046,7 +1115,7 @@ kmain
 
 - 五级页表 LA57（0.3.0 落地的是四级教学版）
 - TCP/IP 栈（参照 lwIP 设计：网卡驱动 → netif → tcp/udp → socket VFS）
-- 线程（`clone` + 共享 mm；为 1.1 的真并行应用铺路）
+- 线程（`clone` + 共享 mm；为 1.x 的真并行应用铺路）
 - procfs（`/proc` 暴露 task/mm/统计——原模块 `/proc/procman` 的回归）
 - 抢占式内核与 RCU、内核模块加载器（`.ko` 风格，回馈起点）
 - 中英 man 手册

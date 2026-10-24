@@ -58,7 +58,7 @@ typedef void (*usighandler_t)(int);
 int ukill(int pid, int sig);                      /* 0 ok, -1 no such task */
 int usignal(int sig, usighandler_t h);            /* h = 0 restores default */
 int usigprocmask(int how, const unsigned int *set, unsigned int *oldset);
-int uwaitpid_nohang(int pid);                     /* WNOHANG: 0 = kids alive */
+int uwaitpid_nohang(int pid);   /* WNOHANG: >0 reaped pid, 0 = kids alive, -1 = none */
 long usbrk(long increment);                       /* old break, or -1 */
 int upipe(int fds[2]);                            /* 0 ok */
 
@@ -90,6 +90,20 @@ int umkdir(const char *path);
 int uchown(const char *path, int uid, int gid);   /* root only */
 unsigned long uuptime(void);                 /* ms since boot (salt entropy) */
 void upoweroff(void) __attribute__((noreturn));
+
+/* debug reports (v1.0.0): kernel-formatted ps/cpus/mem tables, appended
+ * truncating into buf; return bytes stored, -1 on a bad buffer/len */
+int ups(char *buf, int len);
+int ucpus(char *buf, int len);
+int umeminfo(char *buf, int len, int verbose);
+
+/* v1.1.0 -- user-space toolbox: the ls/rm/date/clear plumbing. ls listings
+ * and the datetime string are kernel-formatted (truncating append, return
+ * bytes stored, -1 on error); unlink refuses directories. */
+int ugetdents(const char *path, char *buf, int len);
+int uunlink(const char *path);
+int udatetime(char *buf, int len);
+int uclear(void);                       /* ioctl TCCLEAR on stdout */
 
 /* terminal echo (TCGETS/TCSETS subset over fd 0-2) */
 #define U_TC_ECHO 0x0008

@@ -64,8 +64,8 @@ static bool gate_c(void) {
         kprintf("gate C: /bin/hello not found in ramfs\n");
         return false;
     }
-    int st = task_waitpid(t->pid, 0);
-    if (st != 42) {
+    int st = 0;
+    if (task_waitpid(t->pid, 0, &st) != t->pid || st != 42) {
         kprintf("gate C: hello exit status %d, want 42\n", st);
         return false;
     }
@@ -242,17 +242,30 @@ static void fs_perm_fixup(void) {
  * ever dies, the kernel respawns it, so the machine always comes back to a
  * login prompt. console=debug still selects the kernel debug shell. */
 static void user_init_supervise(void) {
+    const char *argv[1] = { "init" };
+    int supervised = -1;
     for (;;) {
-        const char *argv[1] = { "init" };
-        struct task *t = task_spawn_argv("/bin/init", argv, 1);
-        if (!t) {
-            kprintf("init: cannot spawn /bin/init -- retrying\n");
-            task_sleep_until(current_task(), timer_ticks() + TICK_HZ);
-            kyield();
-            continue;
+        if (supervised < 0) {
+            struct task *t = task_spawn_argv("/bin/init", argv, 1);
+            if (t) {
+                supervised = t->pid;
+            } else {
+                kprintf("init: cannot spawn /bin/init -- retrying\n");
+                task_sleep_until(current_task(), timer_ticks() + TICK_HZ);
+                kyield();
+                continue;
+            }
         }
-        task_waitpid(t->pid, 0);           /* reap, then respawn */
-        kprintf("init: /bin/init exited -- respawning\n");
+        /* v1.0.1 (F3): block on ANY child, not just /bin/init. Orphans
+         * re-parented to pid 1 are reaped the moment they exit instead of
+         * piling up as zombies for as long as the supervised child lived;
+         * the supervised child's own death still respawns it (SysV rule). */
+        int st = 0;
+        int pid = task_waitpid(-1, 0, &st);
+        if (pid == supervised) {
+            kprintf("init: /bin/init exited (status %d) -- respawning\n", st);
+            supervised = -1;
+        }
     }
 }
 
@@ -360,6 +373,12 @@ void kmain(uint32_t magic, struct multiboot_info *mbi) {
         if (tmp_ino) tmp_ino->mode |= 0777;
     }
     ramfs_mkdir("/var/run");
+    /* v1.0.0: out-of-box homes. The FAT image ships /root and /home; on the
+     * no-disk (ramfs) boot nothing else creates them, and register's
+     * umkdir("/home/<name>") would only warn. Invisible after the FAT root
+     * switch, so the disk boot is unaffected. */
+    ramfs_mkdir("/root");
+    ramfs_mkdir("/home");
     rtc_init();
 
     /* v0.8.0 rootfs switch: FAT32 root over the ramfs root, ramfs /dev, /tmp
