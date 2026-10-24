@@ -18,7 +18,7 @@ thing.
   /  |/ / __ `/ __ \/ /
  / /|  / /_/ / /_/ /  \
 /_/ |_/\__,_/\____/_/\_\
-Novix 1.0.0 -- a real OS, grown out of a kernel module
+Novix 1.1.0 -- a real OS, grown out of a kernel module
 ```
 
 ## What actually works
@@ -98,22 +98,22 @@ Retype new password:
 register: account 'ktest' created (uid 100, home /home/ktest)
 
 Registration complete. Please log in.
-Novix 1.0.0 (tty1) -- authorized users only
+Novix 1.1.0 (tty1) -- authorized users only
 
 login: ktest
 Password:
-Novix 1.0.0 -- a real OS, grown out of a kernel module
+Novix 1.1.0 -- a real OS, grown out of a kernel module
 osh: pipelines a|b, redirects a>b a>>b a<b, jobs a&, $VAR $?
 ktest@novix:/home/ktest$ id
 uid=100(ktest) gid=100(ktest)
 ktest@novix:/home/ktest$ cat /etc/motd | grep Novix > /tmp/x
 ktest@novix:/home/ktest$ cat /tmp/x
-Novix 1.0.0 -- a real OS, grown out of a kernel module
+Novix 1.1.0 -- a real OS, grown out of a kernel module
 ktest@novix:/home/ktest$ hello &
 [1] pid 12
 ktest@novix:/home/ktest$ wait
 ktest@novix:/home/ktest$ logout
-Novix 1.0.0 (tty1) -- authorized users only
+Novix 1.1.0 (tty1) -- authorized users only
 login:
 ```
 

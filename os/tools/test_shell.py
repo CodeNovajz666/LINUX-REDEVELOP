@@ -182,8 +182,8 @@ LOGIN_EXPECT = [
                                                 # proves the content travelled
     ('osh rm missing',       'rm: no-such-file: failed'),
     ('osh date local',       'local (unix'),    # the RTC line, kernel-formatted
-    ('osh uname',            'Novix 1.1.0'),    # only uname prints the new
-                                                # version (banners stay 1.0.0)
+    ('osh uname',            'Novix 1.1.0'),    # uname and the banners agree
+                                                # on the version again (v1.1.0)
     ('osh history',          '  1  id'),        # the first osh line, numbered
 ]
 LOGIN_COUNT_EXPECT = [
@@ -198,7 +198,7 @@ LOGIN_COUNT_EXPECT = [
     # v1.0.0: 'cat /etc/motd | grep Novix > /tmp/x' + cat -- the needle
     # hits the boot banner (1), motd at each of the two logins (2) and the
     # redirected copy (1)
-    ('osh motd pipeline', 'Novix 1.0.0 -- a real OS', 4),
+    ('osh motd pipeline', 'Novix 1.1.0 -- a real OS', 4),
     # variable + redirect + pipe + grep + cat: two cats of derived files;
     # the echoed command lines only ever contain '$p-pipe', never the value
     ('osh var+pipe+redirect', 'zz-pipe', 2),

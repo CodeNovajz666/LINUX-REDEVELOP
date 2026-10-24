@@ -56,7 +56,7 @@ python build.py test -smp 2; python build.py test -smp 1; python tools/test_shel
 | `make shell` | `python tools/test_shell.py` |
 | `make run` | `python build.py run` |
 
-**当前基线（v1.0.0）**：门禁 1 = 44/44，门禁 2 = 44/44，门禁 3 = 84/84。
+**当前基线（v1.1.0）**：门禁 1 = 46/46，门禁 2 = 46/46，门禁 3 = 96/96。
 
 ---
 
@@ -64,8 +64,8 @@ python build.py test -smp 2; python build.py test -smp 1; python tools/test_shel
 
 | 层 | 载体 | 规模 | 覆盖 |
 |----|------|------|------|
-| 一、内核自测 | `kernel/ktest.c`，由 `kmain` 驱动 | 44 项 | 内核机制：内存、调度、COW、信号、管道、VMA/swap、SMP、磁盘、身份、osh 管道、调试报告 |
-| 二、串口自动化 | `tools/test_shell.py` 驱动 QEMU `-serial stdio` | 84 项 | 端到端：内核 shell 全量回归、首启注册、登录世界、脚本化 shell、osh 调试命令、断电存续 |
+| 一、内核自测 | `kernel/ktest.c`，由 `kmain` 驱动 | 46 项 | 内核机制：内存、调度、COW、信号、管道、VMA/swap、SMP、磁盘、身份、osh 管道、调试报告、用户工具箱 |
+| 二、串口自动化 | `tools/test_shell.py` 驱动 QEMU `-serial stdio` | 96 项 | 端到端：内核 shell 全量回归、首启注册、登录世界、脚本化 shell、osh 调试命令、交互工具箱（v1.1.0）、断电存续 |
 | 三、辅助校验 | `tools/` 下若干脚本 | 随用随跑 | syscall 表一致性、ELF/GOT 检查、镜像 dump 等 |
 
 三层互补：第一层证明**内核机制**正确（可观测行为，非打印语句），
@@ -86,7 +86,7 @@ python build.py test -smp 1   # 单核回归
 
 - 构建内核后，QEMU 无头运行，串口日志写入 `build/serial.log` 并回显到终端
 - 超时 180s；超时视为失败
-- 通过判据：串口出现 `GATES-OK` 与 `KTEST SUMMARY: 44/44 passed, 0 failed`
+- 通过判据：串口出现 `GATES-OK` 与 `KTEST SUMMARY: 46/46 passed, 0 failed`
 
 **退出码语义**
 
@@ -118,7 +118,7 @@ python build.py test -smp 1   # 单核回归
 `-smp 1` 与 `-smp 2` 双跑的意义：SMP 套件断言随核数自适应，单核跑用于**回归**，
 确保多核协议（`on_cpu` 所有权、TLB shootdown IPI）的修复没有在单核路径引入退化。
 
-### 4.3 44 项明细
+### 4.3 46 项明细
 
 **early（3）** — 开中断前
 
@@ -203,6 +203,7 @@ python build.py test -smp 1   # 单核回归
 | `dup2_osh` | dup2 端到端：pipe+fork 接线、边界语义、文件重定向 |
 | `scripting_toolkit` | shell 及其管道伙伴、/etc 脚本文件随镜像发行 |
 | `debug_syscalls` | sys_ps/cpus/meminfo 背后的内核报告：表头、每 CPU 一行、内存数值、-v 附加 swap 行 |
+| `user_toolbox` | v1.1.0：getdents/unlink/datetime 的内核侧断言——/bin 列表（entries 尾行）、/tmp unlink 往返（列见→删→列不见）、RTC 日期行 sane |
 
 ---
 
@@ -232,7 +233,7 @@ python tools/test_shell.py
 
 合计 **84** 项。
 
-### 5.3 84 项明细
+### 5.3 96 项明细
 
 **会话 1（内核 shell，50 项）**
 
@@ -249,7 +250,7 @@ python tools/test_shell.py
 | 行编辑/信号 | `ctrl-c echo`、`ctrl-c kill`、`backspace edit` |
 | Tab 补全/历史 | `tab list`、`tab uptime`、`tab forker`、`history recall`、`tab forker rerun` |
 
-**会话 2（首启注册 + 登录世界，32 项）**
+**会话 2（首启注册 + 登录世界 + 交互工具箱，44 项）**
 
 | 分组 | 检查项 |
 |------|--------|
@@ -258,7 +259,8 @@ python tools/test_shell.py
 | 身份 | `id shows ktest`、`whoami`、`who session`、`shadow denied`（/etc/shadow 权限拒绝） |
 | 改密 | `passwd current ask`、`passwd updated` |
 | osh 脚本 | `osh exit status`、`osh background job`、`osh comments`、`osh motd pipeline`（管道+重定向 ×4）、`osh var+pipe+redirect`（变量+管道+重定向 ×2） |
-| osh 调试 | `osh ps header`（任务表表头）、`osh ps shell row`（osh 任务行）、`osh cpus header`（CPU 表头）、`osh mem lines`（内存统计）、`osh upt`（开机毫秒）、`osh kill no task`（kill 错误路径） |
+| osh 调试 | `osh ps header`（任务表表头）、`osh ps shell row`（osh 任务行）、`osh cpus header`（CPU 表头）、`osh mem lines`（内存统计）、`osh upt`（开机毫秒）、`osh kill no task`（kill 错误路径）、`osh kill bad pid`（pid 0 拒解析）、`osh kill mortal guard`（uid 100 杀不动 kswapd） |
+| osh 工具箱 | v1.1.0 九件端到端：`osh ls dir tag`（`<dir>` 标注）、`osh pwd home`（登录家目录）、`osh cd tmp prompt`（prompt 跟随 cwd）、`osh touch ls`、`osh cp+mv roundtrip`（cat 证内容搬运）、`osh rm missing`（失败文案）、`osh date local`（RTC 行）、`osh uname`（版本行）、`osh history`（编号列出） |
 
 **会话 3（断电存续，2 项）**
 
@@ -321,7 +323,7 @@ python build.py iso             # 生成 novix.iso（需 grub-mkrescue + xorriso
 
 Windows 没有原生 grub-mkrescue（MSYS2 只有 xorriso、没有 grub 包），
 **必须借 Linux 环境**。WSL2 是推荐路径（2026-10 已在本机验证，
-`novix.iso` 经 GRUB 引导跑完全部 44 项内核自测）。
+`novix.iso` 经 GRUB 引导跑完全部 46 项内核自测）。
 
 一次性安装（管理员 PowerShell 装 WSL，工具在 Ubuntu 内装）：
 
@@ -367,19 +369,19 @@ wsl -d Ubuntu-22.04 -- bash -c "cd /mnt/d/Projects/LINUX-REDEVELOP/os && \
 - **SMP 拓扑要显式**：`-smp 2` 裸参数下 SeaBIOS 的 MP 表只报 1 CPU
   （gate G 自适应通过但只有单核）；`-smp 2,sockets=2,cores=1,threads=1`
   才能双核上线（见根 DESIGN.md 的 SeaBIOS 教训）
-- grub.cfg（2026-10-15 起）为**三菜单项**：默认 `Novix 1.0.0 -- run`
+- grub.cfg（2026-10-15 起）为**三菜单项**：默认 `Novix 1.1.0 -- run`
   （`root=/dev/hd0 interactive`，进注册/登录世界，登录后是用户态
-  shell osh）、第二项 `kernel self-test`（44 项自测后
+  shell osh）、第二项 `kernel self-test`（46 项自测后
   `NOVIX-BOOT-OK` 停机）、第三项 `kernel debug shell`
-  （`console=debug`，44 项自测后进内核调试 shell `novix>`，可用
+  （`console=debug`，46 项自测后进内核调试 shell `novix>`，可用
   ps/cpus/spawn 等调试命令；osh 也已内建 ps/cpus/mem/upt/kill 的
   只读版本，内核 shell 保留为急救路径）。
-  注意 run/debug 模式**每次开机先跑完全部 44 项自测再进 shell**
+  注意 run/debug 模式**每次开机先跑完全部 46 项自测再进 shell**
   （开箱完整性门禁，约多花十几秒），登录提示出现前的大段 [TEST]
   输出不是卡死
 - **纯 ISO（无盘）也受支持**：去掉上面命令里的 `-drive` 整段即
   可——root 自动回退 ramfs，initrd 携带 /bin 与零账户 /etc，首启
-  注册向导照常工作（disk 套件如实 skipped，仍 44/44）。VMware 等
+  注册向导照常工作（disk 套件如实 skipped，仍 46/46）。VMware 等
   不想挂虚拟硬盘的场景用这个路径
 
 ---

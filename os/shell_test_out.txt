@@ -13,7 +13,7 @@ fresh zero-account image: D:\Projects\LINUX-REDEVELOP\os\build\novix-hd.img
 
 /_/ |_/\__,_/\____/_/\_\
 
-Novix 1.0.0 -- a real OS, grown out of a kernel module
+Novix 1.1.0 -- a real OS, grown out of a kernel module
 
 
 
@@ -29,7 +29,7 @@ ata: primary master, 131072 sectors (64 MiB), LBA28 PIO
 
 driver: ata-hd -> /dev/hd0
 
-rtc: boot 2026-10-23 18:23:53 (localtime)
+rtc: boot 2026-10-24 16:09:41 (localtime)
 
 boot: root on FAT32 (/dev/hd0): 121358/127006 clusters free, 64 MiB, ramfs keeps /dev /tmp /var
 
@@ -431,13 +431,13 @@ novix> ps
 
 PID   PPID  STATE     PRI  CPU  UID   TICKS  USER  EXIT      NAME
 
-0     -1    READY     0   0    0     865    no    -         idle
+0     -1    READY     0   0    0     880    no    -         idle
 
 1     0     RUN       10  0    0     189    no    -         init
 
-2     0     READY     8   0    0     1038   no    -         kswapd
+2     0     READY     8   0    0     979    no    -         kswapd
 
-3     -1    RUN       0   1    0     62     no    -         idle
+3     -1    RUN       0   1    0     73     no    -         idle
 
 novix> cpus
 
@@ -445,7 +445,7 @@ CPU  APIC  ONLINE  CURRENT
 
 0    0     yes     init
 
-1    1     yes     kswapd
+1    1     yes     idle
 
 novix> spawn spawner
 
@@ -455,25 +455,25 @@ novix> [spawner] pid=4, fork+exec two children
 
 [spawner] children: 5, 6; waiting...
 
-[hello] user process running, pid=5
-
-[hello] tick 3...
-
 [hello] user process running, pid=6
 
+[[hheelloll]o ]u tsicek r3 ..p.
+
+rocess running, pid=5
+
 [hello] tick 3...
 
 [hello] tick 2...
 
 [hello] tick 2...
 
-[hello] tick 1...
+[[hheelllloo]] t tick i1..c.
 
-[hello] tick 1...
+k 1...
 
-[hello] exiting with status 42
+[[hehlloe]ll eo]x exititinigng wi witthh stat stautuss  424
 
-[hello] exiting with status 42
+2
 
 [spawner] child 5 -> 42, child 6 -> 42
 
@@ -483,13 +483,13 @@ ps
 
 PID   PPID  STATE     PRI  CPU  UID   TICKS  USER  EXIT      NAME
 
-0     -1    READY     0   0    0     1088   no    -         idle
+0     -1    READY     0   0    0     1093   no    -         idle
 
-1     0     RUN       10  0    0     521    no    -         init
+1     0     RUN       10  0    0     494    no    -         init
 
-2     0     SLEEP     8   0    0     1215   no    -         kswapd
+2     0     SLEEP     8   1    0     1141   no    -         kswapd
 
-3     -1    RUN       0   1    0     151    no    -         idle
+3     -1    READY     0   1    0     174    no    -         idle
 
 novix> spawn fault_div
 
@@ -525,7 +525,7 @@ policy -> RR
 
 novix> uptime 
 
-uptime: 29940 ms (2994 ticks)
+uptime: 28610 ms (2861 ticks)
 
 novix> mem
 
@@ -679,7 +679,7 @@ Files written here survive poweroff.
 
 novix> date
 
-2026-10-23 18:24:32 local (unix 1792779872, up 36240 ms)
+2026-10-24 16:10:19 local (unix 1792858219, up 34670 ms)
 
 novix> echo disk-persist-line > persist.txt
 
@@ -821,9 +821,9 @@ physical: 27616/28640 pages free (111 MiB total managed)
 
 kernel heap: 2884 used, 9403 free of 12288 KiB
 
-mm: file-in 259 anon 1299 swap-in 529 cow 31
+mm: file-in 168 anon 1299 swap-in 527 cow 31
 
-    swap-out 786 file-drop 129, 1024/1024 swap slots free
+    swap-out 784 file-drop 38, 1024/1024 swap slots free
 
 novix> spawn memhog
 
@@ -844,6 +844,8 @@ spawned pid 4 (hello)
 novix> [hello] user process running, pid=4
 
 [hello] tick 3...
+
+[hello] tick 2...
 
 ^C
 
@@ -867,7 +869,7 @@ bye.
 
 /_/ |_/\__,_/\____/_/\_\
 
-Novix 1.0.0 -- a real OS, grown out of a kernel module
+Novix 1.1.0 -- a real OS, grown out of a kernel module
 
 
 
@@ -883,7 +885,7 @@ ata: primary master, 131072 sectors (64 MiB), LBA28 PIO
 
 driver: ata-hd -> /dev/hd0
 
-rtc: boot 2026-10-23 18:25:23 (localtime)
+rtc: boot 2026-10-24 16:11:10 (localtime)
 
 boot: root on FAT32 (/dev/hd0): 121356/127006 clusters free, 64 MiB, ramfs keeps /dev /tmp /var
 
@@ -1255,7 +1257,7 @@ register: account 'ktest' created (uid 100, home /home/ktest)
 
 Registration complete. Please log in.
 
-Novix 1.0.0 (tty1) -- authorized users only
+Novix 1.1.0 (tty1) -- authorized users only
 
 login: ktest
 
@@ -1265,7 +1267,7 @@ Login incorrect
 
 Password: 
 
-Novix 1.0.0 -- a real OS, grown out of a kernel module
+Novix 1.1.0 -- a real OS, grown out of a kernel module
 
 osh: pipelines a|b, redirects a>b a>>b a<b, jobs a&, $VAR $?
 
@@ -1289,7 +1291,7 @@ ktest@novix:/home/ktest$ cat /etc/motd | grep Novix > /tmp/x
 
 ktest@novix:/home/ktest$ cat /tmp/x
 
-Novix 1.0.0 -- a real OS, grown out of a kernel module
+Novix 1.1.0 -- a real OS, grown out of a kernel module
 
 ktest@novix:/home/ktest$ p=zz
 
@@ -1323,51 +1325,51 @@ ktest@novix:/home/ktest$ hello &
 
 [1] pid 6
 
-[hello] user process running, pid=6
+ktest@novix:/home/ktest$ [hello] user process running, pid=6
 
 [hello] tick 3...
 
-ktest@novix:/home/ktest$ [hello] tick 2...
-
-wait
+[hello] tick 2...
 
 [hello] tick 1...
 
 [hello] exiting with status 42
 
+wait
+
 ktest@novix:/home/ktest$ ps
 
 PID   PPID  STATE     PRI  CPU  UID   TICKS  USER  EXIT      NAME
 
-0     -1    READY     0   0    0     1829   no    -         idle
+0     -1    READY     0   0    0     3271   no    -         idle
 
-1     0     WAIT      10  0    0     138    no    -         init
+1     0     WAIT      10  1    0     132    no    -         init
 
-2     0     SLEEP     8   0    0     2079   no    -         kswapd
+2     0     SLEEP     8   0    0     3158   no    -         kswapd
 
-3     -1    RUN       0   1    0     915    no    -         idle
+3     -1    RUN       0   1    0     2315   no    -         idle
 
-4     1     WAIT      5   1    0     4      yes   -         init
+4     1     WAIT      5   0    0     4      yes   -         init
 
-5     4     RUN       5   0    100   1211   yes   -         osh
+5     4     RUN       5   0    100   3002   yes   -         osh
 
 ktest@novix:/home/ktest$ cpus
 
 CPU  APIC  ONLINE  CURRENT
 
-0    0     yes     osh
+0    0     yes     idle
 
-1    1     yes     idle
+1    1     yes     osh
 
 ktest@novix:/home/ktest$ mem
 
 physical: 27584/28640 pages free (111 MiB total managed)
 
-kernel heap: 2916 used, 9371 free of 12288 KiB
+kernel heap: 2917 used, 9371 free of 12288 KiB
 
 ktest@novix:/home/ktest$ upt
 
-uptime: 43220 ms
+uptime: 68100 ms
 
 ktest@novix:/home/ktest$ kill 999
 
@@ -1449,7 +1451,7 @@ ktest@novix:/tmp$ ls
 
 ktest@novix:/tmp$ date
 
-2026-10-23 18:26:20 local (unix 1792779980, up 52950 ms)
+2026-10-24 16:11:55 local (unix 1792858315, up 84170 ms)
 
 ktest@novix:/tmp$ uname
 
@@ -1539,7 +1541,7 @@ passwd: password updated for ktest
 
 ktest@novix:/home/ktest$ logout
 
-Novix 1.0.0 (tty1) -- authorized users only
+Novix 1.1.0 (tty1) -- authorized users only
 
 login: ktest
 
@@ -1549,7 +1551,7 @@ Login incorrect
 
 Password: 
 
-Novix 1.0.0 -- a real OS, grown out of a kernel module
+Novix 1.1.0 -- a real OS, grown out of a kernel module
 
 osh: pipelines a|b, redirects a>b a>>b a<b, jobs a&, $VAR $?
 
@@ -1571,7 +1573,7 @@ poweroff: requested by pid 5 (osh)
 
 /_/ |_/\__,_/\____/_/\_\
 
-Novix 1.0.0 -- a real OS, grown out of a kernel module
+Novix 1.1.0 -- a real OS, grown out of a kernel module
 
 
 
@@ -1587,7 +1589,7 @@ ata: primary master, 131072 sectors (64 MiB), LBA28 PIO
 
 driver: ata-hd -> /dev/hd0
 
-rtc: boot 2026-10-23 18:28:36 (localtime)
+rtc: boot 2026-10-24 16:14:11 (localtime)
 
 boot: root on FAT32 (/dev/hd0): 121355/127006 clusters free, 64 MiB, ramfs keeps /dev /tmp /var
 
@@ -1931,13 +1933,13 @@ GATES-OK
 
 KTEST SUMMARY: 46/46 passed, 0 failed
 
-Novix 1.0.0 (tty1) -- authorized users only
+Novix 1.1.0 (tty1) -- authorized users only
 
 login: ktest
 
 Password: 
 
-Novix 1.0.0 -- a real OS, grown out of a kernel module
+Novix 1.1.0 -- a real OS, grown out of a kernel module
 
 osh: pipelines a|b, redirects a>b a>>b a<b, jobs a&, $VAR $?
 

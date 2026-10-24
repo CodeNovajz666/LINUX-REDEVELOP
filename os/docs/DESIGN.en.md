@@ -1,7 +1,7 @@
-# Novix Design Document (English edition, v1.0.0)
+# Novix Design Document (English edition, v1.1.0)
 
 The Chinese original (`docs/DESIGN.md`) is authoritative; this edition
-mirrors its structure for the v1.0.0 milestone. Where the two disagree,
+mirrors its structure for the v1.1.0 milestone. Where the two disagree,
 the code and the Chinese text win.
 
 ## 1. Goals and non-goals
@@ -10,7 +10,7 @@ Novix is a real, bootable, multitasking, multi-core operating system for
 x86_64 under QEMU, grown out of a Linux kernel module that *simulated*
 PCB-style process management. Every "fake" of the original module was
 replaced by the real thing: real boot, real interrupts, real page tables,
-ring 3, spinlocks. v1.0.0 completes the "a real OS" promise: bootable
+ring 3, spinlocks. v1.0.0 completed the "a real OS" promise: bootable
 from ISO (GRUB multiboot), a scripting user shell (osh), a user-space
 init reading `/etc/init`, the documentation set — and out-of-box
 registration: the image ships zero accounts, so the first boot asks
