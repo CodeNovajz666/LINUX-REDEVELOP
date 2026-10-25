@@ -22,17 +22,25 @@ static struct file *file_new(struct inode *ino, uint16_t flags) {
 
 /* v0.9.0: the Unix permission decision. uid 0 bypasses everything (root);
  * otherwise exactly one of the owner/group/world bit triples applies --
- * owner wins over group wins over world, per POSIX. */
-int vfs_permitted(const struct inode *ino, uint16_t want) {
+ * owner wins over group wins over world, per POSIX.
+ * v1.1.7: the ids-parameterised core lets access(2) answer with the REAL
+ * ids while every other check keeps using the effective pair. */
+int vfs_permitted_ids(const struct inode *ino, uint16_t want,
+                      uint16_t uid, uint16_t gid) {
     if (!ino) return 0;
-    struct task *cur = current_task();
-    uint16_t uid = cur ? cur->uid : 0;         /* boot context: root */
     if (uid == 0) return 1;
     uint16_t bits;
     if (ino->uid == uid)          bits = (ino->mode >> 6) & 7;
-    else if (ino->gid == cur->gid) bits = (ino->mode >> 3) & 7;
+    else if (ino->gid == gid)     bits = (ino->mode >> 3) & 7;
     else                          bits = ino->mode & 7;
     return (bits & want) == want;
+}
+
+int vfs_permitted(const struct inode *ino, uint16_t want) {
+    struct task *cur = current_task();
+    return vfs_permitted_ids(ino, want,
+                             cur ? cur->uid : 0,        /* boot ctx: root */
+                             cur ? cur->gid : 0);
 }
 
 struct file *vfs_open(const char *path, uint16_t flags) {

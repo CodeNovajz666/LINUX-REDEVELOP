@@ -6,7 +6,7 @@
 #include <stdbool.h>
 #include "lib.h"
 
-#define NOVIX_VERSION "1.1.6"
+#define NOVIX_VERSION "1.1.7"
 
 /* ---- SMP (v0.7.0) ---- */
 #define SMP_MAX            4        /* QEMU -smp cap for stress runs */

@@ -53,6 +53,9 @@
 | 44 | DATETIME | buf / len | 字节数 | v1.1.0：/bin/date；RTC 墙钟（与内核 shell date 同行格式）；RTC 不 sane 返 -1 |
 | 45 | RENAME | old path / new path | 0 | v1.1.2：/bin/mv 快路径；inode 不变（同实例内）；两个父目录 W+X；目标存在拒绝 -1（不覆盖） |
 | 46 | RMDIR | path | 0 | v1.1.2：/bin/rmdir；仅空目录；父目录 W+X |
+| 47 | SETREUID | ruid / euid | 0 | v1.1.7：-1 保留原值；root 任意，凡人仅可取自身 (ruid,euid) 内的值——可降可回不可升 |
+| 48 | SETREGID | rgid / egid | 0 | v1.1.7：rgid 拆分后的组版本，同上规则 |
+| 49 | ACCESS | path / mode | 0/-1 | v1.1.7：以真实 (ruid,rgid) 做权限判定（SUID 程序问"调用者能不能"就用它）；mode 为 R=4/W=2/X=1 位组合 |
 
 ## ABI 约定
 

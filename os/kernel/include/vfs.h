@@ -139,6 +139,10 @@ struct file *vfs_open(const char *path, uint16_t flags);
 /* v0.9.0: Unix permission check (owner/group/world bits, uid 0 bypasses);
  * `want` is a mask of VFS_PERM_{R,W,X} that must all be granted */
 int vfs_permitted(const struct inode *ino, uint16_t want);
+/* v1.1.7: the same decision for an explicit id pair (access(2) asks with
+ * the REAL ids; everything else uses the effective pair above) */
+int vfs_permitted_ids(const struct inode *ino, uint16_t want,
+                      uint16_t uid, uint16_t gid);
 int vfs_read(struct file *f, void *buf, uint32_t len);
 int vfs_write(struct file *f, const void *buf, uint32_t len);
 int vfs_close(struct file *f);

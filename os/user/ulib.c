@@ -48,6 +48,9 @@
 #define SYS_DATETIME    44
 #define SYS_RENAME      45
 #define SYS_RMDIR       46
+#define SYS_SETREUID    47
+#define SYS_SETREGID    48
+#define SYS_ACCESS      49
 #define TCGETS          0
 #define TCSETS          1
 #define TCCLEAR         2
@@ -262,6 +265,15 @@ int urename(const char *oldpath, const char *newpath) {
 }
 int urmdir(const char *path) {
     return (int)_sys3(SYS_RMDIR, (long)path, 0, 0);
+}
+int usetreuid(int ruid, int euid) {
+    return (int)_sys3(SYS_SETREUID, ruid, euid, 0);
+}
+int usetregid(int rgid, int egid) {
+    return (int)_sys3(SYS_SETREGID, rgid, egid, 0);
+}
+int uaccess(const char *path, int mode) {
+    return (int)_sys3(SYS_ACCESS, (long)path, mode, 0);
 }
 int udatetime(char *buf, int len) {
     return (int)_sys3(SYS_DATETIME, (long)buf, len, 0);

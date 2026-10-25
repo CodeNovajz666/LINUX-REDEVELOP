@@ -56,7 +56,7 @@ python build.py test -smp 2; python build.py test -smp 1; python tools/test_shel
 | `make shell` | `python tools/test_shell.py` |
 | `make run` | `python build.py run` |
 
-**当前基线（v1.1.6）**：门禁 1 = 49/49，门禁 2 = 49/49，门禁 3 = 119/119。
+**当前基线（v1.1.7）**：门禁 1 = 50/50，门禁 2 = 50/50，门禁 3 = 119/119。
 
 ---
 
@@ -64,7 +64,7 @@ python build.py test -smp 2; python build.py test -smp 1; python tools/test_shel
 
 | 层 | 载体 | 规模 | 覆盖 |
 |----|------|------|------|
-| 一、内核自测 | `kernel/ktest.c`，由 `kmain` 驱动 | 49 项 | 内核机制：内存、调度、COW、信号、管道、VMA/swap、SMP、磁盘、身份、osh 管道、调试报告、用户工具箱 |
+| 一、内核自测 | `kernel/ktest.c`，由 `kmain` 驱动 | 50 项 | 内核机制：内存、调度、COW、信号、管道、VMA/swap、SMP、磁盘、身份、osh 管道、调试报告、用户工具箱 |
 | 二、串口自动化 | `tools/test_shell.py` 驱动 QEMU `-serial stdio` | 119 项 | 端到端：内核 shell 全量回归、首启注册、登录世界、脚本化 shell、osh 调试命令、交互工具箱（v1.1.0）、交互检索与行编辑（v1.1.1）、断电存续 |
 | 三、辅助校验 | `tools/` 下若干脚本 | 随用随跑 | syscall 表一致性、ELF/GOT 检查、镜像 dump 等 |
 
@@ -118,7 +118,7 @@ python build.py test -smp 1   # 单核回归
 `-smp 1` 与 `-smp 2` 双跑的意义：SMP 套件断言随核数自适应，单核跑用于**回归**，
 确保多核协议（`on_cpu` 所有权、TLB shootdown IPI）的修复没有在单核路径引入退化。
 
-### 4.3 49 项明细
+### 4.3 50 项明细
 
 **early（3）** — 开中断前
 

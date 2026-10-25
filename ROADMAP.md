@@ -1188,6 +1188,9 @@ test_shell 若干项）。
 - **v1.1.7 —— 身份完整化**：euid/egid 与 ruid/rgid 正式拆分
   （README 差距表回收）、setreuid(2)/setregid(2)、access(2)。
   验收：SUID login 的 getruid!=getuid 语义进入 ktest uid 组。
+  ✅ 完成（2026-10-26）：(euid,egid,ruid,rgid) 四元组 + 参数化权限
+  判定 + SETREUID/SETREGID/ACCESS(47-49) + euidtest 整链证明。
+  50/50、119/119。
 - **v1.1.8 —— procfs**：/proc 只读挂载（task/mm/统计）——
   **原内核模块 /proc/procman 的回归**（"假的变真的"叙事闭环：
   当年是 procfs 假装进程，如今是真内核提供真 procfs）。

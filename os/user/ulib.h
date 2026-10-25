@@ -104,6 +104,12 @@ int ugetdents(const char *path, char *buf, int len);
 int uunlink(const char *path);
 int urename(const char *oldpath, const char *newpath);   /* v1.1.2 */
 int urmdir(const char *path);                            /* v1.1.2 */
+int usetreuid(int ruid, int euid);            /* v1.1.7: -1 = unchanged */
+int usetregid(int rgid, int egid);
+int uaccess(const char *path, int mode);      /* real-id permission probe */
+#define U_R_OK 4
+#define U_W_OK 2
+#define U_X_OK 1
 int udatetime(char *buf, int len);
 int uclear(void);                       /* ioctl TCCLEAR on stdout */
 

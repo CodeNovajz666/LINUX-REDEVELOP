@@ -40,6 +40,7 @@ struct task {
                              * never killable; each CPU falls back to its own */
     uint16_t uid;           /* v0.9.0: user id (0 = root, bypasses VFS perms) */
     uint16_t gid;           /* v0.9.0: group id */
+    uint16_t rgid;          /* v1.1.7: real gid -- the egid twin of ruid */
     uint16_t ruid;          /* v0.9.0: real uid -- survives SUID exec, so
                              * /bin/passwd still knows who invoked it */
     char cwd[TASK_CWD_LEN]; /* v0.9.0: working directory ("/" until chdir) */

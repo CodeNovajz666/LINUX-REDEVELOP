@@ -115,7 +115,7 @@ USER_PROGRAMS = ['hello', 'spawner', 'fault_div', 'fault_segv', 'stackovf', 'fil
                  'memhog',
                  # v0.9.0: users & login
                  'getty', 'login', 'id', 'whoami', 'who',
-                 'passwd', 'useradd', 'cat', 'touch', 'uidtest',
+                 'passwd', 'useradd', 'cat', 'touch', 'uidtest', 'euidtest',
                  'shadowtest',
                  # v1.0.0: first-boot registration wizard
                  'register',

@@ -264,17 +264,17 @@ def etc_files():
     # against it even when registered passwords were changed at runtime.
     shadow = shadow_line('kck', 'ktest-pass') + "\n"
     inittab = "tty1:getty\n"
-    issue = "Novix 1.1.6 (tty1) -- authorized users only\n"
+    issue = "Novix 1.1.7 (tty1) -- authorized users only\n"
     # the user-space init script (/bin/init reads it; the first
     # "respawn" line is the supervised tty service) and the post-login
     # banner login(1) prints before exec'ing the shell.
     init = (
-        "# Novix 1.1.6 init script: one-shots first (in order), then the\n"
+        "# Novix 1.1.7 init script: one-shots first (in order), then the\n"
         "# respawn service is supervised forever.\n"
         "respawn /bin/getty\n"
     )
     motd = (
-        "Novix 1.1.6 -- a real OS, grown out of a kernel module\n"
+        "Novix 1.1.7 -- a real OS, grown out of a kernel module\n"
         "osh: pipelines a|b, redirects a>b a>>b a<b, jobs a&, $VAR $?\n"
     )
 

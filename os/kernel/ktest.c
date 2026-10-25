@@ -1328,6 +1328,16 @@ static void test_perm_boundary(void) {
  * plants a legacy line, verifies it, runs login's upgrade hook and checks
  * the rewritten PBKDF2 line still verifies. Covers exactly the code path
  * an old-disk login takes. */
+/* v1.1.7: euid/rgid split, setreuid/access boundaries -- /bin/euidtest
+ * (root) walks down to euid 100, proves the shadow-open denies while
+ * access(2) with the real id grants, climbs back, mirrors with gids and
+ * verifies a true mortal cannot reach 0. */
+static void test_euid_boundary(void) {
+    struct task *t = task_spawn_path("/bin/euidtest");
+    if (!t) { kprintf("  (/bin/euidtest missing -- skipped)\n"); return; }
+    reap_expect(t, 46);
+}
+
 static void test_shadow_upgrade(void) {
     struct task *t = task_spawn_path("/bin/shadowtest");
     if (!t) { kprintf("  (/bin/shadowtest missing -- skipped)\n"); return; }
@@ -1337,6 +1347,7 @@ static void test_shadow_upgrade(void) {
 static const struct ktest_case uid_cases[] = {
     { "setuid_boundary",  test_setuid_boundary },
     { "shadow_roundtrip", test_shadow_roundtrip },
+    { "euid_boundary",     test_euid_boundary },
     { "shadow_upgrade",   test_shadow_upgrade },
     { "perm_boundary",    test_perm_boundary },
 };

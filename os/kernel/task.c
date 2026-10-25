@@ -128,6 +128,7 @@ static void task_fill(struct task *t, const char *name, int prio) {
         t->uid = cur ? cur->uid : 0;
         t->gid = cur ? cur->gid : 0;
         t->ruid = cur ? cur->ruid : 0;
+        t->rgid = cur ? cur->rgid : 0;   /* v1.1.7: real gid follows the same rule */
         strcpy(t->cwd, cur ? cur->cwd : "/");
     }
     memset(t->fd, 0, sizeof(t->fd));
@@ -318,6 +319,7 @@ struct task *task_fork(struct pt_regs *parent_regs) {
     t->uid = parent->uid;
     t->gid = parent->gid;
     t->ruid = parent->ruid;
+    t->rgid = parent->rgid;              /* v1.1.7: identity inherits whole */
     strcpy(t->cwd, parent->cwd);
     t->kstack_base = (uint64_t)(uintptr_t)kmalloc(KSTACK_SIZE);
     if (!t->kstack_base) {

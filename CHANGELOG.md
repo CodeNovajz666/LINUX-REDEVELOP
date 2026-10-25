@@ -3,6 +3,37 @@
 版本号约定见 ROADMAP.md：次版本号递增 = 交付一个完整子系统；
 修订号递增 = 稳定性/小改进。
 
+## v1.1.7 —— 身份完整化：euid/egid 拆分、setreuid、access（2026-10-26）
+
+ROADMAP 1.1.x 第七步：README 差距表"单 uid、无 euid 拆分"一行回收。
+身份模型从 (uid, gid, ruid) 完整化为 (euid, egid, ruid, rgid)。
+
+**新增**
+- task 增 `rgid`（fork/spawn 继承、exec 保留，与 ruid 同规则）
+- `vfs_permitted_ids`：权限判定核心参数化——access(2) 用真实
+  (ruid, rgid) 判定，其余路径继续用有效身份
+- SETREUID(47)/SETREGID(48)：-1 保留原侧；root 任意设置，凡人只能
+  取自身 (real, effective) 对内的值——降权、（root-real 进程）回升、
+  永不升新
+- ACCESS(49)：mode 为 R=4/W=2/X=1 组合，"真实的我能不能"——SUID
+  程序信任调用者前该问的问题
+- setuid/setgid 语义 POSIX 化：root 置 real+effective，凡人可取
+  自身对内值（SUID 程序自此有能力自我解除特权）；setgid 补齐 rgid
+- /bin/euidtest：整链证明（ktest uid 组以 root 运行，退出码 46）——
+  降到 euid 100 后 shadow 打不开而 access(R_OK) 放行、凭 ruid 回升、
+  egid 镜像往返、真凡人 (100,100) 升 0 被拒
+
+**修复**
+- find 的递归在父层迭代共享 listing 缓冲时重入 ugetdents，父层行
+  指针被覆写成野指针（会话级 #GP）——改为先收集子目录、迭代完成
+  后再递归
+
+**测试**
+- ktest 49→50：`euid_boundary`（euidtest 载体）；setuid_boundary 等
+  既有身份测试在新语义下原样全绿（凡人不可升的不变量未动）
+- test_shell 119 项不变全绿
+- 三门禁全绿收版：50/50（smp=2 与 smp=1）、119/119
+
 ## v1.1.6 —— 文本工具六件：wc/head/tail/which/find/cut（2026-10-26）
 
 ROADMAP 1.1.x 第六步：纯用户态、零内核改动——六个工具全部吃现成

@@ -60,6 +60,10 @@
 /* v1.1.2 -- file operations completed: rename(2)/rmdir(2) */
 #define SYS_RENAME      45      /* rdi = old path, rsi = new path */
 #define SYS_RMDIR       46      /* rdi = path (empty dirs only) */
+/* v1.1.7 -- identity completion: euid/egid split, setreuid/access */
+#define SYS_SETREUID    47      /* rdi = ruid, rsi = euid (-1 = unchanged) */
+#define SYS_SETREGID    48      /* rdi = rgid, rsi = egid (-1 = unchanged) */
+#define SYS_ACCESS      49      /* rdi = path, rsi = mode (R|W|X bits) */
 
 /* ioctl requests (TCGETS/TCSETS subset; flags word: bit 0x8 = ECHO) */
 #define TCGETS 0

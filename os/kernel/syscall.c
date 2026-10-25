@@ -360,26 +360,88 @@ static long sys_getgid(void) {
     return cur ? cur->gid : 0;
 }
 
-/* setuid(2) teaching rule: root becomes anyone; a mortal may only restate
- * its own uid. login drops privilege through this call, never raises it. */
+/* setuid(2), POSIX-shaped (v1.1.7): root sets real AND effective; a
+ * mortal may only pick one of its current pair (the drop-back after a
+ * SUID binary is the interesting case -- passwd could disarm itself).
+ * login drops privilege through this call, never raises it. */
 static long sys_setuid(uint64_t uid) {
     struct task *cur = current_task();
     if (!cur || !cur->is_user) return -1;
+    uint16_t u = (uint16_t)uid;
     if (cur->uid == 0) {
-        cur->uid = cur->ruid = (uint16_t)uid;
+        cur->uid = cur->ruid = u;
         return 0;
     }
-    return (uint16_t)uid == cur->uid ? 0 : -1;
+    if (u != cur->uid && u != cur->ruid) return -1;
+    cur->uid = u;
+    return 0;
 }
 
+/* setgid(2): the egid twin of setuid (root sets both, mortal picks from
+ * its own pair). */
 static long sys_setgid(uint64_t gid) {
     struct task *cur = current_task();
     if (!cur || !cur->is_user) return -1;
+    uint16_t g = (uint16_t)gid;
     if (cur->uid == 0) {
-        cur->gid = (uint16_t)gid;
+        cur->gid = cur->rgid = g;
         return 0;
     }
-    return (uint16_t)gid == cur->gid ? 0 : -1;
+    if (g != cur->gid && g != cur->rgid) return -1;
+    cur->gid = g;
+    return 0;
+}
+
+/* v1.1.7 setreuid(ruid, euid): -1 leaves a side unchanged. Root may set
+ * anything; a mortal may only choose values already in its (ruid, euid)
+ * pair -- enough to swap privileges down and (for a root-real process)
+ * back up, never to gain new ones. */
+static long sys_setreuid(uint64_t ruid, uint64_t euid) {
+    struct task *cur = current_task();
+    if (!cur || !cur->is_user) return -1;
+    int64_t r = (int64_t)ruid, e = (int64_t)euid;
+    if (r != -1) {
+        uint16_t v = (uint16_t)r;
+        if (cur->uid != 0 && v != cur->ruid && v != cur->uid) return -1;
+        cur->ruid = v;
+    }
+    if (e != -1) {
+        uint16_t v = (uint16_t)e;
+        if (cur->uid != 0 && v != cur->ruid && v != cur->uid) return -1;
+        cur->uid = v;
+    }
+    return 0;
+}
+
+static long sys_setregid(uint64_t rgid, uint64_t egid) {
+    struct task *cur = current_task();
+    if (!cur || !cur->is_user) return -1;
+    int64_t r = (int64_t)rgid, e = (int64_t)egid;
+    if (r != -1) {
+        uint16_t v = (uint16_t)r;
+        if (cur->uid != 0 && v != cur->rgid && v != cur->gid) return -1;
+        cur->rgid = v;
+    }
+    if (e != -1) {
+        uint16_t v = (uint16_t)e;
+        if (cur->uid != 0 && v != cur->rgid && v != cur->gid) return -1;
+        cur->gid = v;
+    }
+    return 0;
+}
+
+/* v1.1.7 access(2): "could the REAL me do this?" -- the permission
+ * decision with ruid/rgid instead of the effective pair, exactly the
+ * question a SUID binary asks before trusting its caller. */
+static long sys_access(uint64_t upath, uint64_t mode) {
+    struct task *cur = current_task();
+    if (!cur || !cur->is_user) return -1;
+    if (mode > 7) return -1;
+    char path[80];
+    if (copy_str_from_user(cur, path, upath, sizeof(path)) != 0) return -1;
+    struct inode *ino = namei(path);
+    if (!ino) return -1;
+    return vfs_permitted_ids(ino, (uint16_t)mode, cur->ruid, cur->rgid) ? 0 : -1;
 }
 
 static long sys_chdir(uint64_t upath) {
@@ -746,6 +808,15 @@ void syscall_dispatch(struct pt_regs *r) {
         break;
     case SYS_RMDIR:
         ret = sys_rmdir(r->rdi);
+        break;
+    case SYS_SETREUID:                            /* v1.1.7 */
+        ret = sys_setreuid(r->rdi, r->rsi);
+        break;
+    case SYS_SETREGID:
+        ret = sys_setregid(r->rdi, r->rsi);
+        break;
+    case SYS_ACCESS:
+        ret = sys_access(r->rdi, r->rsi);
         break;
     case SYS_DATETIME:
         ret = sys_datetime(r->rdi, r->rsi);
