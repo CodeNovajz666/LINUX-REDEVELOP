@@ -81,9 +81,12 @@ struct task *task_spawn_argv(const char *path, const char *const argv[], int arg
 /* fork/exec (v0.4.0) */
 struct task *task_fork(struct pt_regs *parent_regs); /* child of current, or NULL */
 /* v0.9.0: exec gains argv -- the strings are pushed onto the fresh user stack
- * so main(argc, argv) works (crt0 reads them off the initial rsp). */
+ * so main(argc, argv) works (crt0 reads them off the initial rsp).
+ * v1.1.5: envp rides along (envp/envc, NULL-terminated world), and crt0
+ * publishes it as the environ global. */
 int task_exec(struct pt_regs *r, const char *path,
-              const char *const argv[], int argc);    /* replace current image */
+              const char *const argv[], int argc,
+              const char *const envp[], int envc);       /* replace current image */
 
 void task_exit(int status) __attribute__((noreturn));
 void task_kill(int signo) __attribute__((noreturn));  /* kill current task */

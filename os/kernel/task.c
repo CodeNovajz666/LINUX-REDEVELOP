@@ -200,7 +200,7 @@ struct task *task_create_user(const char *name, struct inode *elf_ino,
     if (!mm) return NULL;
 
     uint64_t pd, entry, uesp, brk;
-    if (elf_load(elf_ino, mm, argv, argc, &pd, &entry, &uesp, &brk) != 0) {
+    if (elf_load(elf_ino, mm, argv, argc, NULL, 0, &pd, &entry, &uesp, &brk) != 0) {
         mm_free_vmas(mm);
         return NULL;
     }
@@ -369,7 +369,8 @@ struct task *task_fork(struct pt_regs *parent_regs) {
  * a single uid, no euid split, so /bin/passwd really becomes root rather
  * than "effectively root". */
 int task_exec(struct pt_regs *r, const char *path,
-              const char *const argv[], int argc) {
+              const char *const argv[], int argc,
+              const char *const envp[], int envc) {
     struct task *cur = current_task();
     if (!cur || !cur->is_user) return -1;
 
@@ -381,7 +382,8 @@ int task_exec(struct pt_regs *r, const char *path,
     struct mm *mm = mm_create();
     if (!mm) return -1;
     uint64_t pd, entry, uesp, brk;
-    if (elf_load(ino, mm, argv, argc, &pd, &entry, &uesp, &brk) != 0) {
+    if (elf_load(ino, mm, argv, argc, envp, envc,
+                 &pd, &entry, &uesp, &brk) != 0) {
         mm_free_vmas(mm);
         return -1;                              /* old image still intact */
     }

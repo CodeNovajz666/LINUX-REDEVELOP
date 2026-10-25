@@ -111,9 +111,16 @@ int uclear(void);                       /* ioctl TCCLEAR on stdout */
 #define U_TC_ECHO 0x0008
 int uecho_set(int on);                       /* login: off before the password */
 
-/* argv-capable spawn/exec (v0.9.0 ABI: rsi = argv, rdx = argc) */
+/* the environment every exec carries (crt0 fills it from the initial
+ * stack; empty after an exec with no envp -- v1.1.5) */
+extern char **environ;
+
+/* argv-capable spawn/exec. v1.1.5 ABI: pointer vectors cross the kernel
+ * NULL-terminated (the count variants are retired); uexec_argv exports
+ * the caller's environ, uexecve takes an explicit environment. */
 int uspawn_argv(const char *name, const char *const argv[], int argc);
 int uexec_argv(const char *path, const char *const argv[], int argc);
+int uexecve(const char *path, const char *const argv[], const char *const envp[]);
 
 /* logical key codes -- the kernel input layer pre-parses arrow/Home/End
  * escapes (PS/2 and serial both) into these single bytes (v1.1.1) */

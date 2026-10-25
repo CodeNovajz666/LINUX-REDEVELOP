@@ -20,11 +20,14 @@ extern const unsigned int ramfs_img_size;
  *
  * v0.9.0: argv[] is pushed onto the (eagerly mapped) stack top page, so
  * the process starts with the classic initial stack:
- *     rsp -> [argc][argv[0]]..[argv[argc-1]][NULL]  (strings above)
- * and crt0 hands (argc, argv) to main. argc <= TASK_MAX_ARGV, and the
+ *     rsp -> [argc][argv[0]]..[argv[argc-1]][NULL]
+ *            [envp[0]]..[envp[envc-1]][NULL]  (strings above)
+ * and crt0 hands (argc, argv) to main and sets the environ global
+ * (v1.1.5). argc <= TASK_MAX_ARGV, envc <= TASK_MAX_ENVP, and the
  * strings must fit the page -- over-budget loads fail before any state
  * is destroyed. */
 int elf_load(struct inode *ino, struct mm *mm, const char *const argv[], int argc,
+             const char *const envp[], int envc,
              uint64_t *pd, uint64_t *entry, uint64_t *uesp, uint64_t *brk_out);
 
 #endif /* ELF_H */

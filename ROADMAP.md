@@ -1177,6 +1177,9 @@ test_shell 若干项）。
 - **v1.1.5 —— 环境变量**：exec 环境数组传递（environ）、osh
   `export` 内建、$PATH 命令查找（PATH 缺省 /bin）、`env` 工具。
   验收：export 后子进程可见；改 PATH 后外部命令可临时失明。
+  ✅ 完成（2026-10-26）：EXEC 向量 ABI 统一 NULL 结尾 + envp 入栈 +
+  crt0 environ；osh export/未导出局部语义/PATH 查找与失明；/bin/env。
+  49/49、113/113。
 - **v1.1.6 —— 文本工具六件**：wc/head/tail/which/find/cut——
   纯用户态零内核改动（吃现成 getdents/stat/read），测试面只增
   test_shell 项。验收：`ls /bin | wc -l` 管道链闭合。

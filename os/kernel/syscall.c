@@ -74,33 +74,37 @@ static int copy_str_from_user(struct task *t, char *dst, uint64_t usrc, size_t m
     return 0;
 }
 
-/* v0.9.0: copy an argv pointer array out of user memory. v1.0.1: each
- * string is NUL-scanned with the same per-page VMA validation and the
- * ARG_MAX_LEN cap the ELF stack builder enforces -- elf_load re-reads
- * the strings on this same CR3 (synchronously, before the switch), so
- * a validated extent here makes those dereferences safe too. */
-static int copy_argv_from_user(struct task *t, uint64_t uargv, int argc,
-                               const char *kargv[TASK_MAX_ARGV]) {
-    if (argc <= 0 || argc > TASK_MAX_ARGV) return -1;
+/* copy a NULL-terminated pointer vector (argv or envp) out of user memory.
+ * Every string is NUL-scanned with per-page VMA validation and the
+ * ARG_MAX_LEN cap; the count is capped at `max_slots`. The pointers are
+ * kept AS USER POINTERS on success -- elf_load re-reads the strings on
+ * this same CR3 (synchronously, before the space switch), so a validated
+ * extent here makes those dereferences safe too. */
+static int copy_vec_from_user(struct task *t, uint64_t uvec, int max_slots,
+                              const char *kvec[], int *count_out) {
     if (!t || !t->mm) return -1;
-    if (uargv < USER_CODE_BASE || uargv + 8u * (uint64_t)argc > USER_STACK_TOP) return -1;
-    if (!user_span_ok(t, uargv, 8u * (uint64_t)argc, 0)) return -1;
-    for (int i = 0; i < argc; i++) {
-        uint64_t p = *(volatile uint64_t *)(uintptr_t)(uargv + 8u * (uint64_t)i);
+    if (uvec < USER_CODE_BASE || uvec >= USER_STACK_TOP) return -1;
+    int n = 0;
+    for (;;) {
+        if (n >= max_slots) return -1;
+        if (!user_span_ok(t, uvec + 8u * (uint64_t)n, 8, 0)) return -1;
+        uint64_t p = *(volatile uint64_t *)(uintptr_t)(uvec + 8u * (uint64_t)n);
+        if (p == 0) break;                      /* the NULL terminator */
         if (p < USER_CODE_BASE || p >= USER_STACK_TOP) return -1;
         uint64_t page = 1;
-        size_t n;
-        for (n = 0; n < ARG_MAX_LEN; n++) {
-            uint64_t addr = p + n;
+        size_t len;
+        for (len = 0; len < ARG_MAX_LEN; len++) {
+            uint64_t addr = p + len;
             if ((addr & ~(uint64_t)(PAGE_SIZE - 1)) != page) {
                 page = addr & ~(uint64_t)(PAGE_SIZE - 1);
                 if (!user_page_ok(t, page, 0)) return -1;
             }
             if (!*(volatile char *)(uintptr_t)addr) break;
         }
-        if (n == ARG_MAX_LEN) return -1;    /* unterminated: out of budget */
-        kargv[i] = (const char *)(uintptr_t)p;
+        if (len == ARG_MAX_LEN) return -1;      /* unterminated: out of budget */
+        kvec[n++] = (const char *)(uintptr_t)p;
     }
+    *count_out = n;
     return 0;
 }
 
@@ -176,13 +180,20 @@ static long sys_spawn(uint64_t uname, uint64_t uargv, uint64_t uargc) {
         t = task_spawn_path(path);
     } else {
         const char *kargv[TASK_MAX_ARGV];
-        if (copy_argv_from_user(cur, uargv, (int)(int32_t)uargc, kargv) != 0) return -1;
-        t = task_spawn_argv(path, kargv, (int)(int32_t)uargc);
+        int argc = 0;
+        /* v1.1.5: the vector wire format is NULL-terminated everywhere */
+        if (copy_vec_from_user(cur, uargv, TASK_MAX_ARGV, kargv, &argc) != 0)
+            return -1;
+        t = task_spawn_argv(path, kargv, argc);
     }
     return t ? t->pid : -1;
 }
 
-static long sys_exec(struct pt_regs *r, uint64_t upath, uint64_t uargv, uint64_t uargc) {
+/* v1.1.5 ABI: rsi = NULL-terminated argv, rdx = NULL-terminated envp
+ * (0 = empty environment). argc/envc are derived by the scan -- the
+ * count-in-rdx form is retired (an envp and a count cannot share a
+ * register, and Unix vectors terminate with NULL anyway). */
+static long sys_exec(struct pt_regs *r, uint64_t upath, uint64_t uargv, uint64_t uenvp) {
     struct task *cur = current_task();
     char path[80];
     if (copy_str_from_user(cur, path, upath, sizeof(path)) != 0) return -1;
@@ -197,16 +208,19 @@ static long sys_exec(struct pt_regs *r, uint64_t upath, uint64_t uargv, uint64_t
         strncpy(full + 5, path, sizeof(full) - 6);
         full[sizeof(full) - 1] = 0;
     }
-    /* v0.9.0: argv from rsi/rdx, same convention as spawn */
-    if (uargv == 0) {
-        if (uargc != 0) return -1;
-        return task_exec(r, full, NULL, 0);
-    }
     const char *kargv[TASK_MAX_ARGV];
-    if (copy_argv_from_user(cur, uargv, (int)(int32_t)uargc, kargv) != 0) return -1;
+    int argc = 0;
+    if (uargv != 0 &&
+        copy_vec_from_user(cur, uargv, TASK_MAX_ARGV, kargv, &argc) != 0)
+        return -1;
+    const char *kenvp[TASK_MAX_ENVP];
+    int envc = 0;
+    if (uenvp != 0 &&
+        copy_vec_from_user(cur, uenvp, TASK_MAX_ENVP, kenvp, &envc) != 0)
+        return -1;
     /* on success this never "returns": the frame is replaced and the
      * pending iretq enters the new image (rax ends up 0, harmless) */
-    return task_exec(r, full, kargv, (int)(int32_t)uargc);
+    return task_exec(r, full, kargv, argc, kenvp, envc);
 }
 
 /* ---- v0.5.0: sbrk / signals / pipes ---- */

@@ -45,15 +45,20 @@ static int img_read(struct inode *ino, uint64_t off, void *buf, uint32_t len) {
 }
 
 int elf_load(struct inode *ino, struct mm *mm, const char *const argv[], int argc,
+             const char *const envp[], int envc,
              uint64_t *pd_out, uint64_t *entry_out, uint64_t *uesp_out,
              uint64_t *brk_out) {
     if (!ino || !ino->f_op || !ino->f_op->read) return -1;
     uint64_t size = ino->size;
 
-    /* v0.9.0: validate the argv budget before touching any state */
+    /* v0.9.0: validate the argv budget before touching any state;
+     * v1.1.5: envp rides the same rule */
     if (argc < 0 || argc > TASK_MAX_ARGV) return -1;
     for (int i = 0; i < argc; i++)
         if (!argv[i]) return -1;
+    if (envc < 0 || envc > TASK_MAX_ENVP) return -1;
+    for (int i = 0; i < envc; i++)
+        if (!envp[i]) return -1;
 
     struct elf64_ehdr e;
     if (size < sizeof(e)) return -1;
@@ -107,50 +112,71 @@ int elf_load(struct inode *ino, struct mm *mm, const char *const argv[], int arg
 
     /* v0.9.0: build the initial stack inside the top page, written through
      * the identity map (the kernel runs on its own CR3, so the user VA is
-     * not dereferenceable here). Layout, low to high:
-     *   [argc] [argv[0] .. argv[argc-1]] [NULL] [strings...]
+     * not dereferenceable here). Layout, low to high (v1.1.5 adds envp):
+     *   [argc] [argv[0] .. argv[argc-1]] [NULL]
+     *   [envp[0] .. envp[envc-1]] [NULL] [strings...]
      * argc lands 16-byte aligned so crt0's `call main` meets the SysV ABI. */
     {
         uint8_t *page = (uint8_t *)(uintptr_t)top;
-        size_t slen[TASK_MAX_ARGV];
+        size_t slen[TASK_MAX_ARGV + TASK_MAX_ENVP];
         size_t sbytes = 0;
-        for (int i = 0; i < argc; i++) {
-            slen[i] = strlen(argv[i]) + 1;
-            if (slen[i] > 64) goto fail;           /* per-arg cap; the frame
-                                                    * is mapped, destroy_user_dir
-                                                    * returns it -- no free here */
-            sbytes += slen[i];
+        int nstr = 0;
+        for (int i = 0; i < argc; i++, nstr++) {
+            slen[nstr] = strlen(argv[i]) + 1;
+            if (slen[nstr] > 64) goto fail;           /* per-arg cap; the frame
+                                                        * is mapped, destroy_user_dir
+                                                        * returns it -- no free here */
+            sbytes += slen[nstr];
         }
-        /* strings end 16 bytes under the top; array + argc sit below them */
+        for (int i = 0; i < envc; i++, nstr++) {
+            slen[nstr] = strlen(envp[i]) + 1;
+            if (slen[nstr] > 96) goto fail;           /* NAME=value rows */
+            sbytes += slen[nstr];
+        }
+        /* strings end 16 bytes under the top; both arrays + argc below them */
         uint32_t s_end = PAGE_SIZE - 16;
-        if (sbytes > s_end - 8 * (argc + 1) - 16 - 64)
+        if (sbytes > s_end - 8 * (argc + envc + 2) - 16 - 64)
             goto fail;                              /* same: frame still mapped */
         uint32_t s_beg = (uint32_t)(s_end - sbytes);
 
-        uint32_t arg_off[TASK_MAX_ARGV];
+        uint32_t str_off[TASK_MAX_ARGV + TASK_MAX_ENVP];
         uint32_t o = s_beg;
-        for (int i = 0; i < argc; i++) {
-            memcpy(page + o, argv[i], slen[i]);
-            arg_off[i] = o;
-            o += (uint32_t)slen[i];
+        int si = 0;
+        for (int i = 0; i < argc; i++, si++) {
+            memcpy(page + o, argv[i], slen[si]);
+            str_off[si] = o;
+            o += (uint32_t)slen[si];
+        }
+        for (int i = 0; i < envc; i++, si++) {
+            memcpy(page + o, envp[i], slen[si]);
+            str_off[si] = o;
+            o += (uint32_t)slen[si];
         }
 
         uint32_t arr_end = s_beg & ~7u;                /* 8-byte aligned */
-        uint32_t arr_beg = arr_end - 8u * (uint32_t)(argc + 1);
+        uint32_t env_beg = arr_end - 8u * (uint32_t)(envc + 1);
+        uint32_t arr_beg = env_beg - 8u * (uint32_t)(argc + 1);
         uint32_t argc_off = (arr_beg - 8u) & ~15u;     /* rsp 16-byte aligned */
         /* the SysV pair [rsp]=argc / [rsp+8]=argv[0] must be contiguous:
          * when the 16-rounding opened an 8-byte gap, argv[] moved with the
          * array -- crt0 would read unwritten stack for argv[0] (v0.9.0 bug,
          * hit only by argument-length combinations osh first produced) */
+        uint32_t shift = arr_beg - (argc_off + 8u);
         arr_beg = argc_off + 8u;
+        env_beg -= shift;                              /* envp follows argv */
 
+        uint64_t base = USER_STACK_TOP - PAGE_SIZE;
         uint64_t *arr = (uint64_t *)(page + arr_beg);
         for (int i = 0; i < argc; i++)
-            arr[i] = USER_STACK_TOP - PAGE_SIZE + arg_off[i];
+            arr[i] = base + str_off[i];
         arr[argc] = 0;                                 /* argv[argc] = NULL */
+        uint64_t *e_arr = (uint64_t *)(page + env_beg);
+        for (int i = 0; i < envc; i++)
+            e_arr[i] = base + str_off[argc + i];
+        e_arr[envc] = 0;                               /* envp[envc] = NULL */
         *(uint64_t *)(page + argc_off) = (uint64_t)argc;
 
-        *uesp_out = USER_STACK_TOP - PAGE_SIZE + argc_off;
+        *uesp_out = base + argc_off;
     }
     *pd_out = pd;
     *entry_out = e.e_entry;

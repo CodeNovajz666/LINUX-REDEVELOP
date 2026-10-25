@@ -12,7 +12,7 @@
 | 3 | GETPID | — | pid | |
 | 4 | YIELD | — | 0 | 主动让出 CPU |
 | 5 | SLEEP | ms | 0 | |
-| 6 | SPAWN | path / char** argv / argc | pid | 裸名按 /bin 解析；(0,0) = 无参数 |
+| 6 | SPAWN | path / char** argv /（忽略） | pid | 裸名按 /bin 解析；v1.1.5 起 argv 为 NULL 结尾向量（ulib 封装不变），无环境 |
 | 7 | WAITPID | pid(-1=任意) / flags(WNOHANG=1) | 退出码 | 0 = WNOHANG 下孩子仍在 |
 | 8 | GETCHAR | — | 字符/0 | |
 | 9 | SET_POLICY | 0..4 | 0 | PRIORITY/RR/FCFS/EDF/RMS |
@@ -23,7 +23,7 @@
 | 14 | LSEEK | fd / off / whence | 新位置 | 只对普通文件；不许越过 EOF |
 | 15 | STAT | path / struct stat* | 0 | |
 | 16 | FORK | — | 父=子 pid，子=0 | COW；fd 共享偏移 |
-| 17 | EXEC | path / char** argv / argc | 不返回 | 失败返回 -1，旧映像完好 |
+| 17 | EXEC | path / char** argv / char** envp | 不返回 | v1.1.5 ABI：argv/envp 均 NULL 结尾（envp=0 即空环境）；envp 压上新栈、crt0 发布为 environ；失败返回 -1，旧映像完好 |
 | 18 | FREEPAGES | — | 空闲页数 | 调试用（测试断言） |
 | 19 | SBRK | 增量 | 旧 break | |
 | 20 | KILL | pid / sig | 0 | |

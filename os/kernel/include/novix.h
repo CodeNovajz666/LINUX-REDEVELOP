@@ -6,7 +6,7 @@
 #include <stdbool.h>
 #include "lib.h"
 
-#define NOVIX_VERSION "1.1.4"
+#define NOVIX_VERSION "1.1.5"
 
 /* ---- SMP (v0.7.0) ---- */
 #define SMP_MAX            4        /* QEMU -smp cap for stress runs */
@@ -42,6 +42,7 @@
 #define TASK_MAX           64
 #define TASK_NAME_LEN      16
 #define TASK_MAX_ARGV      8         /* v0.9.0: exec argv slots */
+#define TASK_MAX_ENVP      16        /* v1.1.5: exec envp slots */
 #define ARG_MAX_LEN        64        /* v0.9.0: per-argument byte cap */
 #define TASK_CWD_LEN       80
 #define KSTACK_SIZE        16384u

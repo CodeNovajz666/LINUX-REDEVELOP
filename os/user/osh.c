@@ -62,6 +62,7 @@ struct osh_job {
 struct osh_var {
     char name[16];
     char value[48];
+    bool exported;                          /* v1.1.5: rides child envp */
 };
 
 static struct osh_job jobs[OSH_JOB_MAX];
@@ -119,6 +120,8 @@ static void var_set(const char *name, int nlen, const char *value) {
         v = &vars[nvars++];
         for (int i = 0; i < nlen; i++) v->name[i] = name[i];
         v->name[nlen] = 0;
+        v->exported = false;                    /* NAME=value stays local
+                                                 * until `export` says so */
     }
     ustrncpy(v->value, value, sizeof(v->value) - 1);
     v->value[sizeof(v->value) - 1] = 0;
@@ -268,24 +271,69 @@ static void wire_child_fds(const struct osh_stage *st, int pipe_in, int pipe_out
     }
 }
 
-/* resolve a command word to /bin/<name> (bare) or pass paths through */
-static void resolve_cmd(const char *word, char *path, int cap) {
+/* v1.1.5: the exported-variable environment children exec with --
+ * "NAME=value" rows rebuilt before every exec (a static pool: the child
+ * copies nothing, the kernel reads the strings before the space switch) */
+static char env_pool[OSH_VAR_MAX][72];
+static const char *env_vec[OSH_VAR_MAX + 1];
+
+static const char *const *osh_envp(void) {
+    int n = 0;
+    for (int i = 0; i < nvars && n < OSH_VAR_MAX; i++) {
+        if (!vars[i].exported) continue;
+        char *o = env_pool[n];
+        char *end = o + sizeof(env_pool[0]) - 1;
+        const char *p = vars[i].name;
+        while (*p && o < end) *o++ = *p++;
+        if (o < end) *o++ = '=';
+        p = vars[i].value;
+        while (*p && o < end) *o++ = *p++;
+        *o = 0;
+        env_vec[n] = env_pool[n];
+        n++;
+    }
+    env_vec[n] = 0;
+    return env_vec;
+}
+
+/* v1.1.5: resolve a command word through $PATH (default /bin): every
+ * ':'-separated entry gets a /NAME stat until a regular file answers.
+ * Words containing '/' or '.' pass through untouched (paths are exact). */
+static int resolve_cmd(const char *word, char *path, int cap) {
     if (word[0] == '/' || word[0] == '.') {
         ustrncpy(path, word, cap - 1);
         path[cap - 1] = 0;
-        return;
+        return 0;
     }
-    int n = 0;
-    const char *b = "/bin/";
-    while (*b && n < cap - 1) path[n++] = *b++;
-    while (*word && n < cap - 1) path[n++] = *word++;
-    path[n] = 0;
+    struct osh_var *pv = var_find("PATH", 4);
+    const char *p = pv ? pv->value : "/bin";
+    for (;;) {
+        const char *e = p;
+        while (*e && *e != ':') e++;
+        int n = 0;
+        while (p < e && n < cap - 2) path[n++] = *p++;
+        if (n > 0 && path[n - 1] != '/' && n < cap - 2) path[n++] = '/';
+        const char *w = word;
+        while (*w && n < cap - 1) path[n++] = *w++;
+        path[n] = 0;
+        struct ustat st;
+        if (ustat(path, &st) == 0 && (st.st_mode & 0xF000) == 0x8000)
+            return 0;                           /* a regular file answers */
+        if (!*e) break;
+        p = e + 1;
+        if (!*p) break;                         /* trailing ':' -- done */
+    }
+    return -1;
 }
 
 /* spawn one stage; returns child pid or -1 (message already printed) */
 static int run_stage(const struct osh_stage *st, int pipe_in, int pipe_out) {
     char path[64];
-    resolve_cmd(st->argv[0], path, sizeof(path));
+    if (resolve_cmd(st->argv[0], path, sizeof(path)) != 0) {
+        uprintf("osh: %s: not found\n", st->argv[0]);
+        return -1;
+    }
+    const char *const *envp = osh_envp();
     int pid = ufork();
     if (pid < 0) {
         uputs("osh: fork failed\n");
@@ -293,7 +341,7 @@ static int run_stage(const struct osh_stage *st, int pipe_in, int pipe_out) {
     }
     if (pid == 0) {                             /* child: wire, exec, never back */
         wire_child_fds(st, pipe_in, pipe_out);
-        uexec_argv(path, st->argv, st->argc);
+        uexecve(path, st->argv, envp);
         uprintf("osh: %s: not found\n", st->argv[0]);
         uexit(127);
     }
@@ -389,7 +437,7 @@ static bool stage_is_builtin(const struct osh_stage *st) {
     if (!st->argc || st->r.in_file || st->r.out_file) return false;
     static const char *names[] =
         { "cd", "exit", "logout", "help", "history", "poweroff", "wait",
-          "jobs", "ps", "cpus", "mem", "kill", "upt", "uptime", 0 };
+          "jobs", "ps", "cpus", "mem", "kill", "upt", "uptime", "export", 0 };
     for (int i = 0; names[i]; i++)
         if (ustrcmp(st->argv[0], names[i]) == 0) return true;
     return false;
@@ -444,17 +492,44 @@ static int run_builtin(struct osh_stage *st) {
         last_status = 0;
         return 0;
     }
+    /* v1.1.5: export NAME / export NAME=value -- marks a variable for the
+     * child environment (plain NAME=value stays shell-local, bash-style) */
+    if (ustrcmp(cmd, "export") == 0) {
+        if (st->argc < 2) {                     /* bare: list the exported set */
+            for (int i = 0; i < nvars; i++)
+                if (vars[i].exported)
+                    uprintf("export %s=%s\n", vars[i].name, vars[i].value);
+            last_status = 0;
+            return 0;
+        }
+        for (int a = 1; a < st->argc; a++) {
+            const char *w = st->argv[a];
+            const char *eq = ustrchr(w, '=');
+            if (eq) {
+                var_set(w, (int)(eq - w), eq + 1);
+                struct osh_var *v = var_find(w, (int)(eq - w));
+                if (v) v->exported = true;
+            } else {
+                struct osh_var *v = var_find(w, (int)ustrlen(w));
+                if (v) v->exported = true;
+                else { uprintf("export: %s: not set\n", w); last_status = 1; }
+            }
+        }
+        last_status = last_status ? 1 : 0;
+        return 0;
+    }
     if (ustrcmp(cmd, "help") == 0) {
         uputs("osh built-ins: cd DIR, exit, logout, help, history, poweroff,\n"
-              "               wait, jobs, ps, cpus, mem [-v], upt, kill PID [SIGNO]\n"
+              "               wait, jobs, ps, cpus, mem [-v], upt, kill PID [SIGNO],\n"
+              "               export NAME[=value] (children see it; $PATH lookup)\n"
               "scripting: a|b, a>b a>>b a<b, a&, $VAR ${VAR} $? $pid,\n"
               "           NAME=value assignments, # comments\n"
               "editing: Up/Down history, Left/Right/Home/End cursor,\n"
               "         Backspace, Ctrl-U kill line, Ctrl-W kill word\n"
-              "/bin tools: ls pwd cat cp mv rm mkdir rmdir touch echo grep date sleep\n"
-              "            uname clear id whoami who passwd useradd hello ...\n"
-              "limits: no quoting, vars are not exported, no Ctrl-C to jobs,\n"
-              "        built-ins are single-stage (no pipe/redirect)\n");
+              "/bin tools: ls pwd cat cp mv rm mkdir rmdir touch echo grep env\n"
+              "            date sleep uname clear id whoami who passwd useradd ...\n"
+              "limits: no quoting, unexported vars stay local, no Ctrl-C to\n"
+              "        jobs, built-ins are single-stage (no pipe/redirect)\n");
         last_status = 0;
         return 0;
     }

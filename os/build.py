@@ -124,7 +124,7 @@ USER_PROGRAMS = ['hello', 'spawner', 'fault_div', 'fault_segv', 'stackovf', 'fil
                  # v1.1.0: interactive toolbox (ls/rm/date/clear plumbing:
                  # SYS_GETDENTS/UNLINK/DATETIME + ioctl TCCLEAR)
                  'ls', 'pwd', 'rm', 'cp', 'mv', 'mkdir', 'rmdir', 'date',
-                 'sleep', 'uname', 'clear']
+                 'sleep', 'uname', 'clear', 'env']
 
 def run(cmd, **kw):
     printable = ' '.join(str(c) for c in cmd)

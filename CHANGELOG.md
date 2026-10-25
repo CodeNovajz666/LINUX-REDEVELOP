@@ -3,6 +3,36 @@
 版本号约定见 ROADMAP.md：次版本号递增 = 交付一个完整子系统；
 修订号递增 = 稳定性/小改进。
 
+## v1.1.5 —— 环境变量：environ、export、$PATH（2026-10-26）
+
+ROADMAP 1.1.x 第五步：exec 语义补完——环境随映像传递，osh 变量
+可导出，命令查找走 $PATH。EXEC 的向量 ABI 顺势统一为 NULL 结尾。
+
+**新增**
+- exec ABI v1.1.5：rsi = NULL 结尾 argv、rdx = NULL 结尾 envp（0 =
+  空环境）；SPAWN 的 argv 同步为 NULL 结尾向量。内核侧
+  copy_argv_from_user 泛化为 copy_vec_from_user（逐指针逐页校验，
+  计数由扫描得出，TASK_MAX_ENVP=16 上限）
+- 初始栈布局扩为经典三段：[argc][argv..][NULL][envp..][NULL]
+  [strings]——elf_load 同时压两组数组；crt0 从栈上算出 envp 并发布
+  为 `environ` 全局（每个用户程序一个槽位）
+- ulib：`uexecve`（显式环境）；`uexec_argv` 语义升级为携带调用者
+  的 environ（Unix 语义）；spawn 封装内部组 NULL 结尾向量，调用方
+  接口不变
+- osh：`export NAME[=value]` 内建（bare 列出已导出集；赋值式
+  set+export；NAME=value 仍是 shell 局部——bash 语义）；子进程
+  envp 由导出变量表即时重建；**命令查找走 $PATH**（缺省 /bin，
+  逐 ':段 stat 到普通文件为止；含 '/' 的词原样透传）；PATH 改坏
+  即"命令失明"，export PATH=... 恢复
+- /bin/env：打印进程环境（environ 逐行）
+
+**测试**
+- ktest 49/49 不变（ABI 变化由全部既有 argv 测试网背书：execer/
+  uidtest/iotest/osh 全链路在两核与单核都绿）
+- test_shell 110→113：export 后子进程 env | grep 可见、未导出变量
+  子进程不可见（精确计数）、PATH 失明与恢复
+- 三门禁全绿收版：49/49（smp=2 与 smp=1）、113/113
+
 ## v1.1.4 —— 内存防护：用户栈 guard page（2026-10-26）
 
 ROADMAP 1.1.x 第四步：栈越界从"裸缺页碰运气"变成结构性保证。

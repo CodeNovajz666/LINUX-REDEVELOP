@@ -281,11 +281,32 @@ int uecho_set(int on) {
     return (int)_sys3(SYS_IOCTL, 0, TCSETS, (long)&fl);
 }
 
+/* v1.1.5: the kernel wants NULL-terminated vectors; our callers hand us
+ * (argv, argc) pairs, so both wrappers build the terminated copy on the
+ * stack (TASK_MAX_ARGV slots -- the kernel cap) */
+#define U_ARGV_MAX 8
+
 int uspawn_argv(const char *name, const char *const argv[], int argc) {
-    return (int)_sys3(SYS_SPAWN, (long)name, (long)argv, argc);
+    if (argc < 0 || argc > U_ARGV_MAX) return -1;
+    const char *tmp[U_ARGV_MAX + 1];
+    for (int i = 0; i < argc; i++) tmp[i] = argv[i];
+    tmp[argc] = 0;
+    return (int)_sys3(SYS_SPAWN, (long)name, (long)tmp, 0);
 }
+
+/* plain exec: argv pair + the caller's own environ (Unix semantics --
+ * what `environ` holds is exactly what the child sees) */
 int uexec_argv(const char *path, const char *const argv[], int argc) {
-    return (int)_sys3(SYS_EXEC, (long)path, (long)argv, argc);
+    if (argc < 0 || argc > U_ARGV_MAX) return -1;
+    const char *tmp[U_ARGV_MAX + 1];
+    for (int i = 0; i < argc; i++) tmp[i] = argv[i];
+    tmp[argc] = 0;
+    return (int)_sys3(SYS_EXEC, (long)path, (long)tmp, (long)environ);
+}
+
+/* explicit environment (osh's exported-variable table) */
+int uexecve(const char *path, const char *const argv[], const char *const envp[]) {
+    return (int)_sys3(SYS_EXEC, (long)path, (long)argv, (long)envp);
 }
 
 /* ---- v1.1.1 line editor ----

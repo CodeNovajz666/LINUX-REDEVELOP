@@ -197,8 +197,12 @@ LOGIN_EXPECT = [
     # v1.1.2: rename fast path + rmdir refusal (empty-dir removal is proven
     # by the exact counts: rd1/rd2 must appear only in the echoed commands)
     ('osh rmdir nonempty',   'rmdir: rd2: directory not empty'),
+    # v1.1.5: export reaches children through envp; unexported stays local;
+    # breaking PATH blinds external commands, restoring finds them again
+    ('osh export in env',    'GR=hi-env-9'),
+    ('osh PATH blind',       'pwd: not found'),
     ('osh date local',       'local (unix'),    # the RTC line, kernel-formatted
-    ('osh uname',            'Novix 1.1.4'),    # uname and the banners agree
+    ('osh uname',            'Novix 1.1.5'),    # uname and the banners agree
                                                 # on the version again (v1.1.0)
     # v1.1.1: the history ring numbers entries chronologically and retires
     # the oldest past 32 -- the listing shows the raw (pre-expansion) lines
@@ -220,7 +224,7 @@ LOGIN_COUNT_EXPECT = [
     # v1.0.0: 'cat /etc/motd | grep Novix > /tmp/x' + cat -- the needle
     # hits the boot banner (1), motd at each of the two logins (2) and the
     # redirected copy (1)
-    ('osh motd pipeline', 'Novix 1.1.4 -- a real OS', 4),
+    ('osh motd pipeline', 'Novix 1.1.5 -- a real OS', 4),
     # variable + redirect + pipe + grep + cat: two cats of derived files;
     # the echoed command lines only ever contain '$p-pipe', never the value
     ('osh var+pipe+redirect', 'zz-pipe', 2),
@@ -242,6 +246,8 @@ LOGIN_EXACT_EXPECT = [
     # echoes + the two `history` listings; never the `ls` output
     ('osh rmdir empty dir', 'rd1', 6),
     ('osh rmdir emptied dir', 'rd2', 16),   # +1: the not-empty refusal
+    # v1.1.5: the unexported variable appears only in its assignment echo
+    ('osh unexported stays local', 'local-only-1', 1),
 ]
 
 # session 3 (v1.0.0): fresh boot -- the accounts registered in session 2
@@ -533,6 +539,17 @@ send_typed('echo osh-kw-victim', enter=False, wait=0.2)
 send('\x17', wait=0.3)
 send('\n', wait=0.6)
 send_typed('history', wait=0.8)               # raw lines survived the editing
+# ---- v1.1.5: environment variables ----
+send_typed('export GR=hi-env-9', wait=0.5)    # set + export in one word
+send_typed('env | grep GR', wait=0.8)         # the child saw the variable
+send_typed('echo $GR', wait=0.5)
+send_typed('LOCl=local-only-1', wait=0.5)     # unexported: stays shell-local
+send_typed('env | grep LOCl', wait=0.6)       # grep finds nothing (exit 1)
+send_typed('echo $?')                         # ... and says so via $?
+send_typed('export PATH=/no-such-dir', wait=0.5)
+send_typed('pwd', wait=0.6)                   # PATH-blind: external tool not found
+send_typed('export PATH=/bin', wait=0.5)      # restore
+send_typed('pwd', wait=0.5)                   # found again
 send_typed('cd /home/ktest', wait=0.6)       # home again for passwd/logout
 # passwd roundtrip: ktest execs the SUID binary and changes its own password
 send_typed('passwd')
