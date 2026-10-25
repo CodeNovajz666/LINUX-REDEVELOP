@@ -105,6 +105,7 @@ KERNEL_SOURCES = [
     'percpu.c', 'smp/mp.c', 'smp/apic.c', 'smp/smp.c', 'smp/trampoline.S',
     # v0.8.0: driver model, ATA PIO, RTC, FAT32 on the boot disk
     'drivers/driver.c', 'drivers/ata.c', 'drivers/rtc.c', 'fs/fat32.c',
+    'fs/procfs.c',
     # v0.9.0: password hashing for the login world
     'sha256.c',
 ]

@@ -815,7 +815,44 @@ static void test_vfs_rename(void) {
     vfs_unlink("/tmp/kren-c");
 }
 
+/* v1.1.8: the read-only /proc -- files answer, the directory lists, and
+ * /proc/uptime agrees with the uptime syscall (sampled around the read,
+ * so monotonicity is the assertion, not exact equality). */
+static void test_procfs(void) {
+    struct stat st;
+    KT_ASSERT(vfs_stat("/proc/uptime", &st) == 0);
+    KT_ASSERT((st.st_mode & S_IFMT) == S_IFREG);
+
+    uint64_t before = timer_uptime_ms();
+    struct file *f = vfs_open("/proc/uptime", O_RDONLY);
+    KT_ASSERT(f != NULL);
+    char buf[64];
+    int n = vfs_read(f, buf, sizeof(buf) - 1);
+    vfs_close(f);
+    uint64_t after = timer_uptime_ms();
+    KT_ASSERT(n > 4);                          /* at least "N ms
+" */
+    buf[n] = 0;
+    uint64_t v = 0;
+    for (const char *p = buf; *p >= '0' && *p <= '9'; p++)
+        v = v * 10 + (uint64_t)(*p - '0');
+    KT_ASSERT(v >= before - 10 && v <= after + 10);
+
+    /* the write path does not exist */
+    KT_ASSERT(vfs_open("/proc/uptime", O_WRONLY | O_CREAT) == NULL);
+
+    /* the directory lists the synthetic files */
+    int saw_mem = 0, saw_ver = 0;
+    char name[32];
+    for (int i = 0; vfs_readdir("/proc", i, name, sizeof(name)) == 0; i++) {
+        if (strcmp(name, "meminfo") == 0) saw_mem = 1;
+        if (strcmp(name, "version") == 0) saw_ver = 1;
+    }
+    KT_ASSERT(saw_mem && saw_ver);
+}
+
 static const struct ktest_case fs_cases[] = {
+    { "procfs", test_procfs },
     { "vfs_create_rw", test_vfs_create_rw },
     { "vfs_lseek", test_vfs_lseek },
     { "vfs_mkdir_readdir", test_vfs_mkdir_readdir },

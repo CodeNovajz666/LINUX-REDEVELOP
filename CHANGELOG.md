@@ -3,6 +3,28 @@
 版本号约定见 ROADMAP.md：次版本号递增 = 交付一个完整子系统；
 修订号递增 = 稳定性/小改进。
 
+## v1.1.8 —— procfs：/proc 只读回归（2026-10-26）
+
+ROADMAP 1.1.x 第八步：原内核模块 /proc/procman 的"假变真"叙事闭环
+——当年是 Linux 模块里假装进程列表，如今是真内核发布真数字。
+
+**新增**
+- `kernel/fs/procfs.c`：只读合成文件系统，(name, generator) 静态表
+  + 每 inode 挂生成器；read 每次现生成（无缓存，读到的永远是活
+  数字），目录 0555 / 文件 0444，无任何写路径
+- 四个文件：`/proc/uptime`（毫秒，与 10 号 UPTIME 同源）、
+  `/proc/version`（NOVIX_VERSION）、`/proc/meminfo`（页/堆/交换槽
+  计数）、`/proc/cpuinfo`（ncpu/online/每核 APIC）
+- 挂载表钉在当前根下（FAT 切换后与 ramfs 回退都成立），与
+  /dev /tmp /var 同机制
+
+**测试**
+- ktest 50→51：`procfs`——/proc/uptime 数值落在读取前后两次
+  uptime 采样之间（单调性断言）、O_WRONLY|O_CREAT 打开被拒、
+  readdir 列出 meminfo/version
+- test_shell 119→122：cat 三个文件（pages_free 行、ncpu 2、版本行）
+- 三门禁全绿收版：51/51（smp=2 与 smp=1）、122/122
+
 ## v1.1.7 —— 身份完整化：euid/egid 拆分、setreuid、access（2026-10-26）
 
 ROADMAP 1.1.x 第七步：README 差距表"单 uid、无 euid 拆分"一行回收。

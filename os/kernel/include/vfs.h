@@ -167,6 +167,9 @@ void task_close_files(struct task *t);      /* close every open fd */
 void task_open_std_fds(struct task *t);     /* fd 0/1/2 -> /dev/console */
 void vfs_dup_files(struct task *dst, const struct task *src); /* fork: share */
 
+/* ---- procfs (fs/procfs.c, v1.1.8): read-only synthetic /proc ---- */
+void procfs_init(void);      /* builds the table, mounts under the root */
+
 /* ---- pipes (fs/pipe.c, v0.5.0) ---- */
 int pipe_create(int *rfd, int *wfd);        /* sys_pipe backend */
 

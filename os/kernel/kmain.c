@@ -405,6 +405,10 @@ void kmain(uint32_t magic, struct multiboot_info *mbi) {
         }
     }
 
+    /* v1.1.8: the read-only synthetic /proc -- uptime/version/meminfo/
+     * cpuinfo, generated on read; pinned under whichever root is live */
+    procfs_init();
+
     /* v0.9.0: FAT carries no permission bits -- correct the inode cache
      * (exec bits, /etc/shadow 0600, /home ownership) before anything runs */
     fs_perm_fixup();

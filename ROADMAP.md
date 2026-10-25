@@ -1195,6 +1195,9 @@ test_shell 若干项）。
   **原内核模块 /proc/procman 的回归**（"假的变真的"叙事闭环：
   当年是 procfs 假装进程，如今是真内核提供真 procfs）。
   验收：cat /proc/uptime 与 10 号 syscall 一致。
+  ✅ 完成（2026-10-26）：只读合成 fs（生成器表 + 逐读现生成）；
+  uptime/version/meminfo/cpuinfo 四文件；ktest 单调性断言 + shell
+  三文件检查。51/51、122/122。
 - **v1.1.9 —— 债务清理**：全库 `/* SMP: */` `/* v0.x: */` 遗留
   标记盘点回收（能收的收、收不了的转正为 DESIGN.md 已知限制）；
   fork bomb 存活门 + 10 分钟长跑压力进 build.py test 可选目标。
