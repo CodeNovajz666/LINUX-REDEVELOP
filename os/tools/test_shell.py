@@ -60,6 +60,7 @@ EXPECT = [
     ('spawner out', 'all children reaped'),
     ('fault_div',   'killed by sig8'),
     ('fault_segv',  'killed by SIGSEGV'),
+    ('stackovf guard kill', '(stackovf): page fault'),   # v1.1.4
     ('kill bad pid','no task with pid 999'),
     ('kill idle guard', 'cannot kill the idle task'),
     ('kill shell guard', 'cannot kill the shell'),
@@ -197,7 +198,7 @@ LOGIN_EXPECT = [
     # by the exact counts: rd1/rd2 must appear only in the echoed commands)
     ('osh rmdir nonempty',   'rmdir: rd2: directory not empty'),
     ('osh date local',       'local (unix'),    # the RTC line, kernel-formatted
-    ('osh uname',            'Novix 1.1.3'),    # uname and the banners agree
+    ('osh uname',            'Novix 1.1.4'),    # uname and the banners agree
                                                 # on the version again (v1.1.0)
     # v1.1.1: the history ring numbers entries chronologically and retires
     # the oldest past 32 -- the listing shows the raw (pre-expansion) lines
@@ -219,7 +220,7 @@ LOGIN_COUNT_EXPECT = [
     # v1.0.0: 'cat /etc/motd | grep Novix > /tmp/x' + cat -- the needle
     # hits the boot banner (1), motd at each of the two logins (2) and the
     # redirected copy (1)
-    ('osh motd pipeline', 'Novix 1.1.3 -- a real OS', 4),
+    ('osh motd pipeline', 'Novix 1.1.4 -- a real OS', 4),
     # variable + redirect + pipe + grep + cat: two cats of derived files;
     # the echoed command lines only ever contain '$p-pipe', never the value
     ('osh var+pipe+redirect', 'zz-pipe', 2),
@@ -322,6 +323,10 @@ send_typed('spawn fault_div', wait=1.0)
 wait_for(out, b'killed by sig8')
 send_typed('spawn fault_segv', wait=1.0)
 wait_for(out, b'killed by SIGSEGV')
+# v1.1.4: unbounded recursion dies on the stack guard page -- the report
+# names the program, so the needle is distinct from fault_segv's kill
+send_typed('spawn stackovf', wait=1.5)
+wait_for(out, b'(stackovf): page fault')
 send_typed('kill 999', wait=0.8)
 send_typed('kill 0', wait=0.8)
 send_typed('kill 1', wait=0.8)

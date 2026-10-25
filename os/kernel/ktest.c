@@ -316,6 +316,22 @@ static void test_fault_segv(void) {
     KT_ASSERT(t->kill_signo == SIGSEGV);          /* cause recorded */
 }
 
+/* v1.1.4: unbounded recursion runs the stack pointer off the stack VMA;
+ * the guard region below (never mapped, mmap-capped away) must turn that
+ * into a clean SIGSEGV kill -- not a panic, and not corruption of
+ * whatever an mmap region might have placed under the stack. */
+static void test_stack_overflow(void) {
+    sched_set_policy(SCHED_PRIORITY);
+    struct task *t = task_spawn_path("/bin/stackovf");
+    if (!t) {
+        kprintf("  (/bin/stackovf not found in ramfs -- build error)\n");
+        cur_failed = 1;
+        return;
+    }
+    reap_expect(t, 128 + SIGSEGV);
+    KT_ASSERT(t->kill_signo == SIGSEGV);
+}
+
 static void test_kill_other_task(void) {
     sched_set_policy(SCHED_PRIORITY);
     struct task *s = task_create_kernel("killme", sleeper_thread, (void *)(intptr_t)0, 5);
@@ -531,6 +547,7 @@ static const struct ktest_case mt_cases[] = {
     { "syscall_userproc", test_syscall_userproc },
     { "fault_div_isolation", test_fault_div },
     { "fault_segv_isolation", test_fault_segv },
+    { "stack_overflow", test_stack_overflow },
     { "kill_other_task", test_kill_other_task },
     { "cow_isolation", test_cow_isolation },
     { "cow_accounting", test_cow_accounting },

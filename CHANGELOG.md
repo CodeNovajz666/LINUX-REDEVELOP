@@ -3,6 +3,26 @@
 版本号约定见 ROADMAP.md：次版本号递增 = 交付一个完整子系统；
 修订号递增 = 稳定性/小改进。
 
+## v1.1.4 —— 内存防护：用户栈 guard page（2026-10-26）
+
+ROADMAP 1.1.x 第四步：栈越界从"裸缺页碰运气"变成结构性保证。
+
+**新增**
+- 用户栈从 2 页扩到 8 页（32 KiB，为 1.1.5 的 environ 数组留余量）
+- **guard region 落为结构不变量**：栈 VMA 之下的页永不映射，且
+  mmap 分配器新增硬上界 USER_MMAP_LIMIT（栈下方 4 页），mmap 区
+  从结构上爬不进栈区——递归炸栈必然落在不可映射的 guard 页上，
+  以干净的 SIGSEGV 终结，而不是悄悄踩进 mmap 数据区
+- /bin/stackovf：无界递归（volatile 局部缓冲保证每帧真实落地，
+  防 -O2 尾调用消除），预期死于 128+SIGSEGV
+
+**测试**
+- ktest 48→49：`stack_overflow`（mt 组）——stackovf 退出码 139、
+  kill_signo==SIGSEGV、页账目由既有 gate D 把关
+- test_shell 109→110：会话 1 spawn stackovf，事件驱动等待
+  "(stackovf): page fault" 报告（与 fault_segv 的报告以程序名区分）
+- 三门禁全绿收版：49/49（smp=2 与 smp=1）、110/110
+
 ## v1.1.3 —— 安全加固：PBKDF2、shadow 审计、login 降权检查（2026-10-26）
 
 ROADMAP 1.1.x 第三步：DESIGN.md "无慢因子哈希"的 1.x 承诺到期回收。

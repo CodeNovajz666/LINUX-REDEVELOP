@@ -182,6 +182,10 @@ uint64_t mm_mmap(struct task *t, uint64_t len) {
     if (!t->mm || len == 0 || len > (1ull << 30)) return 0;
     uint64_t al = (len + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
     uint64_t va = t->mm->mmap_top;
+    /* v1.1.4: the allocator stops below the stack's guard region -- mmap
+     * can never climb into it, so a stack overflow always faults on the
+     * unmapped guard (clean SIGSEGV) instead of corrupting mmap data */
+    if (va + al > USER_MMAP_LIMIT) return 0;
     if (vma_add(t->mm, va, va + al, VMA_R | VMA_W, VMA_ANON, NULL, 0) != 0)
         return 0;
     t->mm->mmap_top += al;

@@ -1171,6 +1171,9 @@ test_shell 若干项）。
 - **v1.1.4 —— 内存防护**：用户栈 guard page（剖析报告遗留缺口：
   栈越界写应落保护页而非裸 #PF）；ktest 增栈溢出 SIGSEGV 边界用例。
   验收：递归炸栈程序死于 SIGSEGV 而非 panic。
+  ✅ 完成（2026-10-26）：栈 2→8 页；guard 落为结构不变量（栈下页
+  永不映射 + mmap 分配器硬上界 USER_MMAP_LIMIT）；stackovf 载体 +
+  ktest stack_overflow + shell 检查。49/49、110/110。
 - **v1.1.5 —— 环境变量**：exec 环境数组传递（environ）、osh
   `export` 内建、$PATH 命令查找（PATH 缺省 /bin）、`env` 工具。
   验收：export 后子进程可见；改 PATH 后外部命令可临时失明。

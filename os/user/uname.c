@@ -5,6 +5,6 @@
 
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
-    uputs("Novix 1.1.3 x86_64 -- a real OS, grown out of a kernel module\n");
+    uputs("Novix 1.1.4 x86_64 -- a real OS, grown out of a kernel module\n");
     return 0;
 }

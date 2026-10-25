@@ -6,7 +6,7 @@
 #include <stdbool.h>
 #include "lib.h"
 
-#define NOVIX_VERSION "1.1.3"
+#define NOVIX_VERSION "1.1.4"
 
 /* ---- SMP (v0.7.0) ---- */
 #define SMP_MAX            4        /* QEMU -smp cap for stress runs */
@@ -26,7 +26,13 @@
  * starts at 1 GiB. The stack tops out below the canonical-half boundary. */
 #define USER_CODE_BASE     0x40000000ull
 #define USER_STACK_TOP     0x7FFFFFFFE000ull
-#define USER_STACK_PAGES   2u
+/* v1.1.4: 8 pages (32 KiB) of user stack; the page(s) below the stack
+ * VMA are the GUARD -- never mapped, never reachable: mmap's allocator
+ * is capped at USER_MMAP_LIMIT, comfortably below the stack, so a stack
+ * overflow faults on the guard and dies by SIGSEGV instead of walking
+ * into an mmap region. */
+#define USER_STACK_PAGES   8u
+#define USER_MMAP_LIMIT    (USER_STACK_TOP - (USER_STACK_PAGES + 4) * 0x1000ull)
 /* sbrk heap ceiling (v0.5.0): code starts at 1 GiB, the heap grows up from
  * the image end; 2 GiB leaves a huge gap to the stack (PML4[255]) for the
  * mmap region planned in 0.6.0. Everything stays under PML4[0] (512 GiB). */

@@ -109,7 +109,7 @@ KERNEL_SOURCES = [
     'sha256.c',
 ]
 
-USER_PROGRAMS = ['hello', 'spawner', 'fault_div', 'fault_segv', 'filetest',
+USER_PROGRAMS = ['hello', 'spawner', 'fault_div', 'fault_segv', 'stackovf', 'filetest',
                  'forker', 'forkacct', 'execer',
                  'malloctest', 'sigtest', 'masktest', 'pipetest',
                  'memhog',
