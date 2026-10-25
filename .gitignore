@@ -17,3 +17,10 @@ zig-out/
 # 调试输出残留（手工重定向的构建/测试日志）
 build_err.txt
 test_out.txt
+# Python bytecode caches
+__pycache__/
+*.pyc
+
+# Local run logs captured at the os/ root
+os/build_out.txt
+os/shell_test_out.txt

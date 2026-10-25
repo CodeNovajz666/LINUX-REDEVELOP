@@ -1111,7 +1111,173 @@ shell。这一版把"用户与 OS 的交互"补齐——常用操作在 osh 内
 
 ---
 
+## 1.1.x → 2.0.0 版本规划（2026-10-25 制定）
+
+主线一句话：**1.1.x 小步补齐交互与安全债务 → 1.2-1.9 每版一个子系统纵深 →
+2.0.0 只重构不改行为的架构分层**。全程延续开发原则：每版三门禁全绿才收，
+每版可引导可交互。
+
+### 主线总览
+
+| 版本 | 主题 | 主要交付 |
+|---|---|---|
+| v1.1.1 | 交互检索 | ↑/↓ 历史翻阅、行编辑增强 |
+| v1.1.2 | 文件操作补全 | rename(2)/rmdir(2)、mv 直连 |
+| v1.1.3 | 安全加固 | PBKDF2、shadow 访问审计 |
+| v1.1.4 | 内存防护 | 栈 guard page |
+| v1.1.5 | 环境变量 | environ、export、$PATH |
+| v1.1.6 | 文本工具 | wc/head/tail/which/find |
+| v1.1.7 | 身份完整化 | euid/egid 拆分、setreuid |
+| v1.1.8 | procfs | /proc 只读回归 |
+| v1.1.9 | 债务清理 | 遗留标记回收、压力门 |
+| v1.2.0 | 线程与作业控制 | clone、pthread、进程组、Ctrl-C |
+| v1.3.0 | 网络入门 | 网卡驱动 + 最小 UDP |
+| v1.4.0 | TCP 与 socket | TCP 子集、socket VFS 化 |
+| v1.5.0 | 存储深化 | page cache、sync/fsync |
+| v1.6.0 | 多用户完整化 | /etc/group、chgrp、umask |
+| v1.7.0 | 调度观测 | PI 演示、调度统计、nice |
+| v1.8.0 | 稳定性与长跑 | 1 小时门、fork bomb、泄漏审计 |
+| v1.9.0 | arch 盘点 | 接口清单文档化、RISC-V spike 附录 |
+| v2.0.0 | 架构分层重构 | arch/x86_64、行为逐字等价 |
+
+### v1.1.x 系列（九个小步版本）
+
+每版聚焦一个改进，纯增量，三门禁全绿即收（预计各自新增自测 1-2 项 +
+test_shell 若干项）。
+
+- **v1.1.1 —— 交互检索**：↑/↓ 翻阅 history（osh 已留行规程，32 条
+  环形记录已就位）+ Home/End/Ctrl-U/Ctrl-W 行编辑。转义序列解析放在
+  内核 console 输入层一处（串口/VGA 共用），osh 与内核 shell 同享。
+  验收：↑↑ 翻出前两条、编辑不破坏历史记录原文。
+- **v1.1.2 —— 文件操作补全**：RENAME(45)/RMDIR(46) 进 VFS 与
+  syscall 表；mv 从"cp+unlink 临时实现"换直连（如实注解随之删除）；
+  rmdir 工具。验收：mv 后 inode 不变（stat 证）、rmdir 拒绝非空。
+- **v1.1.3 —— 安全加固**：PBKDF2 替换裸 salted SHA-256
+  （DESIGN.md §6.5 的 1.x 承诺到期回收）+ /etc/shadow 访问路径审计
+  （login SUID 只读、register 只写）；存量哈希首启自动升级。
+  验收：shadow 字段格式带迭代数、旧盘镜像登录后哈希已换新。
+- **v1.1.4 —— 内存防护**：用户栈 guard page（剖析报告遗留缺口：
+  栈越界写应落保护页而非裸 #PF）；ktest 增栈溢出 SIGSEGV 边界用例。
+  验收：递归炸栈程序死于 SIGSEGV 而非 panic。
+- **v1.1.5 —— 环境变量**：exec 环境数组传递（environ）、osh
+  `export` 内建、$PATH 命令查找（PATH 缺省 /bin）、`env` 工具。
+  验收：export 后子进程可见；改 PATH 后外部命令可临时失明。
+- **v1.1.6 —— 文本工具六件**：wc/head/tail/which/find/cut——
+  纯用户态零内核改动（吃现成 getdents/stat/read），测试面只增
+  test_shell 项。验收：`ls /bin | wc -l` 管道链闭合。
+- **v1.1.7 —— 身份完整化**：euid/egid 与 ruid/rgid 正式拆分
+  （README 差距表回收）、setreuid(2)/setregid(2)、access(2)。
+  验收：SUID login 的 getruid!=getuid 语义进入 ktest uid 组。
+- **v1.1.8 —— procfs**：/proc 只读挂载（task/mm/统计）——
+  **原内核模块 /proc/procman 的回归**（"假的变真的"叙事闭环：
+  当年是 procfs 假装进程，如今是真内核提供真 procfs）。
+  验收：cat /proc/uptime 与 10 号 syscall 一致。
+- **v1.1.9 —— 债务清理**：全库 `/* SMP: */` `/* v0.x: */` 遗留
+  标记盘点回收（能收的收、收不了的转正为 DESIGN.md 已知限制）；
+  fork bomb 存活门 + 10 分钟长跑压力进 build.py test 可选目标。
+  验收：标记计数归零或全部转为文档化限制；压力门绿。
+
+### v1.2.0 —— 线程与作业控制（minor 功能版）
+
+- **clone(2)**：轻量执行流（共享 mm/文件表，CLONE_VM 起步），
+  pt_regs 与调度器改动最小化——on_cpu 协议对线程同样生效
+- **最小 pthread**：create/join/mutex/exit 四件（ulib 提供）；
+  thread_hello 双线程在 cross_cpu 证据下真并行
+- **进程组**：setpgid(2)/getpgrp(2)，会话概念留 1.x 后
+- **Ctrl-C 信号路由**：console 输入层 → 前台组 SIGINT（osh 作业
+  前台语义）——补齐 v1.1.0 时"无 Ctrl-C 路由"的如实边界
+- 验收：thread_hello 跨核并行证据；Ctrl-C 杀前台作业、后台作业
+  存活；fork+thread 混合后页计数守恒（gate F 扩展）
+
+### v1.3.0 —— 网络栈入门（延伸方向第一条兑现）
+
+- QEMU e1000（或 virtio-net）驱动：MMIO + DMA 环缓冲，
+  统一驱动模型注册为 netif
+- **最小 UDP**：socket(2)/bind/sendto/recvfrom/close 六调用；
+  校验_and 直通（不做分片）
+- 工具：`ping`（ICMP echo）+ `nc`（UDP 回环演示）
+- 验收：QEMU user-net 下 ping 通网关；nc 环回收发一致；
+  中断路径不破坏既有锁序（NAPI 风格下半部留 v1.4）
+
+### v1.4.0 —— TCP 与 socket 完整化
+
+- TCP 状态机子集：LISTEN/SYN-SENT/ESTABLISHED/CLOSE，
+  三次握手与优雅关闭（参照 lwIP 设计，不抄代码）
+- **socket VFS 化**：socket fd 统一进文件表，dup2/管道语义
+  对 socket 生效
+- telnetd 玩具服务：登录世界第一次可以远程进
+- 验收：外部 `telnet` 连入并完成一次登录会话；
+  socket 经 dup2 进 osh 管道
+
+### v1.5.0 —— 存储深化
+
+- **page cache**：读路径缓存 + 写回策略（脏页阈值/定时），
+  FAT 读放大下降可测
+- **sync(2)/fsync(2)**：掉电一致性从 fat_powercycle 门扩展到
+  随机写模式
+- FAT32 簇分配器优化（连续分配提示）；swap 预读
+- 验收：io 压力门（iotest 扩展）+ 掉电门双绿；
+  写盘字节数可统计（对比无 cache 基线）
+
+### v1.6.0 —— 多用户完整化
+
+- **/etc/group**：组数据库、chgrp(2)、组权限位（rwx 三元组
+  第三段生效）
+- **umask**：open/mkdir 默认权限掩码
+- 新用户默认属组；useradd -g 选项
+- 验收：跨用户目录访问矩阵进 test_shell（uid A 建组，
+  uid B 验证组 rwx）
+
+### v1.7.0 —— 调度观测与公平
+
+- 优先级继承（PI）最小演示：mutex 持有者临时提升——
+  在现有锁序契约内做，不动 sched_lock 语义
+- nice(2)：PRIORITY 策略下用户态权重
+- /proc 调度统计（每任务切换次数/等待时间），
+  `top` 工具
+- 验收：低优先级任务在 nice 梯度下可见饥饿差异；
+  PI 用例翻转抢占顺序有断言
+
+### v1.8.0 —— 稳定性与长跑（v2.0 前的信任基线）
+
+- **1 小时长跑门**：脚本化 osh 会话循环（fork/pipe/fs 混合
+  载荷），页表/堆/swap 计数漂移为零
+- fork bomb 存活从 v1.1.9 可选转正式门
+- 错误路径清扫：每个 syscall 的边界用例至少一项进 ktest
+- 验收：长跑前后 meminfo 逐项 diff 为零；
+  三门禁 + 长跑门四绿——**重构前的行为锚点定版**
+
+### v1.9.0 —— arch 层盘点（只文档不动码）
+
+- **ArchOps 接口清单**：early_boot/context_switch/tlb_flush/
+  send_ipi/set_timer 五件 + per-CPU 机制，DESIGN.md 新章
+- x86 绑定点全量标注（boot.S/APIC/paging.rs/MP 表/isa-debug-exit
+  与架构无关代码的边界线）
+- **RISC-V spike 附录**：延续 spike/ 目录传统——QEMU virt +
+  OpenSBI 起最小核的一次性验证（S 态入口 + UART 打印），
+  结论只进文档不进主线
+- 验收：接口清单覆盖全部 arch 依赖 grep 零漏；
+  spike 附录可复现
+
+### v2.0.0 —— 架构分层重构（只重构不改行为）
+
+- kernel/ 平铺 → `arch/x86_64/`（boot/GDT/IDT/APIC/MP/paging/
+  percpu/trampoline）+ 架构无关子系统；ArchOps 落地为编译期
+  分派（教学内核不上函数指针表——保持可读）
+- **行为逐字等价**为最高验收：重构前后 test_shell.py 三会话
+  输出 diff 为零、46 项自测计数与断言文本不变
+- 门禁矩阵：x86_64 三门禁 × 重构前后双跑对照
+- RISC-V 端口**不在本版**——v2.0.0 只立抽象层；
+  端口留给 v2.1.0（届时三门禁变双架构六门禁）
+- 风险与对策：纯搬家版本绝不夹带功能（违反则拆版）；
+  重构分五步提交（每子系统一步），每步门禁全绿
+
+---
+
 ## 延伸方向（1.x 之后，不承诺）
+
+（注：下列条目中 **TCP/IP 栈已入 v1.3.0/v1.4.0**、**线程已入 v1.2.0**、
+**procfs 已入 v1.1.8** 规划；其余仍为未承诺方向。）
 
 - 五级页表 LA57（0.3.0 落地的是四级教学版）
 - TCP/IP 栈（参照 lwIP 设计：网卡驱动 → netif → tcp/udp → socket VFS）
