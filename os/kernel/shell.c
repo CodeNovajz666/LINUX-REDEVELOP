@@ -85,7 +85,7 @@ void shell_report_mem(shell_emit_t emit, void *ctx, int verbose) {
             "kernel heap: %u used, %u free of %u KiB\n",
             (unsigned)(heap_used_bytes() >> 10),
             (unsigned)(heap_free_bytes() >> 10),
-            (unsigned)((HEAP_END - HEAP_START) >> 10));
+            (unsigned)((HEAP_END - heap_base()) >> 10));
     emit(row, n, ctx);
     if (verbose) {                              /* v0.6.0: mm accounting */
         n = ksnprintf(row, sizeof(row),
@@ -249,9 +249,9 @@ static void cmd_rm(const char *path) {
 
 /* echo TEXT, echo TEXT > FILE (overwrite), echo TEXT >> FILE (append) */
 static void cmd_echo(char *arg) {
-    char *redir = strstr(arg, " >> ");
+    char *redir = (char *)strstr(arg, " >> ");
     int append = redir != NULL;
-    if (!redir) redir = strstr(arg, " > ");
+    if (!redir) redir = (char *)strstr(arg, " > ");
     if (!redir) { kprintf("%s\n", arg); return; }
 
     *redir = 0;
@@ -443,13 +443,17 @@ void shell_run(void) {
                 tab_complete(line, &n, sizeof(line));
                 continue;
             }
-            if (c == 0x1b) {                     /* ESC [ A/B: up/down history */
-                int c1 = keyboard_trychar();
-                if (c1 == '[') {
-                    int c2 = keyboard_trychar();
-                    if (c2 == 'A') hist_prev(line, &n, sizeof(line));
-                    else if (c2 == 'B') hist_next(line, &n, sizeof(line));
-                }
+            if (c == KEY_UP) { hist_prev(line, &n, sizeof(line)); continue; }
+            if (c == KEY_DOWN) { hist_next(line, &n, sizeof(line)); continue; }
+            /* v1.1.1: KEY_LEFT/RIGHT/HOME/END arrive pre-parsed from the
+             * input layer; this editor is append-only, so they are no-ops */
+            if (c == 0x15) {                   /* Ctrl-U: erase the whole line */
+                while (n > 0) { n--; kprintf("\b \b"); }
+                continue;
+            }
+            if (c == 0x17) {                   /* Ctrl-W: erase the last word */
+                while (n > 0 && line[n - 1] == ' ') { n--; kprintf("\b \b"); }
+                while (n > 0 && line[n - 1] != ' ') { n--; kprintf("\b \b"); }
                 continue;
             }
             if (c == '\b' || c == 0x7f) {     /* BS or DEL: erase last char

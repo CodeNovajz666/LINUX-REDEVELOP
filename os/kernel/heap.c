@@ -3,10 +3,20 @@
 #include "lib.h"
 #include "spinlock.h"
 
-/* First-fit free-list allocator over the fixed [HEAP_START, HEAP_END) region.
- * Block layout: [header][payload ...]. Headers live in-band; neighbours are
- * coalesced on free. v0.7.0: heap_lock (leaf) replaces cli/sti -- it fences
- * every CPU, not just this one's interrupt sources. */
+/* First-fit free-list allocator over [heap_base, HEAP_END). Block layout:
+ * [header][payload ...]. Headers live in-band; neighbours are coalesced on
+ * free. v0.7.0: heap_lock (leaf) replaces cli/sti -- it fences every CPU,
+ * not just this one's interrupt sources.
+ *
+ * v1.1.1: the heap starts AFTER the kernel image. HEAP_START used to be a
+ * fixed 0x400000 and the v1.1.0 kernel's .bss ended 0x4458 bytes below it;
+ * the next bit of embedded ramfs growth pushed __bss_end past the constant
+ * and the allocator began handing out the kernel's own .bss (ramfs nodes on
+ * the boot stack, wild memcpys, #DF at boot). The base is now computed from
+ * the linker's __bss_end at init time -- growing the kernel just moves the
+ * heap up. */
+
+extern char __bss_end[];               /* linker.ld (boot.S zeroes to it) */
 
 struct blk {
     uint32_t size;          /* total block bytes incl. header */
@@ -19,24 +29,34 @@ struct blk {
 
 static struct blk *head;
 static size_t used_bytes;
+static uintptr_t heap_lo;                       /* actual first heap byte */
 static spinlock_t heap_lock = SPINLOCK_INIT;
 
+size_t heap_base(void) { return heap_lo; }
+
 void heap_init(void) {
-    head = (struct blk *)HEAP_START;
-    head->size = HEAP_END - HEAP_START;
+    uintptr_t base = ((uintptr_t)__bss_end + 0xFFFFu) & ~0xFFFFu;  /* 64 KiB up */
+    if (base < HEAP_START) base = HEAP_START;   /* small kernels: old spot */
+    if (base >= HEAP_END)
+        panic("heap: kernel image (%llx) leaves no room below 16 MiB",
+              (unsigned long long)base);
+    heap_lo = base;
+    head = (struct blk *)base;
+    head->size = HEAP_END - base;
     head->used = 0;
     head->next = NULL;
 }
 
 static void heap_check(struct blk *b, const char *where) {
     (void)b; (void)where;
-    if (b && (b->size < HDR_SIZE || (uintptr_t)b + b->size > HEAP_END))
+    if (b && (b->size < HDR_SIZE || (uintptr_t)b + b->size > HEAP_END
+             || (uintptr_t)b < heap_lo))
         panic("heap corrupt (%s): blk %llx size %08x", where,
               (unsigned long long)(uintptr_t)b, b->size);
 }
 
 void *kmalloc(size_t n) {
-    if (n == 0 || n > HEAP_END - HEAP_START) return NULL;
+    if (n == 0 || n > HEAP_END - heap_lo) return NULL;
     irq_flags_t f; spin_lock_irqsave(&heap_lock, &f);
     size_t need = HDR_SIZE + ((n + 15u) & ~15u);
     for (struct blk *b = head; b; b = b->next) {

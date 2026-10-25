@@ -280,28 +280,133 @@ int uexec_argv(const char *path, const char *const argv[], int argc) {
     return (int)_sys3(SYS_EXEC, (long)path, (long)argv, argc);
 }
 
-/* read one line from fd 0. The console device echoes printables and \n
- * itself while the echo flag is on (see dev_console_read); backspace
- * editing is the reader's job, hence the explicit "\b \b" here. Returns
- * the line length without the newline; the buffer is NUL-terminated. */
-int ureadline(char *buf, int max) {
-    int n = 0;
+/* ---- v1.1.1 line editor ----
+ *
+ * The edited line shares one screen row with the prompt, and the console
+ * understands exactly two cursor motions ('\b' one left, printing a char one
+ * right), so every operation is expressed as: back up, reprint the tail,
+ * blank the leftovers, back up onto the cursor. The device echo prints each
+ * typed char itself; everything the editor emits is explicit redraw.
+ *
+ * Column bookkeeping (pos measures columns right of the line start):
+ *   insert c at pos: device already echoed c; print buf[pos+1..n), '\b'*(n-pos-1)
+ *   delete d chars ending at pos: '\b'*d + tail(t bytes) + ' '*d + '\b'*(t+d)
+ *   replace line (history): '\b'*pos + new line + ' '*pad + '\b'*(len+pad-pos')
+ */
+static void ed_emit(const char *s, int n) { uwrite_fd(1, s, n); }
+
+static void ed_backs(int n) {
+    for (int i = 0; i < n; i++) ed_emit("\b", 1);
+}
+
+static void ed_spaces(int n) {
+    for (int i = 0; i < n; i++) ed_emit(" ", 1);
+}
+
+/* delete the d chars immediately left of the cursor */
+static void ed_del_before(char *buf, int *n, int *pos, int d) {
+    if (d <= 0 || d > *pos) return;
+    int t = *n - *pos;                        /* tail right of the cursor */
+    umemmove(buf + *pos - d, buf + *pos, (unsigned long)t);
+    *pos -= d;
+    *n -= d;
+    buf[*n] = 0;
+    ed_backs(d);
+    ed_emit(buf + *pos, t);
+    ed_spaces(d);
+    ed_backs(t + d);
+}
+
+/* swap the whole edited line for s (history recall); cursor lands at end */
+static void ed_set(char *buf, int *n, int *pos, int cap, const char *s) {
+    ed_backs(*pos);
+    int old = *n, i = 0;
+    while (s[i] && i < cap - 1) { buf[i] = s[i]; i++; }
+    *n = i;
+    *pos = i;
+    buf[i] = 0;
+    ed_emit(buf, i);
+    int pad = old > i ? old - i : 0;          /* blank the old tail */
+    ed_spaces(pad);
+    ed_backs(pad);
+}
+
+int ureadline_ex(char *buf, int max, uhist_cb hist, void *ctx) {
+    int n = 0, pos = 0;                       /* line length, cursor column */
+    char live[128];                           /* the half-typed line, parked
+                                                 while history is browsed */
+    int have_live = 0, hpos = 0;              /* browse depth; 0 = live line */
     for (;;) {
         char c;
-        if (uread(0, &c, 1) != 1) continue;
+        int r = uread(0, &c, 1);
+        if (r != 1) {                         /* v1.1.1: EOF/error ends the
+                                                   read (the old editor spun
+                                                   forever on a closed stdin) */
+            buf[n] = 0;
+            return -1;
+        }
         if (c == '\n') break;
-        if (c == '\b' || c == 0x7f) {
-            if (n > 0) {
-                n--;
-                uwrite("\b \b", 3);
+        if (c == '\b' || c == 0x7f) {         /* erase the char left of pos */
+            ed_del_before(buf, &n, &pos, 1);
+            continue;
+        }
+        if (c == 0x15) {                      /* Ctrl-U: kill to line start */
+            ed_del_before(buf, &n, &pos, pos);
+            continue;
+        }
+        if (c == 0x17) {                      /* Ctrl-W: kill previous word */
+            int k = pos;
+            while (k > 0 && buf[k - 1] == ' ') k--;
+            while (k > 0 && buf[k - 1] != ' ') k--;
+            ed_del_before(buf, &n, &pos, pos - k);
+            continue;
+        }
+        if ((unsigned char)c == UKEY_UP && hist) {
+            const char *s = hist(hpos + 1, ctx);
+            if (!s) continue;                 /* already at the oldest entry */
+            if (hpos == 0) {                  /* park the half-typed line */
+                ustrncpy(live, buf, (unsigned long)n);
+                live[n] = 0;
+                have_live = 1;
+            }
+            hpos++;
+            ed_set(buf, &n, &pos, max, s);
+            continue;
+        }
+        if ((unsigned char)c == UKEY_DOWN && hist) {
+            if (hpos == 0) continue;
+            hpos--;
+            if (hpos == 0 && have_live) ed_set(buf, &n, &pos, max, live);
+            else {
+                const char *s = hist(hpos, ctx);
+                if (s) ed_set(buf, &n, &pos, max, s);
             }
             continue;
         }
-        if (c >= 32 && c < 127 && n < max - 1)
-            buf[n++] = c;
+        if ((unsigned char)c == UKEY_LEFT)  { if (pos > 0) { ed_backs(1); pos--; } continue; }
+        if ((unsigned char)c == UKEY_RIGHT) { if (pos < n) { ed_emit(" ", 1); pos++; } continue; }
+        if ((unsigned char)c == UKEY_HOME)  { ed_backs(pos); pos = 0; continue; }
+        if ((unsigned char)c == UKEY_END)   { ed_emit(buf + pos, n - pos); pos = n; continue; }
+        if (c >= 32 && c < 127 && n < max - 1) {
+            /* the device echoed c at the old cursor; reprint the tail that
+             * now sits right of it, then step back onto the cursor */
+            int t = n - pos;
+            umemmove(buf + pos + 1, buf + pos, (unsigned long)t);
+            buf[pos++] = c;
+            n++;
+            buf[n] = 0;
+            ed_emit(buf + pos, t);
+            ed_backs(t);
+        }
+        /* other control bytes (Ctrl-C among them) are not the editor's
+         * business -- dropped, exactly as the old reader did */
     }
     buf[n] = 0;
     return n;
+}
+
+int ureadline(char *buf, int max) {
+    return ureadline_ex(buf, max, 0, 0);
 }
 
 /* ---- freestanding string helpers ---- */
@@ -358,7 +463,19 @@ char *ustrstr(const char *hay, const char *needle) {
 void *umemcpy(void *dst, const void *src, unsigned long n) {
     char *d = dst;
     const char *s = src;
-    while (n--) *d++ = *s++;
+    for (unsigned long i = 0; i < n; i++) d[i] = s[i];
+    return dst;
+}
+
+/* v1.1.1: overlapping-safe copy (the line editor shifts its own buffer) */
+void *umemmove(void *dst, const void *src, unsigned long n) {
+    char *d = dst;
+    const char *s = src;
+    if (d < s) {
+        for (unsigned long i = 0; i < n; i++) d[i] = s[i];
+    } else if (d > s) {
+        for (unsigned long i = n; i > 0; i--) d[i - 1] = s[i - 1];
+    }
     return dst;
 }
 

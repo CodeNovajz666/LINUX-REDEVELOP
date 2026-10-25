@@ -1149,6 +1149,10 @@ test_shell 若干项）。
   环形记录已就位）+ Home/End/Ctrl-U/Ctrl-W 行编辑。转义序列解析放在
   内核 console 输入层一处（串口/VGA 共用），osh 与内核 shell 同享。
   验收：↑↑ 翻出前两条、编辑不破坏历史记录原文。
+  ✅ 完成（2026-10-26）：输入层 KEY_* 逻辑键码归一、ulib 编辑器
+  ureadline_ex（←/→/Home/End/Ctrl-U/Ctrl-W + 历史回调）、osh 真
+  环形历史修复、附带修复堆起点写死 0x400000 被 .bss 增长顶穿的
+  启动期 #DF（heap_base 动态化）。shell 105/105。
 - **v1.1.2 —— 文件操作补全**：RENAME(45)/RMDIR(46) 进 VFS 与
   syscall 表；mv 从"cp+unlink 临时实现"换直连（如实注解随之删除）；
   rmdir 工具。验收：mv 后 inode 不变（stat 证）、rmdir 拒绝非空。

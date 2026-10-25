@@ -105,7 +105,7 @@ static void test_heap(void) {
     KT_ASSERT(p2 == p1);                       /* first-fit reuses freed block */
     kfree(p2);
     KT_ASSERT(kmalloc(0) == NULL);
-    KT_ASSERT(kmalloc(HEAP_END - HEAP_START + 4096) == NULL);
+    KT_ASSERT(kmalloc(HEAP_END - heap_base() + 4096) == NULL);
     void *ps[16];
     for (int i = 0; i < 16; i++) {
         ps[i] = kmalloc(32 + i * 128);

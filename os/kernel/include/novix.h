@@ -6,7 +6,7 @@
 #include <stdbool.h>
 #include "lib.h"
 
-#define NOVIX_VERSION "1.1.0"
+#define NOVIX_VERSION "1.1.1"
 
 /* ---- SMP (v0.7.0) ---- */
 #define SMP_MAX            4        /* QEMU -smp cap for stress runs */
@@ -14,7 +14,8 @@
 
 /* ---- memory layout (physical == virtual for kernel, identity) ---- */
 #define KERNEL_LOAD_ADDR   0x00100000u   /* 1 MiB, where multiboot loads us */
-#define HEAP_START         0x00400000u   /* 4 MiB */
+#define HEAP_START         0x00400000u   /* heap FLOOR: heap_init starts at
+                                     * max(HEAP_START, __bss_end) (v1.1.1) */
 #define HEAP_END           0x01000000u   /* 16 MiB -- grown in 0.2.0: ramfs lives here */
 #define PMM_START          0x01000000u   /* first page managed by PMM */
 #define RAM_TOP_MAX        0x08000000u   /* cap at 128 MiB */

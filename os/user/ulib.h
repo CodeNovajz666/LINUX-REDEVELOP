@@ -113,8 +113,29 @@ int uecho_set(int on);                       /* login: off before the password *
 int uspawn_argv(const char *name, const char *const argv[], int argc);
 int uexec_argv(const char *path, const char *const argv[], int argc);
 
-/* read one line from fd 0 (echoed by the console device; handles \b/DEL
- * editing). Returns the length, buffer NUL-terminated. */
+/* logical key codes -- the kernel input layer pre-parses arrow/Home/End
+ * escapes (PS/2 and serial both) into these single bytes (v1.1.1) */
+#define UKEY_UP     0x80
+#define UKEY_DOWN   0x81
+#define UKEY_RIGHT  0x82
+#define UKEY_LEFT   0x83
+#define UKEY_HOME   0x84
+#define UKEY_END    0x85
+
+/* history callback for ureadline_ex: return the line `back` entries before
+ * the newest one entered (back = 1 -> most recent), or NULL when the caller
+ * is browsing past its oldest record */
+typedef const char *(*uhist_cb)(int back, void *ctx);
+
+/* read one line from fd 0 (echoed by the console device). The v1.1.1 editor:
+ * full cursor movement (Left/Right/Home/End), Backspace anywhere in the line,
+ * Ctrl-U (kill to start) and Ctrl-W (kill previous word); when `hist` is
+ * given, Up/Down walk it (the live line is restored on the way back down).
+ * Returns the line length, buffer NUL-terminated; -1 when the input stream
+ * errors (old ureadline spun forever here). */
+int ureadline_ex(char *buf, int max, uhist_cb hist, void *ctx);
+
+/* plain readline: same editor, no history browsing */
 int ureadline(char *buf, int max);
 
 /* ---- freestanding string helpers (no libc on this side of the fence) ---- */
@@ -126,6 +147,7 @@ char *ustrncpy(char *dst, const char *src, unsigned long n);
 char *ustrchr(const char *s, int c);
 char *ustrstr(const char *hay, const char *needle);   /* NULL = absent */
 void *umemcpy(void *dst, const void *src, unsigned long n);
+void *umemmove(void *dst, const void *src, unsigned long n);   /* overlap-safe */
 void *umemset(void *dst, int c, unsigned long n);
 
 #endif /* ULIB_H */

@@ -9,9 +9,12 @@
  * Explicit teaching scope (v1.0.0 honesty):
  *   - no quoting/escaping: words split on blanks, operators always split
  *   - variables are shell-local; they are NOT exported to children
- *   - no Ctrl-C routing to foreground jobs (the kernel debug shell has it;
- *     this shell has no line-discipline hook yet) and no Ctrl-D/EOF
+ *   - no Ctrl-C routing to foreground jobs (v1.2.0 scope) and no Ctrl-D/EOF
  *   - globs, here-docs, conditionals are 1.x territory
+ *
+ * v1.1.1: interactive recall -- Up/Down walk the history ring through
+ * ureadline_ex's editor (Left/Right/Home/End/Ctrl-U/Ctrl-W included); the
+ * escape-sequence grammar itself is parsed once in the kernel input layer.
  *
  * v1.0.0: the kernel debug shell's read-only reports (ps/cpus/mem) are
  * merged in as built-ins over syscalls 39-41; the kernel shell itself
@@ -66,18 +69,30 @@ static struct osh_var vars[OSH_VAR_MAX];
 static int nvars;
 static int last_status;                         /* $? */
 
-/* v1.1.0: command history -- a plain ring of raw (pre-expansion) lines;
- * `history` lists them. Up/Down recall is 1.x line-discipline territory. */
+/* v1.1.0: command history -- raw (pre-expansion) lines in a true ring.
+ * v1.1.1: fixed the "pseudo ring" (a full table used to overwrite only the
+ * last slot forever) and wired it to the editor's Up/Down browsing: hist(i)
+ * is chronological entry i; entries older than the ring holds are gone. */
 #define OSH_HIST_MAX 32
 static char history[OSH_HIST_MAX][OSH_LINE_MAX];
-static int nhist;
+static int nhist;                     /* total lines ever entered */
 
 static void hist_add(const char *line) {
     if (!line[0]) return;                       /* blank lines not recorded */
-    int slot = nhist < OSH_HIST_MAX ? nhist : OSH_HIST_MAX - 1;
-    if (nhist < OSH_HIST_MAX) nhist++;
-    ustrncpy(history[slot], line, OSH_LINE_MAX - 1);
-    history[slot][OSH_LINE_MAX - 1] = 0;
+    int last = nhist - 1;
+    if (nhist > 0 && ustrcmp(history[last % OSH_HIST_MAX], line) == 0)
+        return;                                 /* consecutive repeat: skip */
+    ustrncpy(history[nhist % OSH_HIST_MAX], line, OSH_LINE_MAX - 1);
+    history[nhist % OSH_HIST_MAX][OSH_LINE_MAX - 1] = 0;
+    nhist++;
+}
+
+/* editor callback: the line `back` entries before the newest, or NULL when
+ * browsing past the oldest entry the ring still holds */
+static const char *hist_back(int back, void *ctx) {
+    (void)ctx;
+    if (back < 1 || back > OSH_HIST_MAX || back > nhist) return 0;
+    return history[(nhist - back) % OSH_HIST_MAX];
 }
 
 /* operator token? ('|' '<' '>' '&' or the two-char '>>') */
@@ -434,6 +449,8 @@ static int run_builtin(struct osh_stage *st) {
               "               wait, jobs, ps, cpus, mem [-v], upt, kill PID [SIGNO]\n"
               "scripting: a|b, a>b a>>b a<b, a&, $VAR ${VAR} $? $pid,\n"
               "           NAME=value assignments, # comments\n"
+              "editing: Up/Down history, Left/Right/Home/End cursor,\n"
+              "         Backspace, Ctrl-U kill line, Ctrl-W kill word\n"
               "/bin tools: ls pwd cat cp mv rm touch echo grep date sleep\n"
               "            uname clear id whoami who passwd useradd hello ...\n"
               "limits: no quoting, vars are not exported, no Ctrl-C to jobs,\n"
@@ -442,8 +459,11 @@ static int run_builtin(struct osh_stage *st) {
         return 0;
     }
     if (ustrcmp(cmd, "history") == 0) {
-        for (int i = 0; i < nhist; i++)
-            uprintf("  %d  %s\n", i + 1, history[i]);
+        /* the ring holds the newest OSH_HIST_MAX entries; numbering stays
+         * chronological across wraparound (entry k ever-entered = k+1) */
+        int first = nhist > OSH_HIST_MAX ? nhist - OSH_HIST_MAX : 0;
+        for (int i = first; i < nhist; i++)
+            uprintf("  %d  %s\n", i + 1, history[i % OSH_HIST_MAX]);
         last_status = 0;
         return 0;
     }
@@ -611,7 +631,7 @@ int main(int argc, char **argv) {
     for (;;) {
         reap_finished_jobs();
         prompt();
-        ureadline(line, sizeof(line));
+        ureadline_ex(line, sizeof(line), hist_back, 0);      /* v1.1.1: ↑/↓ */
         hist_add(line);                         /* v1.1.0: raw line, pre-expansion */
         expand_line(line, exp, sizeof(exp));
 

@@ -4,6 +4,7 @@
 #include <stddef.h>
 
 void heap_init(void);
+size_t heap_base(void);      /* v1.1.1: actual first heap byte (past __bss_end) */
 void *kmalloc(size_t n);
 void kfree(void *p);
 size_t heap_free_bytes(void);

@@ -112,6 +112,15 @@ EXPECT = [
     # relative path resolution (no cwd yet: resolved from /)
     ('touch rel',   'rel-content'),
     ('rm rel',      "rm: gone.txt: failed"),
+    # v1.1.1 line editing: the follow-up output proves the kill keys worked
+    ('ctrl-u rerun', 'cu-ok-7'),
+]
+
+# v1.1.1: exactly-N checks -- the Ctrl-U/Ctrl-W victim text may appear only
+# as the typing echo (never as a command's output or a later reprint)
+EXACT_EXPECT = [
+    ('ctrl-u killed line', 'cu-line-9', 1),
+    ('ctrl-w killed word', 'kw-victim', 1),
 ]
 
 # checks that need N occurrences, not just one
@@ -122,6 +131,9 @@ COUNT_EXPECT = [
     # Tab-completed 'spawn forke<Tab>' re-runs forker: once from the ktest
     # cow_isolation case, once from the shell session
     ('tab forker rerun', 'COW-ISOLATION-OK', 2),
+    # v1.1.1: Home arrives pre-parsed and is a no-op for this append-only
+    # editor, so 'da' Home 'te' spells date -- a second wall-clock line
+    ('home no-op + date', ' local (unix ', 2),
 ]
 
 # session 1: text that must NOT appear anywhere in the log
@@ -182,9 +194,15 @@ LOGIN_EXPECT = [
                                                 # proves the content travelled
     ('osh rm missing',       'rm: no-such-file: failed'),
     ('osh date local',       'local (unix'),    # the RTC line, kernel-formatted
-    ('osh uname',            'Novix 1.1.0'),    # uname and the banners agree
+    ('osh uname',            'Novix 1.1.1'),    # uname and the banners agree
                                                 # on the version again (v1.1.0)
-    ('osh history',          '  1  id'),        # the first osh line, numbered
+    # v1.1.1: the history ring numbers entries chronologically and retires
+    # the oldest past 32 -- the listing shows the raw (pre-expansion) lines
+    # (two-space indent: prompt lines end in '$ ', never match)
+    ('osh history',          '  echo osh-edit-a'),
+    # v1.1.1 editor: Ctrl-U ran `date` instead of the cancelled line (the
+    # second RTC line of this session)
+    ('osh ctrl-u clear',     ' local (unix '),
 ]
 LOGIN_COUNT_EXPECT = [
     # register's own retype prompt, then passwd's roundtrip one
@@ -198,10 +216,20 @@ LOGIN_COUNT_EXPECT = [
     # v1.0.0: 'cat /etc/motd | grep Novix > /tmp/x' + cat -- the needle
     # hits the boot banner (1), motd at each of the two logins (2) and the
     # redirected copy (1)
-    ('osh motd pipeline', 'Novix 1.1.0 -- a real OS', 4),
+    ('osh motd pipeline', 'Novix 1.1.1 -- a real OS', 4),
     # variable + redirect + pipe + grep + cat: two cats of derived files;
     # the echoed command lines only ever contain '$p-pipe', never the value
     ('osh var+pipe+redirect', 'zz-pipe', 2),
+    # v1.1.1: typing echo + output + Up-Up redraw + rerun output + the two
+    # `history` listings' entries = at least 5 occurrences of osh-edit-a
+    ('osh up-up recall + history', 'osh-edit-a', 5),
+    # Home + 'echo ' insert: typing echo + the command's output
+    ('osh home insert', 'osh-mid-9', 2),
+]
+LOGIN_EXACT_EXPECT = [
+    # v1.1.1: killed text appears only as the typing echo -- never rerun
+    ('osh ctrl-u killed line', 'cu2-cancel-me', 1),
+    ('osh ctrl-w killed word', 'osh-kw-victim', 1),
 ]
 
 # session 3 (v1.0.0): fresh boot -- the accounts registered in session 2
@@ -306,6 +334,20 @@ send('\n', wait=0.3)                               # runs 'c' -> unknown command
 send_typed('echo hist-recall-9')
 send('\x1b[A', wait=0.4)                           # Up: recall
 send('\n', wait=0.5)
+# v1.1.1: Ctrl-U kills the line, Ctrl-W kills the last word. Each victim
+# string must stay in the log EXACTLY once (the typing echo) -- the follow-up
+# commands' outputs prove the line really ran without the killed text.
+send_typed('echo cu-line-9', enter=False, wait=0.2)
+send('\x15', wait=0.3)                             # Ctrl-U: kill line
+send_typed('echo cu-ok-7')
+send_typed('echo kw-victim', enter=False, wait=0.2)
+send('\x17', wait=0.3)                             # Ctrl-W: kill word
+send('\n', wait=0.5)                               # bare echo: empty output
+# Home is pre-parsed by the input layer; this editor is append-only, so the
+# sequence 'da' Home 'te' must still spell 'date'
+send_typed('da', enter=False, wait=0.2)
+send('\x1b[H', wait=0.3)
+send_typed('te', wait=0.5)
 # filesystem (v0.2.0)
 send_typed('ls')
 send_typed('ls /bin')
@@ -439,6 +481,26 @@ send_typed('sleep 1', wait=2.0)
 send_typed('clear', wait=0.5)                # ioctl TCCLEAR: no serial bytes,
                                              # the next command proves survival
 send_typed('history', wait=0.8)
+# ---- v1.1.1: the editor's interactive recall and kill keys ----
+# Up Up recalls the SECOND-newest raw line ('echo osh-edit-a') and re-runs it
+send_typed('echo osh-edit-a')
+send_typed('echo osh-edit-b')
+send('\x1b[A', wait=0.3); send('\x1b[A', wait=0.4)
+send('\n', wait=0.8)
+# Home then 'echo ' inserts the command at line start (mid-line insert)
+send_typed('osh-mid-9', enter=False, wait=0.2)
+send('\x1b[H', wait=0.3)
+send_typed('echo ', enter=False, wait=0.4)
+send('\n', wait=0.6)
+# Ctrl-U kills the half-typed line; date runs instead
+send_typed('echo cu2-cancel-me', enter=False, wait=0.2)
+send('\x15', wait=0.3)
+send_typed('date')
+# Ctrl-W kills the trailing word; a bare echo runs
+send_typed('echo osh-kw-victim', enter=False, wait=0.2)
+send('\x17', wait=0.3)
+send('\n', wait=0.6)
+send_typed('history', wait=0.8)               # raw lines survived the editing
 send_typed('cd /home/ktest', wait=0.6)       # home again for passwd/logout
 # passwd roundtrip: ktest execs the SUID binary and changes its own password
 send_typed('passwd')
@@ -494,7 +556,7 @@ with open(os.path.join(ROOT, 'build', 'shell_persist.log'), 'w') as f:
     f.write(text3)
 
 # ---- checks ----
-def run_checks(text, expect, count_expect, absent=()):
+def run_checks(text, expect, count_expect, absent=(), exact=()):
     failed = 0
     for label, needle in expect:
         ok = needle in text
@@ -509,6 +571,11 @@ def run_checks(text, expect, count_expect, absent=()):
         ok = needle not in text
         print(f"[{'ok' if ok else 'FAIL'}] {label}")
         failed += 0 if ok else 1
+    for label, needle, want in exact:            # v1.1.1: exactly-N
+        got = text.count(needle)
+        ok = got == want
+        print(f"[{'ok' if ok else 'FAIL'}] {label} (x{got}, want exactly {want})")
+        failed += 0 if ok else 1
     return failed
 
 print('---- session 1 (kernel shell) ----')
@@ -518,12 +585,13 @@ print(text2)
 print('---- session 3 (password survives poweroff) ----')
 print(text3)
 print('---- checks ----')
-failed = run_checks(text1, EXPECT, COUNT_EXPECT, ABSENT_EXPECT)
-failed += run_checks(text2, LOGIN_EXPECT, LOGIN_COUNT_EXPECT)
+failed = run_checks(text1, EXPECT, COUNT_EXPECT, ABSENT_EXPECT, EXACT_EXPECT)
+failed += run_checks(text2, LOGIN_EXPECT, LOGIN_COUNT_EXPECT, (),
+                     LOGIN_EXACT_EXPECT)
 failed += run_checks(text3, PERSIST_EXPECT, [])
 
-total = (len(EXPECT) + len(COUNT_EXPECT) + len(ABSENT_EXPECT)
-         + len(LOGIN_EXPECT) + len(LOGIN_COUNT_EXPECT)
+total = (len(EXPECT) + len(COUNT_EXPECT) + len(ABSENT_EXPECT) + len(EXACT_EXPECT)
+         + len(LOGIN_EXPECT) + len(LOGIN_COUNT_EXPECT) + len(LOGIN_EXACT_EXPECT)
          + len(PERSIST_EXPECT))
 print(f'\nshell test: {total - failed}/{total} checks passed')
 sys.exit(0 if failed == 0 and rc1 in (0, 1) and rc2 in (0, 1)

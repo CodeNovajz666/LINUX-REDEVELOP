@@ -3,6 +3,55 @@
 版本号约定见 ROADMAP.md：次版本号递增 = 交付一个完整子系统；
 修订号递增 = 稳定性/小改进。
 
+## v1.1.1 —— 交互检索：↑/↓ 历史翻阅与行编辑（2026-10-26）
+
+ROADMAP 1.1.x 系列第一步：把两个 shell 的交互输入补到"日常可用"。
+转义序列解析收拢到内核输入层一处，两个 shell 共享同一套逻辑键码。
+
+**新增**
+- 内核输入层（keyboard.c）统一转义序列解析：PS/2 方向键/Home/End
+  与串口终端的 CSI（ESC [ A/B/C/D/H/F）、SS3（ESC O H/F）序列在
+  进入输入队列前归一为 `KEY_UP/DOWN/LEFT/RIGHT/HOME/END`
+  （0x80-0x85，高于可打印 ASCII 不冲突）；序列状态机跨 IRQ 存活
+  （同一序列的三个字节可分批到达）；孤立的 ESC 无消费者、如实丢弃
+- ulib 行编辑器 `ureadline_ex`：←/→/Home/End 光标移动、行中插入与
+  退格（退格-重印尾部-擦余量-回退四步重绘，兼容非 ANSI 的 VGA
+  console）、Ctrl-U 清至行首、Ctrl-W 删前一个词；历史回调接口
+  （↑ 取更旧、↓ 逐级返回、离开当前行时暂存半输入行）；
+  `ureadline` 保留为无历史版本
+- osh：↑/↓ 历史翻阅接入编辑器；history 修成**真环形**——v1.1.0
+  的实现在满 32 条后 slot 恒停最后一条（只覆盖最新），现在
+  `nhist % OSH_HIST_MAX` 真轮转、编号保持纪元连续、旧条目退役；
+  help 文案新增 editing 行
+- 内核 shell：逻辑键码接入（自带 ESC 解析删除）、Ctrl-U/Ctrl-W；
+  Home/End 对追加式编辑器如实为无操作
+- test_shell 检查框架新增**精确计数**类别（EXACT_EXPECT）：受害
+  文本必须恰好出现 N 次（Ctrl-U/Ctrl-W 的键入回显恰好一次，证明
+  命令真的没带着受害词运行）
+
+**修复**
+- **内核堆起点动态化（启动期双重故障的根因）**：HEAP_START 原本
+  写死 0x400000，v1.1.0 内核 `.bss` 结束于 0x3fbba8——只剩 0x4458
+  字节余量。本次用户程序增长使 ramfs_img 变大约 380KB，`.bss`
+  越过常量顶进堆区，堆分配器把内核自身的静态数据当空闲块发出
+  （ramfs 节点落在 boot 栈上、memcpy 参数错乱、initrd 解包期
+  #DF；QEMU 异常日志实锤 RIP=memcpy+0x8a、dst 指向内核 .text）。
+  heap_init 现在从 `max(HEAP_START, __bss_end 向上 64KiB 对齐)`
+  开始，内核再长只是堆上移；ktest 的超限断言与 `mem` 报告改用
+  `heap_base()`
+- `ureadline` 在 stdin 读错误时无限忙自旋（`!= 1` 即 continue）——
+  编辑器改为返回 -1，调用方自行决定；ulib 补 overlap 安全的
+  `umemmove`
+- 预存编译警告清理：kernel/shell.c 的 strstr 弃 const 限定
+
+**测试**
+- ktest 46/46 不变（smp=2 与 smp=1 双绿）；shell 检查 96→105 项：
+  会话 1 +4（内核 shell Ctrl-U/Ctrl-W/Home 无操作/精确计数×2）、
+  会话 2 +5（osh ↑↑ 召回次新行并重跑、Home+行首插入、Ctrl-U 改跑
+  date、精确计数×2；history 检查改为环形语义断言——'1 id' 让位于
+  列表行 'echo osh-edit-a'）
+- 三门禁全绿收版
+
 ## v1.1.0 —— 交互工具箱：ls/rm/date 进 /bin，osh 学会 history（2026-10）
 
 v1.0.0 之后的第一课：把"用户与 OS 的交互"补成完整的工具箱。

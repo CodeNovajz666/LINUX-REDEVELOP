@@ -74,14 +74,21 @@ static const char sc_to_ascii[128] = {
 
 static void kbd_push_scancode(uint8_t sc) {
     if (sc & 0x80) return;              /* break code */
-    /* up/down arrows become the ESC sequences serial terminals already
-     * send, so the shell parses one grammar on both input paths */
+    /* v1.1.1: arrows/Home/End deliver the SAME logical key codes the
+     * serial escape parser below produces -- one grammar for readers */
+    static const uint8_t nav[16] = {
+        /*0x46*/ 0,    /*0x47*/ KEY_HOME, /*0x48*/ KEY_UP,   /*0x49*/ 0,
+        /*0x4A*/ 0,    /*0x4B*/ KEY_LEFT, /*0x4C*/ 0,        /*0x4D*/ KEY_RIGHT,
+        /*0x4E*/ 0,    /*0x4F*/ KEY_END,  /*0x50*/ KEY_DOWN, /*0x51*/ 0,
+    };
     irq_flags_t f;
     spin_lock_irqsave(&kq_lock, &f);
-    if (sc == 0x48) { kq_put(0x1b); kq_put('['); kq_put('A'); spin_unlock_irqrestore(&kq_lock, f); return; }
-    if (sc == 0x50) { kq_put(0x1b); kq_put('['); kq_put('B'); spin_unlock_irqrestore(&kq_lock, f); return; }
-    char c = sc < 128 ? sc_to_ascii[sc] : 0;
-    if (c) kq_put(c);
+    if (sc >= 0x46 && sc <= 0x51 && nav[sc - 0x46])
+        kq_put(nav[sc - 0x46]);
+    else if (sc != 0x01) {              /* bare Esc has no consumer: drop */
+        char c = sc < 128 ? sc_to_ascii[sc] : 0;
+        if (c) kq_put(c);
+    }
     spin_unlock_irqrestore(&kq_lock, f);
 }
 
@@ -103,13 +110,46 @@ static void keyboard_ps2_drain(void) {
 }
 
 /* COM1 receive: terminal input under QEMU -serial stdio arrives here.
- * irq_save keeps the poll-drain and the IRQ4 handler from racing on the queue. */
+ * irq_save keeps the poll-drain and the IRQ4 handler from racing on the queue.
+ *
+ * v1.1.1: the ANSI escape parse lives HERE, once, for every reader. The
+ * three-byte sequences terminals send for arrows/Home/End (CSI: ESC [ x,
+ * SS3: ESC O H/F) collapse into the KEY_* logical bytes the PS/2 path also
+ * produces; anything else after ESC is dropped (nothing consumes a lone
+ * Escape). State survives across drains -- the bytes of one sequence may
+ * arrive in different IRQs. */
+static int esc_state;                   /* 0 none, 1 saw ESC, 2 saw CSI/SS3 */
+
+static void serial_parse(char c) {
+    if (esc_state == 0) {
+        if (c == 0x1b) { esc_state = 1; return; }
+        kq_put(c);
+        return;
+    }
+    if (esc_state == 1) {
+        if (c == '[' || c == 'O') esc_state = 2;
+        else esc_state = 0;             /* lone ESC + other: not a sequence */
+        return;
+    }
+    /* final byte of the sequence */
+    esc_state = 0;
+    switch (c) {
+    case 'A': kq_put(KEY_UP); break;
+    case 'B': kq_put(KEY_DOWN); break;
+    case 'C': kq_put(KEY_RIGHT); break;
+    case 'D': kq_put(KEY_LEFT); break;
+    case 'H': kq_put(KEY_HOME); break;
+    case 'F': kq_put(KEY_END); break;
+    default: break;                     /* unknown sequence: swallowed */
+    }
+}
+
 void keyboard_serial_drain(void) {
     irq_flags_t f; spin_lock_irqsave(&kq_lock, &f);
     while (inb(0x3FD) & 0x01) {         /* LSR: data ready */
         char c = (char)inb(0x3F8);
         if (c == '\r') c = '\n';
-        if (c) kq_put(c);
+        if (c) serial_parse(c);
     }
     spin_unlock_irqrestore(&kq_lock, f);
 }
