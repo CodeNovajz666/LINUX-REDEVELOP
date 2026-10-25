@@ -201,8 +201,12 @@ LOGIN_EXPECT = [
     # breaking PATH blinds external commands, restoring finds them again
     ('osh export in env',    'GR=hi-env-9'),
     ('osh PATH blind',       'pwd: not found'),
+    # v1.1.6: the text toolbox -- deterministic outputs on a 2-line file
+    ('osh wc lines',         '2 /tmp/hh.txt'),
+    ('osh which',            '/bin/which'),
+    ('osh find',             '/tmp/fd9/needle-fx'),
     ('osh date local',       'local (unix'),    # the RTC line, kernel-formatted
-    ('osh uname',            'Novix 1.1.5'),    # uname and the banners agree
+    ('osh uname',            'Novix 1.1.6'),    # uname and the banners agree
                                                 # on the version again (v1.1.0)
     # v1.1.1: the history ring numbers entries chronologically and retires
     # the oldest past 32 -- the listing shows the raw (pre-expansion) lines
@@ -224,7 +228,7 @@ LOGIN_COUNT_EXPECT = [
     # v1.0.0: 'cat /etc/motd | grep Novix > /tmp/x' + cat -- the needle
     # hits the boot banner (1), motd at each of the two logins (2) and the
     # redirected copy (1)
-    ('osh motd pipeline', 'Novix 1.1.5 -- a real OS', 4),
+    ('osh motd pipeline', 'Novix 1.1.6 -- a real OS', 4),
     # variable + redirect + pipe + grep + cat: two cats of derived files;
     # the echoed command lines only ever contain '$p-pipe', never the value
     ('osh var+pipe+redirect', 'zz-pipe', 2),
@@ -248,6 +252,10 @@ LOGIN_EXACT_EXPECT = [
     ('osh rmdir emptied dir', 'rd2', 16),   # +1: the not-empty refusal
     # v1.1.5: the unexported variable appears only in its assignment echo
     ('osh unexported stays local', 'local-only-1', 1),
+    # v1.1.6: head/tail pick their exact line; cut fields its token
+    ('osh head line', 'hh-line-1', 2),
+    ('osh tail line', 'hh-line-2', 2),
+    ('osh cut field', 'yy-2', 2),
 ]
 
 # session 3 (v1.0.0): fresh boot -- the accounts registered in session 2
@@ -550,6 +558,20 @@ send_typed('export PATH=/no-such-dir', wait=0.5)
 send_typed('pwd', wait=0.6)                   # PATH-blind: external tool not found
 send_typed('export PATH=/bin', wait=0.5)      # restore
 send_typed('pwd', wait=0.5)                   # found again
+# ---- v1.1.6: the text toolbox (pure userland, existing syscalls) ----
+send_typed('echo hh-line-1 > /tmp/hh.txt', wait=0.6)
+send_typed('echo hh-line-2 >> /tmp/hh.txt', wait=0.6)
+send_typed('wc -l /tmp/hh.txt', wait=0.5)
+send_typed('head -n 1 /tmp/hh.txt', wait=0.5)
+send_typed('tail -n 1 /tmp/hh.txt', wait=0.5)
+send_typed('which ls which', wait=0.5)        # both resolve under /bin
+send_typed('mkdir fd9', wait=0.5)
+send_typed('touch fd9/needle-fx', wait=0.5)
+send_typed('find /tmp -name needle-fx', wait=0.8)
+send_typed('echo xx-1:yy-2:zz-3 | cut -d : -f 2', wait=0.8)
+send_typed('rm fd9/needle-fx', wait=0.5)
+send_typed('rmdir fd9', wait=0.5)
+send_typed('rm /tmp/hh.txt', wait=0.5)
 send_typed('cd /home/ktest', wait=0.6)       # home again for passwd/logout
 # passwd roundtrip: ktest execs the SUID binary and changes its own password
 send_typed('passwd')

@@ -526,7 +526,7 @@ static int run_builtin(struct osh_stage *st) {
               "           NAME=value assignments, # comments\n"
               "editing: Up/Down history, Left/Right/Home/End cursor,\n"
               "         Backspace, Ctrl-U kill line, Ctrl-W kill word\n"
-              "/bin tools: ls pwd cat cp mv rm mkdir rmdir touch echo grep env\n"
+              "/bin tools: ls pwd cat cp mv rm mkdir rmdir touch echo grep env wc head tail\n"
               "            date sleep uname clear id whoami who passwd useradd ...\n"
               "limits: no quoting, unexported vars stay local, no Ctrl-C to\n"
               "        jobs, built-ins are single-stage (no pipe/redirect)\n");

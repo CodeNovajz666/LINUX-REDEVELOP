@@ -3,6 +3,27 @@
 版本号约定见 ROADMAP.md：次版本号递增 = 交付一个完整子系统；
 修订号递增 = 稳定性/小改进。
 
+## v1.1.6 —— 文本工具六件：wc/head/tail/which/find/cut（2026-10-26）
+
+ROADMAP 1.1.x 第六步：纯用户态、零内核改动——六个工具全部吃现成
+syscall（read/stat/getdents/environ）。
+
+**新增**
+- `wc`：-l/-w/-c 单选或组合（缺省全三项），多文件逐个报告
+- `head`/`tail`：-n N（缺省 10）；tail 用 64 条环形行缓冲单遍回放
+- `which`：按 environ 的 PATH（缺省 /bin）逐段 stat 到普通文件；
+  含 '/' 的词按路径原样检查（与 osh 的查找规则一致）
+- `find DIR [-name SUBSTR]`：递归枚举（GETDENTS 报告解析，深度 8、
+  路径 128 字节上限如实注明）
+- `cut`：-c N-M 与 -d SEP -f N（缺字段输出空行），文件或 stdin
+- osh help 工具清单更新
+
+**测试**
+- ktest 49/49 不变（零内核改动）；shell 113→119：wc -l 的行数报告、
+  head/tail 各取精确行（精确计数 ×2）、which 双名解析、find 命中
+  深层路径、cut 取字段（精确计数）
+- 三门禁全绿收版：49/49（smp=2 与 smp=1）、119/119
+
 ## v1.1.5 —— 环境变量：environ、export、$PATH（2026-10-26）
 
 ROADMAP 1.1.x 第五步：exec 语义补完——环境随映像传递，osh 变量

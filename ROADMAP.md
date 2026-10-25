@@ -1183,6 +1183,8 @@ test_shell 若干项）。
 - **v1.1.6 —— 文本工具六件**：wc/head/tail/which/find/cut——
   纯用户态零内核改动（吃现成 getdents/stat/read），测试面只增
   test_shell 项。验收：`ls /bin | wc -l` 管道链闭合。
+  ✅ 完成（2026-10-26）：六件全交付 + which 走 environ 的 PATH。
+  49/49、119/119。
 - **v1.1.7 —— 身份完整化**：euid/egid 与 ruid/rgid 正式拆分
   （README 差距表回收）、setreuid(2)/setregid(2)、access(2)。
   验收：SUID login 的 getruid!=getuid 语义进入 ktest uid 组。
