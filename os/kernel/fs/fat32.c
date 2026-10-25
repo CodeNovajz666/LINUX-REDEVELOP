@@ -688,11 +688,9 @@ static int fat_i_unlink(struct inode *dir, const char *name) {
         struct dir_scan_entry *e = &U.ent;
 
         if (e->is_dir) {
-            /* directories only when empty ("." and ".." are skipped by the
-             * walker, so an empty dir yields zero scan entries) */
-            struct empty_ctx E = { true };
-            if (dir_walk(sb, e->first_clus, empty_check_cb, &E) != 0 || !E.empty)
-                break;
+            /* v1.1.2: unlink refuses directories -- rmdir(2) is the only
+             * path that removes them now (same rule as ramfs) */
+            break;
         }
 
         /* delete exactly the LFN group + the 8.3 dirent (a group is at most
@@ -745,6 +743,150 @@ static int fat_i_truncate(struct inode *ino) {
     return rc;
 }
 
+/* v1.1.2 rename: delete the victim's dirent group (LFN entries + 8.3, the
+ * same range unlink clears) and append a fresh dirent for the new name in
+ * the target directory, pointing at the SAME first cluster and size -- the
+ * data never moves and the inode-cache node is updated in place, so the
+ * struct inode (and every open fd, and st_ino) survives, which is the
+ * point of rename(2). Teaching scope: same-directory rename for files and
+ * directories; cross-directory rename for files only (moving a directory
+ * would need its ".." entry rewritten; -1, honestly). Crash between the
+ * delete and the append leaves the data orphaned-but-intact -- same
+ * no-fsck honesty as every other FAT write here. */
+static int fat_i_rename(struct inode *olddir, const char *oldname,
+                        struct inode *newdir, const char *newname) {
+    struct fat32_node *od = node_of(olddir), *nd = node_of(newdir);
+    if (!od || !od->is_dir || !nd || !nd->is_dir) return -1;
+    if (od->sb != nd->sb) return -1;               /* EXDEV: another instance */
+    if (!oldname[0] || !newname[0] || strlen(newname) >= FAT_NAME_MAX)
+        return -1;
+    uint8_t nsname[11];
+    if (name_to_sname(newname, nsname) != 0) return -1;
+    struct fat32_sb *sb = od->sb;
+
+    irq_flags_t fl;
+    spin_lock_irqsave(&sb->lock, &fl);
+    int rc = -1;
+    do {
+        struct unlink_ctx U;
+        memset(&U, 0, sizeof(U));
+        U.target = oldname;
+        if (dir_walk(sb, od->first_clus, unlink_cb, &U) != 1 || !U.found)
+            break;
+        struct dir_scan_entry *e = &U.ent;
+
+        if (e->is_dir && od->first_clus != nd->first_clus)
+            break;                                 /* cross-dir dir move: out of scope */
+
+        /* the new name must be free (never clobber) */
+        struct lookup_ctx L;
+        memset(&L, 0, sizeof(L));
+        L.sb = sb; L.parent_vfs = newdir;
+        L.parent_clus = nd->first_clus; L.target = newname;
+        if (dir_walk(sb, nd->first_clus, lookup_cb, &L) == 1 || L.node)
+            break;
+
+        struct fat32_node *n = node_find(sb, od->first_clus, e->sname);
+        if (!n) break;
+
+        /* pure rename to the identical 8.3 name in place: nothing to do */
+        if (od->first_clus == nd->first_clus && memcmp(e->sname, nsname, 11) == 0) {
+            rc = 0;
+            break;
+        }
+
+        /* kill the old dirent group (LFN + 8.3), exactly like unlink */
+        if (e->lfn_first_clus == e->dirent_clus) {
+            if (mark_deleted_range(sb, e->dirent_clus, e->lfn_first_off,
+                                   e->dirent_off + 32) != 0)
+                break;
+        } else {
+            if (mark_deleted_range(sb, e->lfn_first_clus, e->lfn_first_off,
+                                   sb->clus_bytes) != 0)
+                break;
+            if (mark_deleted_range(sb, e->dirent_clus, 0,
+                                   e->dirent_off + 32) != 0)
+                break;
+        }
+
+        /* append the new dirent in the target directory */
+        uint32_t slot_clus, slot_off;
+        bool slot_fresh;
+        if (dir_append_slot(sb, nd->first_clus, &slot_clus, &slot_off,
+                            &slot_fresh) != 0)
+            break;
+        if (slot_fresh) {
+            memset(sb->bounce, 0, sb->clus_bytes);
+        } else {
+            if (clus_read(sb, slot_clus, sb->bounce) != 0) break;
+        }
+        dirent_fill(sb->bounce + slot_off, nsname,
+                    e->is_dir ? ATTR_DIR : ATTR_ARC, e->first_clus,
+                    e->is_dir ? 0 : e->size);
+        if (clus_write(sb, slot_clus, sb->bounce) != 0) break;
+
+        /* the cache node moves in place: same inode, new identity */
+        n->parent_clus = nd->first_clus;
+        memcpy(n->sname, nsname, 11);
+        n->dirent_clus = slot_clus;
+        n->dirent_off = slot_off;
+        if (od->first_clus != nd->first_clus)
+            n->vfs.i_parent = newdir;
+        rc = 0;
+    } while (0);
+    spin_unlock_irqrestore(&sb->lock, fl);
+    return rc;
+}
+
+/* v1.1.2 rmdir: directories only, and only when empty ("." and ".." are
+ * skipped by the walker, so an empty dir yields zero scan entries). */
+static int fat_i_rmdir(struct inode *dir, const char *name) {
+    struct fat32_node *dn = node_of(dir);
+    if (!dn || !dn->is_dir || !name[0]) return -1;
+    struct fat32_sb *sb = dn->sb;
+
+    irq_flags_t fl;
+    spin_lock_irqsave(&sb->lock, &fl);
+    int rc = -1;
+    do {
+        struct unlink_ctx U;
+        memset(&U, 0, sizeof(U));
+        U.target = name;
+        if (dir_walk(sb, dn->first_clus, unlink_cb, &U) != 1 || !U.found)
+            break;
+        struct dir_scan_entry *e = &U.ent;
+
+        if (!e->is_dir) break;                     /* ENOTDIR: files use unlink */
+        struct empty_ctx E = { true };
+        if (dir_walk(sb, e->first_clus, empty_check_cb, &E) != 0 || !E.empty)
+            break;                                 /* ENOTEMPTY */
+
+        if (e->lfn_first_clus == e->dirent_clus) {
+            if (mark_deleted_range(sb, e->dirent_clus, e->lfn_first_off,
+                                   e->dirent_off + 32) != 0)
+                break;
+        } else {
+            if (mark_deleted_range(sb, e->lfn_first_clus, e->lfn_first_off,
+                                   sb->clus_bytes) != 0)
+                break;
+            if (mark_deleted_range(sb, e->dirent_clus, 0,
+                                   e->dirent_off + 32) != 0)
+                break;
+        }
+        if (e->first_clus != 0 && chain_free(sb, e->first_clus) != 0)
+            break;
+
+        struct fat32_node *n = node_find(sb, dn->first_clus, e->sname);
+        if (n) {
+            node_unlink(sb, n);
+            kfree(n);
+        }
+        rc = 0;
+    } while (0);
+    spin_unlock_irqrestore(&sb->lock, fl);
+    return rc;
+}
+
 static const struct inode_operations fat_iops = {
     .lookup = fat_i_lookup,
     .create = fat_i_create,
@@ -752,6 +894,8 @@ static const struct inode_operations fat_iops = {
     .unlink = fat_i_unlink,
     .truncate = fat_i_truncate,
     .readdir = fat_i_readdir,
+    .rename = fat_i_rename,
+    .rmdir = fat_i_rmdir,
 };
 
 /* ---- file operations ---- */

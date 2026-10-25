@@ -102,6 +102,8 @@ int umeminfo(char *buf, int len, int verbose);
  * bytes stored, -1 on error); unlink refuses directories. */
 int ugetdents(const char *path, char *buf, int len);
 int uunlink(const char *path);
+int urename(const char *oldpath, const char *newpath);   /* v1.1.2 */
+int urmdir(const char *path);                            /* v1.1.2 */
 int udatetime(char *buf, int len);
 int uclear(void);                       /* ioctl TCCLEAR on stdout */
 

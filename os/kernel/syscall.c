@@ -538,6 +538,26 @@ static long sys_unlink(uint64_t upath) {
     return vfs_unlink(path);
 }
 
+/* v1.1.2 rename(2): the inode survives (mv's fast path); both parents'
+ * W+X checks live inside vfs_rename. */
+static long sys_rename(uint64_t uold, uint64_t unew) {
+    struct task *cur = current_task();
+    if (!cur || !cur->is_user) return -1;
+    char oldp[80], newp[80];
+    if (copy_str_from_user(cur, oldp, uold, sizeof(oldp)) != 0) return -1;
+    if (copy_str_from_user(cur, newp, unew, sizeof(newp)) != 0) return -1;
+    return vfs_rename(oldp, newp);
+}
+
+/* v1.1.2 rmdir(2): empty directories only (rm keeps refusing dirs). */
+static long sys_rmdir(uint64_t upath) {
+    struct task *cur = current_task();
+    if (!cur || !cur->is_user) return -1;
+    char path[80];
+    if (copy_str_from_user(cur, path, upath, sizeof(path)) != 0) return -1;
+    return vfs_rmdir(path);
+}
+
 /* datetime: the RTC wall clock, pre-formatted by the shared builder the
  * kernel debug shell's `date` uses. -1 when the RTC is not sane. */
 static long sys_datetime(uint64_t ubuf, uint64_t len) {
@@ -706,6 +726,12 @@ void syscall_dispatch(struct pt_regs *r) {
         break;
     case SYS_UNLINK:
         ret = sys_unlink(r->rdi);
+        break;
+    case SYS_RENAME:                              /* v1.1.2 */
+        ret = sys_rename(r->rdi, r->rsi);
+        break;
+    case SYS_RMDIR:
+        ret = sys_rmdir(r->rdi);
         break;
     case SYS_DATETIME:
         ret = sys_datetime(r->rdi, r->rsi);

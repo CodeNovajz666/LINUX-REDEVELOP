@@ -135,7 +135,18 @@ int vfs_mkdir(const char *path) {
     /* v0.9.0: like create, a new subdirectory needs write+search on the
      * parent (the walk only X-checked the ancestors) */
     if (!vfs_permitted(parent, VFS_PERM_W | VFS_PERM_X)) return -1;
-    return parent->i_op->mkdir(parent, last);
+    if (parent->i_op->mkdir(parent, last) != 0) return -1;
+    /* v1.1.2: the new directory belongs to its creator -- the same rule
+     * vfs_open applies to created files (before, mkdir'd dirs stayed owned
+     * by root and a mortal could not create anything inside a directory
+     * it had just made; rmdir still worked, so tests never caught it) */
+    struct inode *n = namei(path);
+    if (n && (n->mode & S_IFMT) == S_IFDIR) {
+        struct task *cur = current_task();
+        n->uid = cur ? cur->uid : 0;
+        n->gid = cur ? cur->gid : 0;
+    }
+    return 0;
 }
 
 int vfs_unlink(const char *path) {
@@ -145,6 +156,37 @@ int vfs_unlink(const char *path) {
     /* v0.9.0: removing a name needs write+search on the parent directory */
     if (!vfs_permitted(parent, VFS_PERM_W | VFS_PERM_X)) return -1;
     return parent->i_op->unlink(parent, last);
+}
+
+/* v1.1.2 rename(2): both parents need W+X (the name is destroyed in one
+ * and created in the other); the operation resolves on the OLD parent's
+ * fs, and implementations reject a new parent on another instance. The
+ * target name must not exist (Unix rename would clobber it; teaching
+ * scope returns -1 instead -- no data is ever silently destroyed). */
+int vfs_rename(const char *oldpath, const char *newpath) {
+    char oldn[32], newn[32];
+    struct inode *olddir = namei_parent(oldpath, oldn, sizeof(oldn));
+    struct inode *newdir = namei_parent(newpath, newn, sizeof(newn));
+    if (!olddir || !newdir) return -1;
+    if (!olddir->i_op || !olddir->i_op->rename) return -1;
+    /* different inode_operations = different filesystem: dispatching a
+     * ramfs rename with a FAT newdir would feed the op a foreign inode
+     * (v1.1.2 lesson: the op table is the fs-type identity). Two mounts
+     * of the SAME type still reach the op, which checks its own instance. */
+    if (newdir->i_op != olddir->i_op) return -1;
+    if (!vfs_permitted(olddir, VFS_PERM_W | VFS_PERM_X)) return -1;
+    if (!vfs_permitted(newdir, VFS_PERM_W | VFS_PERM_X)) return -1;
+    return olddir->i_op->rename(olddir, oldn, newdir, newn);
+}
+
+/* v1.1.2 rmdir(2): W+X on the parent; the fs itself refuses anything but
+ * an empty directory (mount points count as busy in ramfs). */
+int vfs_rmdir(const char *path) {
+    char last[32];
+    struct inode *parent = namei_parent(path, last, sizeof(last));
+    if (!parent || !parent->i_op || !parent->i_op->rmdir) return -1;
+    if (!vfs_permitted(parent, VFS_PERM_W | VFS_PERM_X)) return -1;
+    return parent->i_op->rmdir(parent, last);
 }
 
 int vfs_readdir(const char *path, int idx, char *name_out, size_t name_max) {

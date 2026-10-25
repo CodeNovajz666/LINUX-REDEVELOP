@@ -80,6 +80,13 @@ struct inode_operations {
     int (*truncate)(struct inode *ino);
     /* enumerate a directory by index: 0 = entry copied out, 1 = end, -1 = err */
     int (*readdir)(struct inode *dir, int idx, char *name_out, size_t name_max);
+    /* v1.1.2: rename a name inside one filesystem instance (the op is
+     * resolved on olddir; implementations must reject a newdir belonging
+     * to another instance). Directories may move within their parent. */
+    int (*rename)(struct inode *olddir, const char *oldname,
+                  struct inode *newdir, const char *newname);
+    /* v1.1.2: remove an EMPTY directory (unlink refuses directories) */
+    int (*rmdir)(struct inode *dir, const char *name);
 };
 
 struct inode {
@@ -139,6 +146,11 @@ int vfs_lseek(struct file *f, int32_t off, int whence);
 int vfs_stat(const char *path, struct stat *st);
 int vfs_mkdir(const char *path);
 int vfs_unlink(const char *path);
+/* v1.1.2: rename(2)/rmdir(2). rename needs W+X on BOTH parent dirs and
+ * stays inside one filesystem instance (EXDEV-style -1 across mounts);
+ * rmdir needs W+X on the parent and refuses non-empty directories. */
+int vfs_rename(const char *oldpath, const char *newpath);
+int vfs_rmdir(const char *path);
 /* enumerate a directory by index: 0 = entry copied out, 1 = end, -1 = err */
 int vfs_readdir(const char *path, int idx, char *name_out, size_t name_max);
 

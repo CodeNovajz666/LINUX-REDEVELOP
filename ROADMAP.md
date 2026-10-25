@@ -1156,6 +1156,10 @@ test_shell 若干项）。
 - **v1.1.2 —— 文件操作补全**：RENAME(45)/RMDIR(46) 进 VFS 与
   syscall 表；mv 从"cp+unlink 临时实现"换直连（如实注解随之删除）；
   rmdir 工具。验收：mv 后 inode 不变（stat 证）、rmdir 拒绝非空。
+  ✅ 完成（2026-10-26）：VFS 层 EXDEV 拦截 + ramfs/FAT32 双实现；
+  FAT unlink 收紧拒目录（rmdir 唯一路径）；mv=rename 优先+跨实例
+  回退；附带修复 mkdir 目录归 root 的权限 bug、补 /bin/mkdir。
+  ktest 47/47、shell 109/109。
 - **v1.1.3 —— 安全加固**：PBKDF2 替换裸 salted SHA-256
   （DESIGN.md §6.5 的 1.x 承诺到期回收）+ /etc/shadow 访问路径审计
   （login SUID 只读、register 只写）；存量哈希首启自动升级。

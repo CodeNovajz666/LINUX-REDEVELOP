@@ -193,8 +193,11 @@ LOGIN_EXPECT = [
     ('osh cp+mv roundtrip',  'toolbox-line'),   # cp wrote it, mv moved it, cat
                                                 # proves the content travelled
     ('osh rm missing',       'rm: no-such-file: failed'),
+    # v1.1.2: rename fast path + rmdir refusal (empty-dir removal is proven
+    # by the exact counts: rd1/rd2 must appear only in the echoed commands)
+    ('osh rmdir nonempty',   'rmdir: rd2: directory not empty'),
     ('osh date local',       'local (unix'),    # the RTC line, kernel-formatted
-    ('osh uname',            'Novix 1.1.1'),    # uname and the banners agree
+    ('osh uname',            'Novix 1.1.2'),    # uname and the banners agree
                                                 # on the version again (v1.1.0)
     # v1.1.1: the history ring numbers entries chronologically and retires
     # the oldest past 32 -- the listing shows the raw (pre-expansion) lines
@@ -216,7 +219,7 @@ LOGIN_COUNT_EXPECT = [
     # v1.0.0: 'cat /etc/motd | grep Novix > /tmp/x' + cat -- the needle
     # hits the boot banner (1), motd at each of the two logins (2) and the
     # redirected copy (1)
-    ('osh motd pipeline', 'Novix 1.1.1 -- a real OS', 4),
+    ('osh motd pipeline', 'Novix 1.1.2 -- a real OS', 4),
     # variable + redirect + pipe + grep + cat: two cats of derived files;
     # the echoed command lines only ever contain '$p-pipe', never the value
     ('osh var+pipe+redirect', 'zz-pipe', 2),
@@ -225,11 +228,19 @@ LOGIN_COUNT_EXPECT = [
     ('osh up-up recall + history', 'osh-edit-a', 5),
     # Home + 'echo ' insert: typing echo + the command's output
     ('osh home insert', 'osh-mid-9', 2),
+    # v1.1.2: rename same-dir + two cats prove the content followed the
+    # inode (fast path) and then the copy (cross-instance fallback)
+    ('osh rename content', 'rename-line-9', 3),
 ]
 LOGIN_EXACT_EXPECT = [
     # v1.1.1: killed text appears only as the typing echo -- never rerun
     ('osh ctrl-u killed line', 'cu2-cancel-me', 1),
     ('osh ctrl-w killed word', 'osh-kw-victim', 1),
+    # v1.1.2: the rmdir'd directories appear ONLY in the echoed commands
+    # (mkdir/rmdir/touch/rm lines) -- never in the `ls` output that follows
+    # echoes + the two `history` listings; never the `ls` output
+    ('osh rmdir empty dir', 'rd1', 6),
+    ('osh rmdir emptied dir', 'rd2', 16),   # +1: the not-empty refusal
 ]
 
 # session 3 (v1.0.0): fresh boot -- the accounts registered in session 2
@@ -474,6 +485,22 @@ send_typed('mv tb2.txt tb3.txt', wait=0.8)
 send_typed('cat tb3.txt', wait=0.8)          # toolbox-line: cp+mv delivered
 send_typed('rm tb0.txt', wait=0.5)
 send_typed('rm no-such-file', wait=0.5)      # the error path reads cleanly
+# ---- v1.1.2: rename(2)/rmdir(2) ----
+# mv inside one directory is rename(2) now (same inode, no copy); across
+# instances (/tmp ramfs pin <-> FAT root) it falls back to copy+unlink
+send_typed('echo rename-line-9 > rn1.txt', wait=0.8)
+send_typed('mv rn1.txt rn2.txt', wait=0.8)        # same dir -> RENAME fast path
+send_typed('cat rn2.txt', wait=0.5)
+send_typed('mv rn2.txt /home/ktest/rn3.txt', wait=0.8)   # cross-instance
+send_typed('cat /home/ktest/rn3.txt', wait=0.5)
+send_typed('rm /home/ktest/rn3.txt', wait=0.5)
+send_typed('mkdir rd1', wait=0.5)
+send_typed('rmdir rd1', wait=0.5)                 # empty dir: gone
+send_typed('mkdir rd2', wait=0.5)
+send_typed('touch rd2/inside.txt', wait=0.5)
+send_typed('rmdir rd2', wait=0.5)                 # not empty: clean refusal
+send_typed('rm rd2/inside.txt', wait=0.5)
+send_typed('rmdir rd2', wait=0.5)                 # now empty: gone
 send_typed('ls', wait=0.8)                   # default listing: the cwd (/tmp)
 send_typed('date', wait=0.5)
 send_typed('uname', wait=0.5)

@@ -46,6 +46,8 @@
 #define SYS_GETDENTS    42
 #define SYS_UNLINK      43
 #define SYS_DATETIME    44
+#define SYS_RENAME      45
+#define SYS_RMDIR       46
 #define TCGETS          0
 #define TCSETS          1
 #define TCCLEAR         2
@@ -254,6 +256,12 @@ int ugetdents(const char *path, char *buf, int len) {
 }
 int uunlink(const char *path) {
     return (int)_sys3(SYS_UNLINK, (long)path, 0, 0);
+}
+int urename(const char *oldpath, const char *newpath) {
+    return (int)_sys3(SYS_RENAME, (long)oldpath, (long)newpath, 0);
+}
+int urmdir(const char *path) {
+    return (int)_sys3(SYS_RMDIR, (long)path, 0, 0);
 }
 int udatetime(char *buf, int len) {
     return (int)_sys3(SYS_DATETIME, (long)buf, len, 0);

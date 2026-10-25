@@ -3,6 +3,53 @@
 版本号约定见 ROADMAP.md：次版本号递增 = 交付一个完整子系统；
 修订号递增 = 稳定性/小改进。
 
+## v1.1.2 —— 文件操作补全：rename(2)/rmdir(2)，mv 直连（2026-10-26）
+
+ROADMAP 1.1.x 第二步：VFS 补齐两个"真文件系统"该有的操作，mv 从
+"cp+unlink 的临时实现"换成 rename 快路径 + 跨实例回退（GNU mv 同款
+语义）。
+
+**新增**
+- `inode_operations` 增 `rename`/`rmdir` 两个操作 + `vfs_rename`/
+  `vfs_rmdir`（两个父目录 W+X；rename 目标存在拒绝而非覆盖——教学
+  系统绝不静默毁数据；跨文件系统类型在 VFS 层拦截、同类型跨实例由
+  文件系统自身拒绝——EXDEV 语义，ABI 无 errno 返 -1）
+- ramfs：rename 原地改挂（inode/打开的 fd/st_ino 全部存活，目录防
+  "移进自己"环检查）；rmdir 仅空目录、挂载点视为忙
+- FAT32：rename = 删旧 dirent 组 + 目标目录追加新 dirent（同一
+  first_clus 与 size——数据不动，缓存节点原地改身份）；跨目录仅
+  文件（目录跨目录需改写 ".."，如实 -1）；rmdir 仅空目录。
+  **unlink 收紧**：FAT 的 unlink 原本能删空目录（与 ramfs 不一致），
+  现在统一拒绝目录——rmdir 是唯一的目录删除路径
+- 45 号 RENAME / 46 号 RMDIR 系统调用（+ ulib `urename`/`urmdir`），
+  docs/syscall.md 同步（CI 门禁 46/46）
+- 新程序两件：`/bin/rmdir`（空目录删除，三种失败路径文案分明）、
+  `/bin/mkdir`——v1.1.0 工具箱漏了它，osh 里 mkdir 一直是"命令
+  不存在"；mv 重写：rename 优先，跨实例（如 ramfs /tmp ↔ FAT 根）
+  回退 copy+unlink，"无 rename(2)"的如实注解随之删除
+- osh help 工具清单补 mkdir/rmdir
+
+**修复**
+- **mkdir 创建的目录归 root**：node_new 默认 uid 0，凡人建目录后
+  自己没有 W 位——touch 进自己刚建的目录失败（rmdir 却能成功，
+  因为权限看的是父目录，测试网此前从未覆盖这条路径）。vfs_mkdir
+  现在与 vfs_open 创建文件同款规则：新目录属主=创建者
+- 跨实例 rename 曾把 FAT 的 newdir 交给 ramfs 的 op 处理
+  （node_of 把 fat32_node 当 ramfs_node 用，#GP 实锤）——VFS 层
+  现在先比对 i_op（op 表即文件系统类型身份）再分发
+
+**测试**
+- ktest 46→47：新 `vfs_rename`（ramfs：inode 存活——旧名打开的 fd
+  在改名后继续写读、目标不覆盖、目录原地改名、跨目录移文件、
+  rmdir 拒绝非空/删后 stat 消失、跨实例拒绝）；`vfs_mkdir_readdir`
+  尾部改用 rmdir 清场（"ramfs 无 rmdir"的历史注释退役）；FAT 往返
+  测试增 rename 段（st_ino 前后一致、内容不经复制、拒覆盖）+
+  unlink 拒目录/rmdir 拒文件双向断言
+- test_shell 105→109：mv 同目录 rename 快路径 + 跨实例回退的内容
+  往返、rmdir 空目录删除（精确计数：目录名只出现在回显与 history
+  里，绝不在 ls 输出里）、rmdir 非空拒绝文案、mkdir 工具就位
+- 三门禁全绿收版：47/47（smp=2 与 smp=1）、109/109
+
 ## v1.1.1 —— 交互检索：↑/↓ 历史翻阅与行编辑（2026-10-26）
 
 ROADMAP 1.1.x 系列第一步：把两个 shell 的交互输入补到"日常可用"。

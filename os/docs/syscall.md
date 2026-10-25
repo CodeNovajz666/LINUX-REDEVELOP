@@ -51,6 +51,8 @@
 | 42 | GETDENTS | path / buf / len | 字节数 | v1.1.0：/bin/ls；目录须授 R；内核 shell 同源报告，截断式写入 |
 | 43 | UNLINK | path | 0 | v1.1.0：/bin/rm；拒绝目录；父目录 W 在 VFS 内检查 |
 | 44 | DATETIME | buf / len | 字节数 | v1.1.0：/bin/date；RTC 墙钟（与内核 shell date 同行格式）；RTC 不 sane 返 -1 |
+| 45 | RENAME | old path / new path | 0 | v1.1.2：/bin/mv 快路径；inode 不变（同实例内）；两个父目录 W+X；目标存在拒绝 -1（不覆盖） |
+| 46 | RMDIR | path | 0 | v1.1.2：/bin/rmdir；仅空目录；父目录 W+X |
 
 ## ABI 约定
 
@@ -63,3 +65,5 @@
 - 权限检查点：open（含 O_CREAT 的父目录 W+X、O_TRUNC/APPEND 的 W）、
   unlink/mkdir（父目录 W+X）、chdir（目标 X）、执行（文件 X）、
   chown（仅 root）。owner > group > world，uid 0 全通过。
+- v1.1.2：rename 两个父目录 W+X、rmdir 父目录 W+X（与 unlink/mkdir
+  同一层）；跨文件系统实例 rename 返回 -1（EXDEV 语义，ABI 无 errno）。

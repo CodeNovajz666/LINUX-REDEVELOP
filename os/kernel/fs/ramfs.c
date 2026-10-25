@@ -149,6 +149,61 @@ static int ramfs_i_truncate(struct inode *ino) {
     return 0;
 }
 
+/* v1.1.2 rename: relink the node under the new parent and rename it in
+ * place -- the inode (and thus every open file and stat st_ino) survives,
+ * which is the whole point of rename over create+unlink. The node stays
+ * put when both parents are the same directory. */
+static int ramfs_i_rename(struct inode *olddir, const char *oldname,
+                          struct inode *newdir, const char *newname) {
+    if ((olddir->mode & S_IFMT) != S_IFDIR || (newdir->mode & S_IFMT) != S_IFDIR)
+        return -1;
+    if (!oldname[0] || strlen(oldname) >= 32 ||
+        !newname[0] || strlen(newname) >= 32)
+        return -1;
+    struct ramfs_node *od = node_of(olddir), *nd = node_of(newdir);
+    irq_flags_t fl = irq_save();
+    int rc = -1;
+    do {
+        struct ramfs_node *n = child_find(od, oldname);
+        if (!n) break;
+        if (child_find(nd, newname)) break;         /* EEXIST: never clobber */
+        if ((n->mode & S_IFMT) == S_IFDIR) {
+            /* cycle guard: a directory cannot move under itself */
+            bool under = false;
+            for (struct ramfs_node *a = nd; a; a = a->parent)
+                if (a == n) { under = true; break; }
+            if (under) break;
+        }
+        child_unlink(od, n);
+        strncpy(n->name, newname, sizeof(n->name) - 1);
+        n->name[sizeof(n->name) - 1] = 0;
+        child_link(nd, n);                          /* reparents i_parent */
+        rc = 0;
+    } while (0);
+    irq_restore(fl);
+    return rc;
+}
+
+/* v1.1.2 rmdir: empty directories only; a mount point is busy by
+ * definition (the mounted tree would be orphaned). */
+static int ramfs_i_rmdir(struct inode *dir, const char *name) {
+    if ((dir->mode & S_IFMT) != S_IFDIR) return -1;
+    struct ramfs_node *d = node_of(dir);
+    irq_flags_t fl = irq_save();
+    int rc = -1;
+    do {
+        struct ramfs_node *n = child_find(d, name);
+        if (!n || (n->mode & S_IFMT) != S_IFDIR) break;
+        if (n->children) break;                     /* ENOTEMPTY */
+        if (vfs_mount_count(&n->inode) > 0) break;  /* busy: a mount lives here */
+        child_unlink(d, n);
+        kfree(n);
+        rc = 0;
+    } while (0);
+    irq_restore(fl);
+    return rc;
+}
+
 static int ramfs_i_readdir(struct inode *dir, int idx, char *name_out, size_t name_max) {
     if ((dir->mode & S_IFMT) != S_IFDIR) return -1;
     struct ramfs_node *c = node_of(dir)->children;
@@ -166,6 +221,8 @@ static const struct inode_operations ramfs_dir_iops = {
     .unlink = ramfs_i_unlink,
     .truncate = ramfs_i_truncate,
     .readdir = ramfs_i_readdir,
+    .rename = ramfs_i_rename,
+    .rmdir = ramfs_i_rmdir,
 };
 
 static struct ramfs_node *node_new(const char *name, uint16_t mode) {

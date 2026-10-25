@@ -657,12 +657,14 @@ static void test_vfs_mkdir_readdir(void) {
     }
     KT_ASSERT(n == 2 && !saw_f1);
 
-    /* directories cannot be unlinked yet (no rmdir) */
+    /* unlink refuses directories (rmdir(2) is the only removal path) */
     KT_ASSERT(vfs_unlink("/tmp/kdir") == -1);
 
-    /* cleanup: files first, the empty dir stays (ramfs keeps it) */
+    /* cleanup: files first, then the now-empty dir (v1.1.2 rmdir) */
     vfs_unlink("/tmp/kdir/f0");
     vfs_unlink("/tmp/kdir/f2");
+    KT_ASSERT(vfs_rmdir("/tmp/kdir") == 0);
+    KT_ASSERT(vfs_stat("/tmp/kdir", &st) == -1);
 }
 
 static void test_fd_exhaust(void) {
@@ -741,10 +743,66 @@ static void test_devfs(void) {
     KT_ASSERT(vfs_stat("/no/such/file", &st) == -1);
 }
 
+/* v1.1.2 rename(2)/rmdir(2) on ramfs: the inode survives a rename (the
+ * open fd and st_ino prove it), the target name is never clobbered, a
+ * directory moves inside its parent, rmdir refuses non-empty dirs, and a
+ * rename across mount instances is refused (EXDEV semantics). */
+static void test_vfs_rename(void) {
+    struct stat st;
+
+    struct file *f = vfs_open("/tmp/kren-a", O_WRONLY | O_CREAT | O_TRUNC);
+    KT_ASSERT(f != NULL);
+    KT_ASSERT(vfs_write(f, "rename-me", 9) == 9);
+    KT_ASSERT(vfs_stat("/tmp/kren-a", &st) == 0);
+    uint32_t ino0 = st.st_ino;
+
+    KT_ASSERT(vfs_rename("/tmp/kren-a", "/tmp/kren-b") == 0);
+    KT_ASSERT(vfs_stat("/tmp/kren-b", &st) == 0);
+    KT_ASSERT(st.st_ino == ino0);                 /* same inode, new name */
+    KT_ASSERT(st.st_size == 9);
+    KT_ASSERT(vfs_stat("/tmp/kren-a", &st) == -1);
+
+    /* the fd opened under the old name still reaches the file */
+    KT_ASSERT(vfs_write(f, "!", 1) == 1);
+    vfs_close(f);
+    struct file *g = vfs_open("/tmp/kren-b", O_RDONLY);
+    KT_ASSERT(g != NULL);
+    char buf[16] = { 0 };
+    KT_ASSERT(vfs_read(g, buf, sizeof(buf)) == 10);
+    KT_ASSERT(memcmp(buf, "rename-me!", 10) == 0);
+    vfs_close(g);
+
+    /* rename never clobbers an existing name */
+    struct file *e = vfs_open("/tmp/kren-c", O_WRONLY | O_CREAT);
+    KT_ASSERT(e != NULL);
+    vfs_close(e);
+    KT_ASSERT(vfs_rename("/tmp/kren-b", "/tmp/kren-c") == -1);
+    KT_ASSERT(vfs_stat("/tmp/kren-c", &st) == 0 && st.st_size == 0);
+
+    /* a directory renames inside its parent; rmdir refuses non-empty */
+    KT_ASSERT(vfs_mkdir("/tmp/krend") == 0);
+    KT_ASSERT(vfs_rename("/tmp/krend", "/tmp/krend2") == 0);
+    KT_ASSERT(vfs_stat("/tmp/krend2", &st) == 0);
+    KT_ASSERT(vfs_rename("/tmp/kren-b", "/tmp/krend2/kren-d") == 0);  /* cross-dir file move */
+    KT_ASSERT(vfs_stat("/tmp/krend2/kren-d", &st) == 0 && st.st_ino == ino0);
+    KT_ASSERT(vfs_rmdir("/tmp/krend2") == -1);    /* not empty */
+    KT_ASSERT(vfs_unlink("/tmp/krend2/kren-d") == 0);
+    KT_ASSERT(vfs_rmdir("/tmp/krend2") == 0);
+    KT_ASSERT(vfs_stat("/tmp/krend2", &st) == -1);
+
+    /* cross-instance rename is refused: /tmp is the ramfs pin, the FAT
+     * root is another instance (EXDEV; only meaningful with the disk) */
+    if (fat32_mounted())
+        KT_ASSERT(vfs_rename("/tmp/kren-c", "/kren-cross") == -1);
+
+    vfs_unlink("/tmp/kren-c");
+}
+
 static const struct ktest_case fs_cases[] = {
     { "vfs_create_rw", test_vfs_create_rw },
     { "vfs_lseek", test_vfs_lseek },
     { "vfs_mkdir_readdir", test_vfs_mkdir_readdir },
+    { "vfs_rename", test_vfs_rename },
     { "fd_exhaust", test_fd_exhaust },
     { "devfs_initrd", test_devfs },
 };
@@ -1069,17 +1127,40 @@ static void test_fat_roundtrip(void) {
     KT_ASSERT(vfs_stat(p, &st) == 0);
     KT_ASSERT(st.st_size == 15);
 
-    /* directories on FAT: create, fill, empty, remove (the unlink handles
-     * empty dirs -- ramfs could not). 8.3 names only: base <= 8 chars. */
+    /* v1.1.2 rename on FAT: the dirent moves, the inode-cache node (and
+     * its st_ino) survives, the content never leaves the cluster */
+    struct stat st_before;
+    KT_ASSERT(vfs_stat(p, &st_before) == 0);
+    KT_ASSERT(vfs_rename(p, "/ktest-mv.txt") == 0);
+    KT_ASSERT(vfs_stat("/ktest-mv.txt", &st) == 0);
+    KT_ASSERT(st.st_ino == st_before.st_ino);
+    KT_ASSERT(st.st_size == 15);
+    KT_ASSERT(vfs_stat(p, &st) == -1);              /* old name is gone */
+    struct file *m = vfs_open("/ktest-mv.txt", O_RDONLY);
+    KT_ASSERT(m != NULL);
+    KT_ASSERT(vfs_read(m, buf, sizeof(buf)) == 15);
+    KT_ASSERT(memcmp(buf, "novix on fat32!", 15) == 0);
+    vfs_close(m);
+    /* rename refuses to clobber an existing name */
+    struct file *c = vfs_open("/ktdir-x", O_WRONLY | O_CREAT);
+    KT_ASSERT(c != NULL);
+    vfs_close(c);
+    KT_ASSERT(vfs_rename("/ktest-mv.txt", "/ktdir-x") == -1);
+    KT_ASSERT(vfs_unlink("/ktdir-x") == 0);
+
+    /* directories on FAT: create, fill, empty, rmdir (v1.1.2: unlink
+     * refuses dirs now, same rule as ramfs). 8.3 names only. */
     KT_ASSERT(vfs_mkdir("/ktdir") == 0);
     struct file *d = vfs_open("/ktdir/inside.txt", O_WRONLY | O_CREAT);
     KT_ASSERT(d != NULL);
     vfs_close(d);
     KT_ASSERT(vfs_unlink("/ktdir/inside.txt") == 0);
-    KT_ASSERT(vfs_unlink("/ktdir") == 0);
+    KT_ASSERT(vfs_unlink("/ktdir") == -1);          /* rm may not remove dirs */
+    KT_ASSERT(vfs_rmdir("/ktdir/inside.txt") == -1);/* rmdir may not remove files */
+    KT_ASSERT(vfs_rmdir("/ktdir") == 0);
     KT_ASSERT(vfs_stat("/ktdir", &st) == -1);
 
-    KT_ASSERT(vfs_unlink(p) == 0);
+    KT_ASSERT(vfs_unlink("/ktest-mv.txt") == 0);
     KT_ASSERT(fat32_free_clusters(g_fat_sb) == free0);      /* all returned */
 }
 

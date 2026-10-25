@@ -57,6 +57,9 @@
 #define SYS_GETDENTS    42      /* rdi = path, rsi = buf, rdx = len -> bytes stored */
 #define SYS_UNLINK      43      /* rdi = path (parent must grant W) */
 #define SYS_DATETIME    44      /* rdi = buf, rsi = len -> bytes stored */
+/* v1.1.2 -- file operations completed: rename(2)/rmdir(2) */
+#define SYS_RENAME      45      /* rdi = old path, rsi = new path */
+#define SYS_RMDIR       46      /* rdi = path (empty dirs only) */
 
 /* ioctl requests (TCGETS/TCSETS subset; flags word: bit 0x8 = ECHO) */
 #define TCGETS 0
