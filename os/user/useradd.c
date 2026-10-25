@@ -1,6 +1,5 @@
 #include "ulib.h"
 #include "etc.h"
-#include "sha256.h"
 
 /* useradd NAME: root-only account creation. Appends to /etc/passwd and
  * /etc/shadow, creates and chowns /home/NAME, and prints a generated
@@ -43,13 +42,13 @@ int main(int argc, char **argv) {
      * the two writes leaves a shadow-only row, which shadow_set replaces
      * by name on the retry -- a passwd row without a shadow row could
      * never be logged into and would block the retry ("already exists") */
-    char salt[9], pw[9], msg[24], hash[65];
-    etc_gen_token(salt, 8);
-    etc_gen_token(pw, 8);
-    umemcpy(msg, salt, 8);
-    umemcpy(msg + 8, pw, 8);
-    sha256_hex(msg, 16, hash);
-    if (etc_shadow_set(name, salt, hash) != 0) {
+    char salt[9], pw[9], hash[65];
+    etc_gen_token(pw, 8);                       /* the printed one-time password */
+    if (etc_hash_password(pw, salt, hash) != 0) {
+        uprintf("useradd: hashing failed\n");
+        return 1;
+    }
+    if (etc_shadow_set(name, salt, ETC_PBKDF2_ITERS, hash) != 0) {
         uprintf("useradd: cannot write /etc/shadow\n");
         return 1;
     }

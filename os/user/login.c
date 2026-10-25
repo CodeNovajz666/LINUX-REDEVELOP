@@ -2,9 +2,17 @@
 #include "etc.h"
 
 /* login <username>: the credential gate. Verifies the password against
- * /etc/shadow (salted SHA-256), then drops to the account's uid/gid and
- * execs its shell. Runs as root (spawned by init via getty), so the
- * setuid pair below is the privilege-dropping point of the whole system.
+ * /etc/shadow (PBKDF2-HMAC-SHA256 since v1.1.3; legacy salted-SHA-256
+ * lines still verify and are upgraded on success), then drops to the
+ * account's uid/gid and execs its shell. Runs as root (spawned by init
+ * via getty), so the setuid pair below is the privilege-dropping point of
+ * the whole system.
+ *
+ * v1.1.3 shadow audit -- who may touch /etc/shadow (mode 0600, uid 0,
+ * enforced at every open): login (root, read + the upgrade rewrite),
+ * passwd (the one SUID binary: root-privileged read + own-line rewrite),
+ * register/useradd (root, write). Every reader runs as uid 0 when it
+ * opens the file; no mortal path reaches it.
  *
  * Unix convention: a wrong username and a wrong password are reported
  * identically ("Login incorrect") so an attacker cannot enumerate users.
@@ -29,9 +37,17 @@ int main(int argc, char **argv) {
         uputs("\n");
 
         if (have_pw && etc_verify(user, pass) == 0) {
+            /* v1.1.3: an old-disk line that still verifies gets rewritten
+             * in PBKDF2 format -- the upgrade rides the proven password,
+             * before the privilege drop (root is who may write shadow) */
+            etc_shadow_upgrade(user, pass);
             etc_utmp_login(user);               /* `who` reads this */
-            usetgid(pw.gid);
-            usetuid(pw.uid);
+            /* v1.1.3: the drop is CHECKED -- a silent setuid failure here
+             * would hand the user a root shell (the classic login bug) */
+            if (usetgid(pw.gid) != 0 || usetuid(pw.uid) != 0) {
+                uputs("login: cannot drop privileges\n");
+                return 1;
+            }
             if (uchdir(pw.home) != 0)
                 uchdir("/");
             /* v1.0.0: /etc/motd after a successful login (world-readable,

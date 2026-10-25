@@ -1164,6 +1164,10 @@ test_shell 若干项）。
   （DESIGN.md §6.5 的 1.x 承诺到期回收）+ /etc/shadow 访问路径审计
   （login SUID 只读、register 只写）；存量哈希首启自动升级。
   验收：shadow 字段格式带迭代数、旧盘镜像登录后哈希已换新。
+  ✅ 完成（2026-10-26）：PBKDF2-HMAC-SHA256 三份同构造（内核/用户/
+  mkpasswd），行内 iters 字段；etc_shadow_upgrade 以 login 同款钩子
+  升级旧格式（shadowtest 程序验证整链）；附带修复 login 降权返回值
+  未检查、passwd target 名字校验缺失。ktest 48/48、shell 109/109。
 - **v1.1.4 —— 内存防护**：用户栈 guard page（剖析报告遗留缺口：
   栈越界写应落保护页而非裸 #PF）；ktest 增栈溢出 SIGSEGV 边界用例。
   验收：递归炸栈程序死于 SIGSEGV 而非 panic。

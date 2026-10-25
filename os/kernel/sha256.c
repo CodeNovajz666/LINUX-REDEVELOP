@@ -114,3 +114,62 @@ void sha256_hex(const void *data, size_t len, char out[65]) {
     }
     out[64] = 0;
 }
+
+/* ---- v1.1.3: HMAC-SHA256 (RFC 2104) + PBKDF2 (RFC 8018, one block) ----
+ * The password hash behind /etc/shadow is now PBKDF2-HMAC-SHA256 with a
+ * per-line iteration count (see etc.h / mkpasswd.py); the bare
+ * sha256(salt||password) construction survives only as the LEGACY line
+ * format, verified and auto-upgraded at login. */
+
+void hmac_sha256(const void *key, size_t keylen,
+                 const void *msg, size_t msglen, uint8_t out[32]) {
+    uint8_t k[64], ipad[64], opad[64], inner[32];
+    memset(k, 0, sizeof(k));
+    if (keylen > 64) sha256(key, keylen, k);
+    else memcpy(k, key, keylen);
+    for (int i = 0; i < 64; i++) {
+        ipad[i] = k[i] ^ 0x36;
+        opad[i] = k[i] ^ 0x5c;
+    }
+    struct sha256_ctx c;
+    sha256_init(&c);
+    sha256_update(&c, ipad, 64);
+    sha256_update(&c, msg, msglen);
+    sha256_final(&c, inner);
+    sha256_init(&c);
+    sha256_update(&c, opad, 64);
+    sha256_update(&c, inner, 32);
+    sha256_final(&c, out);
+}
+
+/* dkLen = 32 (one T-block): T1 = U1 ^ U2 ^ ... ^ Uc with
+ * U1 = HMAC(password, salt || INT(1)) and Uj = HMAC(password, U_{j-1}) */
+void pbkdf2_sha256(const void *password, size_t pwlen,
+                   const void *salt, size_t saltlen,
+                   unsigned iters, uint8_t out[32]) {
+    uint8_t sblock[64];
+    size_t sb = saltlen > 60 ? 60 : saltlen;
+    memcpy(sblock, salt, sb);
+    sblock[sb] = 0; sblock[sb + 1] = 0; sblock[sb + 2] = 0; sblock[sb + 3] = 1;
+    uint8_t u[32], t[32];
+    hmac_sha256(password, pwlen, sblock, sb + 4, u);
+    memcpy(t, u, 32);
+    for (unsigned i = 1; i < iters; i++) {
+        hmac_sha256(password, pwlen, u, 32, u);
+        for (int j = 0; j < 32; j++) t[j] ^= u[j];
+    }
+    memcpy(out, t, 32);
+}
+
+void pbkdf2_sha256_hex(const void *password, size_t pwlen,
+                       const void *salt, size_t saltlen,
+                       unsigned iters, char out[65]) {
+    uint8_t d[32];
+    pbkdf2_sha256(password, pwlen, salt, saltlen, iters, d);
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < 32; i++) {
+        out[2 * i] = hex[d[i] >> 4];
+        out[2 * i + 1] = hex[d[i] & 0xF];
+    }
+    out[64] = 0;
+}

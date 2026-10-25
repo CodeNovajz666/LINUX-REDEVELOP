@@ -19,4 +19,15 @@ void sha256_final(struct sha256_ctx *c, unsigned char out[32]);
 void sha256(const void *data, unsigned long len, unsigned char out[32]);
 void sha256_hex(const void *data, unsigned long len, char out[65]);
 
+/* v1.1.3 twin of the kernel additions: HMAC-SHA256 + PBKDF2 (the shadow
+ * hash). Same construction as kernel/include/sha256.h and mkpasswd.py. */
+void hmac_sha256(const void *key, unsigned long keylen,
+                 const void *msg, unsigned long msglen, unsigned char out[32]);
+void pbkdf2_sha256(const void *password, unsigned long pwlen,
+                   const void *salt, unsigned long saltlen,
+                   unsigned iters, unsigned char out[32]);
+void pbkdf2_sha256_hex(const void *password, unsigned long pwlen,
+                       const void *salt, unsigned long saltlen,
+                       unsigned iters, char out[65]);
+
 #endif /* USHA256_H */

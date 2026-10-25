@@ -3,6 +3,45 @@
 版本号约定见 ROADMAP.md：次版本号递增 = 交付一个完整子系统；
 修订号递增 = 稳定性/小改进。
 
+## v1.1.3 —— 安全加固：PBKDF2、shadow 审计、login 降权检查（2026-10-26）
+
+ROADMAP 1.1.x 第三步：DESIGN.md "无慢因子哈希"的 1.x 承诺到期回收。
+密码哈希从裸 salted SHA-256 换成 PBKDF2-HMAC-SHA256（迭代数入行），
+旧盘哈希登录时自动升级；同时补上 login 降权检查这个真实世界出过
+CVE 的经典漏洞位。
+
+**新增**
+- HMAC-SHA256（RFC 2104）+ PBKDF2（RFC 8018，单块 dkLen=32）三份同
+  构造：kernel/sha256.c、user/sha256.c（孪生）、tools/mkpasswd.py
+  （hashlib 口径）。迭代数 ETC_PBKDF2_ITERS=4096，写进行内
+- shadow 行格式 v2：`name:salt:iters:hash`；旧格式 `name:salt:hash`
+  仍可验证——etc_verify 双格式，iters 字段有无即判别
+- `etc_hash_password`：唯一的"盐+哈希"入口（register/useradd/passwd
+  原本三份各自漂移的实现收拢为一份）
+- `etc_shadow_upgrade`：login 的升级钩子——legacy 行验证通过后，
+  用刚证明过的口令重算 PBKDF2 并改写该行（降权前、以 root 身份）
+- /bin/shadowtest：运行期验证载体（ktest uid 组以 root 运行）——
+  种 legacy 行 → legacy 验证 → 升级 → 新行仍可验证 → 二次升级为
+  no-op → 清场，退出码 45
+
+**修复（安全）**
+- **login 的 setgid/setuid 返回值现在被检查**：降权静默失败会给
+  用户一个 root shell（真实 login(1) 出过同类 CVE）。失败即拒登
+- passwd 的 target 现在过 `etc_valid_name`：root 用含 ':' 的名字
+  改密会写出畸形 shadow 行（useradd/register 早有校验，passwd 漏了）
+- shadow 访问审计落档（login.c 头注释 + DESIGN.md）：/etc/shadow
+  0600/uid 0，触碰者 login（root，读+升级改写）、passwd（唯一 SUID，
+  root 读+改写自己行）、register/useradd（root，写）——每个读者
+  打开文件时都是 uid 0，凡人路径不可达
+
+**测试**
+- ktest 47→48：shadow_roundtrip 改验 PBKDF2 锚点（kernel KDF 与
+  mkpasswd 逐字节一致，含 iters 字段解析与"慢因子下限 1000"断言）；
+  新增 shadow_upgrade（shadowtest 载体，login 同款代码路径）
+- test_shell 109 项不变但全链路换血：注册向导、登录、passwd 改密、
+  断电存续全部走 PBKDF2
+- 三门禁全绿收版：48/48（smp=2 与 smp=1）、109/109
+
 ## v1.1.2 —— 文件操作补全：rename(2)/rmdir(2)，mv 直连（2026-10-26）
 
 ROADMAP 1.1.x 第二步：VFS 补齐两个"真文件系统"该有的操作，mv 从

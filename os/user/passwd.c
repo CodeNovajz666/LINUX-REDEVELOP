@@ -1,6 +1,5 @@
 #include "ulib.h"
 #include "etc.h"
-#include "sha256.h"
 
 /* passwd [USER]: change a password. /bin/passwd is the system's one SUID
  * binary (see fs_perm_fixup): a mortal execs it with effective uid 0,
@@ -25,6 +24,12 @@ int main(int argc, char **argv) {
         return 1;
     }
     const char *target = argc > 1 ? argv[1] : self.name;
+    /* v1.1.3 audit fix: a target containing ':' would be written into
+     * shadow as a mangled line (useradd/register already validate) */
+    if (!etc_valid_name(target)) {
+        uprintf("passwd: invalid user name %s\n", target);
+        return 1;
+    }
     if (etc_getpwnam(target, 0) != 0 && ustrcmp(target, self.name) != 0) {
         uprintf("passwd: unknown user %s\n", target);
         return 1;
@@ -57,15 +62,12 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    char salt[9], msg[72], hash[65];
-    etc_gen_token(salt, 8);
-    unsigned long pl = ustrlen(pw1);
-    if (pl > ETC_PW_MAX) pl = ETC_PW_MAX;       /* same clamp as etc_verify */
-    umemcpy(msg, salt, 8);
-    umemcpy(msg + 8, pw1, pl);
-    sha256_hex(msg, 8 + pl, hash);
-
-    if (etc_shadow_set(target, salt, hash) != 0) {
+    char salt[9], hash[65];
+    if (etc_hash_password(pw1, salt, hash) != 0) {
+        uprintf("passwd: hashing failed\n");
+        return 1;
+    }
+    if (etc_shadow_set(target, salt, ETC_PBKDF2_ITERS, hash) != 0) {
         uprintf("passwd: cannot write /etc/shadow\n");
         return 1;
     }

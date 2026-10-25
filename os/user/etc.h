@@ -35,16 +35,33 @@ int etc_user_count(void);
  * pwent.name and contains no ':' */
 bool etc_valid_name(const char *name);
 
-/* shadow: name:salt:sha256hex */
-int etc_shadow_lookup(const char *name, char salt[9], char hash[65]);
-/* 0 = password matches, 1 = no such account, 2 = mismatch */
+/* v1.1.3: shadow lines are name:salt:iters:hash with PBKDF2-HMAC-SHA256
+ * (iters = ETC_PBKDF2_ITERS for everything written now). Lines from older
+ * disks lack the iters field (name:salt:hash, bare salted SHA-256): they
+ * still verify, and login rewrites them in the new format on success. */
+#define ETC_PBKDF2_ITERS 4096
+
+/* lookup: 0 = found. *iters (may be NULL) receives the line's iteration
+ * count, 0 for a legacy line. */
+int etc_shadow_lookup(const char *name, char salt[9], unsigned *iters, char hash[65]);
+/* 0 = password matches, 1 = no such account, 2 = mismatch (either format) */
 int etc_verify(const char *name, const char *password);
-/* replace the user's shadow line (append if absent): 0 = ok */
-int etc_shadow_set(const char *name, const char *salt, const char *hash);
+/* replace the user's shadow line (append if absent): 0 = ok. v1.1.3:
+ * writes the PBKDF2 format -- pass iters = ETC_PBKDF2_ITERS (0 writes a
+ * legacy line; only tests do that). */
+int etc_shadow_set(const char *name, const char *salt, unsigned iters, const char *hash);
+/* the ONE password hasher (v1.1.3, was three drifting copies): fresh salt,
+ * PBKDF2 digest, 0 = ok */
+int etc_hash_password(const char *password, char salt_out[9], char hash_out[65]);
+/* login's upgrade hook: when `name` verifies against a LEGACY line,
+ * rehash the just-proven password in PBKDF2 format and rewrite the line.
+ * 1 = upgraded, 0 = nothing to do (already new / no line), -1 = error */
+int etc_shadow_upgrade(const char *name, const char *password);
 int etc_passwd_append(const struct pwent *e);
 
 /* n chars of uptime+pid entropy (salts and generated passwords). Not
- * crypto-grade -- teaching scope, like the unkeyed hash itself. */
+ * crypto-grade -- teaching scope, recorded in DESIGN.md; PBKDF2's slow
+ * factor (v1.1.3) is what actually buys brute-force resistance. */
 void etc_gen_token(char out[9], int n);
 
 /* session ledger for `who`: one line "user:tty:pid" per tty, rewritten on

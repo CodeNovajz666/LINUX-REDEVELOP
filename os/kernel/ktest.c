@@ -1237,9 +1237,10 @@ static void test_setuid_boundary(void) {
 
 /* case 2 -- the roundtrip: the digest tools/mkpasswd.py baked into
  * /etc/shadow for the shadow-only "kck" anchor (password "ktest-pass")
- * must equal what this kernel's own SHA-256 computes from salt||password.
- * Green here means host tool and kernel hash agree byte for byte. The
- * anchor is used instead of "ktest" because passwd rewrites only the
+ * must equal what this kernel's own PBKDF2 computes from (salt, iters,
+ * password). Green here means host tool and kernel KDF agree byte for
+ * byte across HMAC, the iteration loop and the hex encoding (v1.1.3).
+ * The anchor is used instead of "ktest" because passwd rewrites only the
  * target user's line -- kck keeps its build-time digest even on an image
  * whose passwords were changed at runtime (test_shell.py session 3). */
 static void test_shadow_roundtrip(void) {
@@ -1256,16 +1257,19 @@ static void test_shadow_roundtrip(void) {
     const char *c1 = strchr(line, ':');            /* after the name */
     const char *c2 = c1 ? strchr(c1 + 1, ':') : NULL;
     KT_ASSERT(c2 != NULL && c2 - (c1 + 1) == 8);   /* 8-char salt */
-    const char *eol = strchr(c2, '\n');
-    size_t hlen = eol ? (size_t)(eol - c2 - 1) : strlen(c2 + 1);
+    const char *c3 = strchr(c2 + 1, ':');          /* v1.1.3: iters field */
+    KT_ASSERT(c3 != NULL);
+    int iters = 0;
+    for (const char *p = c2 + 1; p < c3 && *p >= '0' && *p <= '9'; p++)
+        iters = iters * 10 + (*p - '0');
+    KT_ASSERT(iters >= 1000);                      /* a real slow factor */
+    const char *eol = strchr(c3, '\n');
+    size_t hlen = eol ? (size_t)(eol - c3 - 1) : strlen(c3 + 1);
     KT_ASSERT(hlen == 64);                         /* sha256 hex digest */
 
-    char msg[32];                                  /* salt + "ktest-pass" */
-    memcpy(msg, c1 + 1, 8);
-    memcpy(msg + 8, "ktest-pass", 11);
     char got[65];
-    sha256_hex(msg, 8 + 10, got);
-    KT_ASSERT(strncmp(got, c2 + 1, 64) == 0);
+    pbkdf2_sha256_hex("ktest-pass", 10, c1 + 1, 8, (unsigned)iters, got);
+    KT_ASSERT(strncmp(got, c3 + 1, 64) == 0);
 }
 
 /* case 3 -- uid 100 against the VFS: /bin and /etc/shadow are closed to
@@ -1303,9 +1307,20 @@ static void test_perm_boundary(void) {
     KT_ASSERT(vfs_unlink("/home/alice/ok.txt") == 0);
 }
 
+/* v1.1.3: the runtime leg of the hash contract -- /bin/shadowtest (root)
+ * plants a legacy line, verifies it, runs login's upgrade hook and checks
+ * the rewritten PBKDF2 line still verifies. Covers exactly the code path
+ * an old-disk login takes. */
+static void test_shadow_upgrade(void) {
+    struct task *t = task_spawn_path("/bin/shadowtest");
+    if (!t) { kprintf("  (/bin/shadowtest missing -- skipped)\n"); return; }
+    reap_expect(t, 45);
+}
+
 static const struct ktest_case uid_cases[] = {
     { "setuid_boundary",  test_setuid_boundary },
     { "shadow_roundtrip", test_shadow_roundtrip },
+    { "shadow_upgrade",   test_shadow_upgrade },
     { "perm_boundary",    test_perm_boundary },
 };
 

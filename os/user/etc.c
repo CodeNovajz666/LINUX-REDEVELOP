@@ -143,7 +143,7 @@ bool etc_valid_name(const char *name) {
     return n > 0 && n < sizeof(((struct pwent *)0)->name) && !ustrchr(name, ':');
 }
 
-int etc_shadow_lookup(const char *name, char salt[9], char hash[65]) {
+int etc_shadow_lookup(const char *name, char salt[9], unsigned *iters, char hash[65]) {
     static char buf[2048];
     if (etc_read_file("/etc/shadow", buf, sizeof(buf)) < 0) return -1;
     unsigned long nlen = ustrlen(name);
@@ -156,7 +156,17 @@ int etc_shadow_lookup(const char *name, char salt[9], char hash[65]) {
             if (!c2 || c2 - saltp != 8) return -1;      /* 8-char salt */
             umemcpy(salt, saltp, 8);
             salt[8] = 0;
-            ustrncpy(hash, c2 + 1, 64);
+            /* v1.1.3: name:salt:iters:hash (PBKDF2) or the legacy
+             * name:salt:hash -- the iters field is what tells them apart */
+            char *c3 = ustrchr(c2 + 1, ':');
+            unsigned it = 0;
+            const char *hashp = c2 + 1;
+            if (c3) {
+                it = (unsigned)parse_int(c2 + 1);
+                hashp = c3 + 1;
+            }
+            if (iters) *iters = it;
+            ustrncpy(hash, hashp, 64);
             hash[64] = 0;
             return 0;
         }
@@ -165,20 +175,39 @@ int etc_shadow_lookup(const char *name, char salt[9], char hash[65]) {
     return -1;
 }
 
+/* the ETC_PW_MAX clamp every hasher honours (set and verify must agree,
+ * or a long password could be set but never verified) */
+static unsigned long pw_len(const char *password) {
+    unsigned long pl = ustrlen(password);
+    return pl > ETC_PW_MAX ? ETC_PW_MAX : pl;
+}
+
 int etc_verify(const char *name, const char *password) {
     char salt[9], want[65];
-    if (etc_shadow_lookup(name, salt, want) != 0) return 1;
-    unsigned long pl = ustrlen(password);
-    if (pl > ETC_PW_MAX) pl = ETC_PW_MAX;       /* same clamp as passwd.c */
-    char msg[64];
-    umemcpy(msg, salt, 8);
-    umemcpy(msg + 8, password, pl);
+    unsigned iters;
+    if (etc_shadow_lookup(name, salt, &iters, want) != 0) return 1;
+    unsigned long pl = pw_len(password);
     char got[65];
-    sha256_hex(msg, 8 + pl, got);
+    if (iters == 0) {
+        /* legacy line: sha256(salt || password) */
+        char msg[64];
+        umemcpy(msg, salt, 8);
+        umemcpy(msg + 8, password, pl);
+        sha256_hex(msg, 8 + pl, got);
+    } else {
+        pbkdf2_sha256_hex(password, pl, salt, 8, iters, got);
+    }
     return ustrcmp(got, want) == 0 ? 0 : 2;
 }
 
-int etc_shadow_set(const char *name, const char *salt, const char *hash) {
+int etc_hash_password(const char *password, char salt_out[9], char hash_out[65]) {
+    etc_gen_token(salt_out, 8);
+    pbkdf2_sha256_hex(password, pw_len(password), salt_out, 8,
+                      ETC_PBKDF2_ITERS, hash_out);
+    return 0;
+}
+
+int etc_shadow_set(const char *name, const char *salt, unsigned iters, const char *hash) {
     static char in[2048], out[2048];
     if (etc_read_file("/etc/shadow", in, sizeof(in)) < 0) in[0] = 0;
     int olen = 0;
@@ -198,9 +227,22 @@ int etc_shadow_set(const char *name, const char *salt, const char *hash) {
     olen = app_str(out, olen, sizeof(out), ":");
     olen = app_str(out, olen, sizeof(out), salt);
     olen = app_str(out, olen, sizeof(out), ":");
+    if (iters) olen = app_int(out, olen, sizeof(out), (int)iters);
+    if (iters) olen = app_str(out, olen, sizeof(out), ":");
     olen = app_str(out, olen, sizeof(out), hash);
     olen = app_str(out, olen, sizeof(out), "\n");
     return etc_write_file("/etc/shadow", out, olen);
+}
+
+int etc_shadow_upgrade(const char *name, const char *password) {
+    char salt[9], old_hash[65];
+    unsigned iters;
+    if (etc_shadow_lookup(name, salt, &iters, old_hash) != 0) return 0;
+    if (iters != 0) return 0;                  /* already the new format */
+    if (etc_verify(name, password) != 0) return -1;   /* not actually ours */
+    char nsalt[9], nhash[65];
+    etc_hash_password(password, nsalt, nhash);
+    return etc_shadow_set(name, nsalt, ETC_PBKDF2_ITERS, nhash) == 0 ? 1 : -1;
 }
 
 void etc_gen_token(char out[9], int n) {

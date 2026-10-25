@@ -1,6 +1,5 @@
 #include "ulib.h"
 #include "etc.h"
-#include "sha256.h"
 
 /* register: the first-boot account wizard (v1.0.0). getty execs this
  * instead of login while /etc/passwd holds no accounts -- the out-of-box
@@ -38,15 +37,12 @@ static int ask_password(const char *prompt, char *out, int max) {
     return -1;
 }
 
+/* v1.1.3: the one shared hasher (etc.c) -- fresh salt + PBKDF2 digest;
+ * register/useradd/passwd used to carry three drifting copies of this */
 static int set_password(const char *name, const char *pw) {
-    char salt[9], msg[72], hash[65];
-    etc_gen_token(salt, 8);
-    unsigned long pl = ustrlen(pw);
-    if (pl > ETC_PW_MAX) pl = ETC_PW_MAX;       /* same clamp as etc_verify */
-    umemcpy(msg, salt, 8);
-    umemcpy(msg + 8, pw, pl);
-    sha256_hex(msg, 8 + pl, hash);
-    return etc_shadow_set(name, salt, hash);
+    char salt[9], hash[65];
+    if (etc_hash_password(pw, salt, hash) != 0) return -1;
+    return etc_shadow_set(name, salt, ETC_PBKDF2_ITERS, hash);
 }
 
 int main(void) {
