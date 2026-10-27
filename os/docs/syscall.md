@@ -1,4 +1,4 @@
-# Novix 系统调用参考（v1.1.0）
+# Novix 系统调用参考（v1.1.8）
 
 对标原内核模块的 `docs/api.md`。编号在 `kernel/include/syscall.h`
 定义、`kernel/syscall.c syscall_dispatch` 分发、`user/ulib.c` 封装。
@@ -59,10 +59,13 @@
 
 ## ABI 约定
 
-- argv 传递（SPAWN/EXEC）：rsi = `char** argv`（指向用户内存的指针
-  数组），rdx = argc；`(0, 0)` 表示"无参数"，argv[0] 取路径本身。
-  ELF 加载器把 argc、argv 数组和字符串压上新栈（`kernel/elf.c`，
-  [rsp]=argc、[rsp+8]=argv[0]，rsp 16 字节对齐）。
+- argv/envp 传递（SPAWN/EXEC）：rsi = `char** argv`，EXEC 的
+  rdx = `char** envp`（SPAWN 的 rdx 传 0）。两个向量都以 NULL 结尾，
+  `0` 表示"无向量"，argv[0] 缺省取路径本身；v1.1.5 起 argc/envc
+  由内核扫描向量得出，不再单独传计数。ELF 加载器把
+  `[argc][argv][envp][strings]` 压上新栈（`kernel/elf.c`，
+  [rsp]=argc、[rsp+8]=argv[0]，rsp 16 字节对齐），crt0 发布
+  `environ`。
 - 用户指针合法性：所有系统调用在拷贝前校验缓冲区落在
   `[USER_CODE_BASE, USER_STACK_TOP)` 内。
 - 权限检查点：open（含 O_CREAT 的父目录 W+X、O_TRUNC/APPEND 的 W）、

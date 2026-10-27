@@ -1318,7 +1318,7 @@ test_shell 若干项）。
    CHANGELOG 写明，绝不假装完成（0.1.0 移除假子系统的传统）
 2. **测试先行**：无断言不合并；自测项只增不减
    （0.1.0=10 → 0.9.0 ≥ 36 → 1.0.0 再增）；`test_shell.py` 用例同步增长
-3. **参照 Linux 设计，不抄 Linux 代码**：MIT 许可证约束；
+3. **参照 Linux 设计，不抄 Linux 代码**：GPLv3 许可证约束；
    对应关系（copy_process/dup_mm/sigreturn/rmap）在 DESIGN.md 记档
 4. **每版可引导可交互**：任何 tag 上 `python build.py run` 都能起来
 5. **埋雷必标**：跨版本的已知限制（如 COW 原子性、锁次序）在代码

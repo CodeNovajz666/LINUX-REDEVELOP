@@ -17,7 +17,7 @@ v0.3.0 移植定基，v0.5.0 随 sbrk 固化，v0.6.0 mmap 区启用。**写死�
 | brk 堆（sbrk 区） | 镜像 end（页对齐） | `0x0000_0000_8000_0000` | ≤ 1 GiB | `USER_HEAP_LIMIT` 上限；`task->brk` 当前断点 |
 | mmap 区 | `0x0000_0000_8000_0000` | 向上生长 | ≤ 1 GiB/次 | 0.6.0 起匿名 mmap 从此向上分配（`mm->mmap_top`） |
 | （mmap 区以上至栈底） | mmap_top | `0x0000_7F00_0000_0000` | ~127 TiB | 保留，未使用 |
-| 用户栈 | `0x0000_7FFF_FFFF_E000` − 64 KiB | `0x0000_7FFF_FFFF_E000` | 16 页 | `USER_STACK_TOP` 固定栈顶，向下生长 |
+| 用户栈 | `0x0000_7FFF_FFFF_E000` − 32 KiB | `0x0000_7FFF_FFFF_E000` | 8 页 | `USER_STACK_TOP` 固定栈顶，向下生长；栈下 4 页永不映射（guard，v1.1.4） |
 
 要点：
 
@@ -29,8 +29,9 @@ v0.3.0 移植定基，v0.5.0 随 sbrk 固化，v0.6.0 mmap 区启用。**写死�
   教训）。
 - sbrk 增长从 `task->brk`（elf_load 记录的镜像 end 页对齐）到
   `USER_HEAP_LIMIT`，回缩释放整页；越过上限返回 -1。
-- 栈固定 16 页，无 guard page；越界写打在 unmapped 上 →
-  #PF → SIGSEGV（fault_segv 即此路径）。
+- 栈固定 8 页（32 KiB），栈下留 4 页永不映射的 guard 区，
+  且 mmap 上限（`USER_MMAP_LIMIT`）压在 guard 之下；越界递归
+  落在 unmapped 上 → #PF → SIGSEGV（fault_segv 即此路径）。
 - v0.6.0 起地址空间由 `task->mm` 的 VMA 链描述（`mm.h`）：
   ELF 段=FILE VMA、bss 尾/brk/mmap/栈=ANON VMA，加载只登记不
   映射。#PF 命中 VMA → FILE 页从 inode 读入 / ANON 页清零 /
@@ -84,7 +85,7 @@ v0.3.0 移植定基，v0.5.0 随 sbrk 固化，v0.6.0 mmap 区启用。**写死�
 | 3 | getpid | — | pid |
 | 4 | yield | — | 0 |
 | 5 | sleep | ms | 0 |
-| 6 | spawn | name | 子 pid（0.5.x 语义：内核直接建任务） |
+| 6 | spawn | name, argv*（可空） | 子 pid（argv 为 NULL 结尾向量，v1.1.5；无环境） |
 | 7 | waitpid | pid, flags | 退出状态 / -1 / WNOHANG 0 |
 | 8 | getchar | — | 字符 |
 | 9 | set_policy | n | 0 |
@@ -95,7 +96,7 @@ v0.3.0 移植定基，v0.5.0 随 sbrk 固化，v0.6.0 mmap 区启用。**写死�
 | 14 | lseek | fd, off, whence | 新偏移 |
 | 15 | stat | path, stat* | 0 |
 | 16 | fork | — | 父：子 pid；子：0 |
-| 17 | exec | path | 不返回（失败 −1） |
+| 17 | exec | path, argv*, envp* | 不返回（失败 −1；两个向量均 NULL 结尾，v1.1.5） |
 | 18 | freepages | — | 内核空闲页（调试） |
 | 19 | sbrk | increment | 旧 brk |
 | 20 | kill | pid, sig | 0 |
@@ -123,12 +124,19 @@ v0.3.0 移植定基，v0.5.0 随 sbrk 固化，v0.6.0 mmap 区启用。**写死�
 | 42 | getdents | path, buf*, len | 字节数（v1.1.0：目录枚举报告，目录须授 R；内核 shell ls 同源） |
 | 43 | unlink | path | 0（v1.1.0：拒绝目录；父目录 W 在 VFS 内检查） |
 | 44 | datetime | buf*, len | 字节数（v1.1.0：RTC 墙钟行；RTC 不 sane 返 −1） |
+| 45 | rename | old, new | 0（v1.1.2：同挂载点改名，inode 原地改；两父目录 W 在 vfs_rename 内查） |
+| 46 | rmdir | path | 0（v1.1.2：仅空目录；父目录 W） |
+| 47 | setreuid | ruid, euid | 0（v1.1.7：root 任意；凡人只许在 (ruid, euid) 现有对之间互换，−1 表示不动） |
+| 48 | setregid | rgid, egid | 0（v1.1.7：同上，gid 版） |
+| 49 | access | path, mode | 0（v1.1.7：按 **real** uid/gid 判 R/W/X，SUID 程序问"真实的我能不能"） |
 
 约定：错误统一 −1（sign-extend）；pipe 的"请稍后重试"是 −2
 （`EAGAIN_RETRY`，仅 pipe 返回，ulib 包装成阻塞语义）。
 v0.9.0：SYS_SPAWN/SYS_EXEC 扩参——rsi = char\*\* argv、
 rdx = argc，ELF 加载器把 argv 数组压上用户栈（`main(argc, argv)`）；
 exec 同名不换 uid/gid/cwd（POSIX），SUID 例外见 §6.2。
+（v1.1.5 起计数参数退役：向量改 NULL 结尾、argc 由内核扫描得出，
+详见下。）
 v1.0.0：新增 38 号 DUP2——osh 管道/重定向的接线，语义见上表；
 新增 39-41 号只读调试报告（ps/cpus/meminfo）——内核 debug shell 的
 同名命令经共享报告函数流式写入用户缓冲，osh 以内建命令呈现，
@@ -138,6 +146,13 @@ ls 列表与 RTC 日期行继续走共享报告函数模式（shell_report_dir /
 shell_report_date，内核 shell 与 syscall 同源逐字一致）；43 号
 unlink 直接暴露 VFS 既有删除能力（父目录 W 检查在 VFS 内）。
 ioctl 33 号扩 TCCLEAR=2 请求（清屏回位，无 flags 指针）。
+v1.1.2：新增 45-46 号 rename/rmdir，`mv` 由此走 inode 改名快路径。
+v1.1.5：SYS_SPAWN/SYS_EXEC 的 argv（以及 EXEC 的 envp）改成
+NULL 结尾向量——rsi = char\*\* argv、EXEC 的 rdx = char\*\* envp
+（SPAWN 的 rdx 传 0），argc/envc 由内核扫描得出，不再单独传计数；
+新栈布局 `[argc][argv][envp][strings]`，crt0 发布 `environ`。
+v1.1.7：新增 47-49 号 setreuid/setregid/access；uid/gid 自此是
+(ruid, euid)/(rgid, egid) 四元组，SUID exec 只抬 effective，real 留调用者。
 
 ## 4. 版本测试账目
 
@@ -153,6 +168,14 @@ ioctl 33 号扩 TCCLEAR=2 请求（清屏回位，无 flags 指针）。
 | v0.9.0 | 41（gate I uid 套件，smp=2/1 双跑） | 66（50 内核 shell + 13 登录/passwd 回环 + 3 断电密码存续） |
 | v1.0.0 | 44（gate J osh 套件含调试报告，smp=2/1 双跑） | 84（50 内核 shell + 32 首启注册/登录回环 + 2 断电注册存续） |
 | v1.1.0 | 46（gate J 增 user_toolbox：目录枚举/unlink 往返/RTC sane，smp=2/1 双跑） | 93（50 内核 shell + 41 首启注册/登录/交互工具箱 + 2 断电注册存续） |
+| v1.1.1 | 46（零内核测试改动；行编辑由 shell 层覆盖） | 105（新增 ↑/↓ 历史、Home/End/Ctrl-U/Ctrl-W 回环） |
+| v1.1.2 | 47（fs 套件增 vfs_rename：改名后 inode 内容/属主不变） | 109（新增 mv 快路径、mkdir/rmdir 往返） |
+| v1.1.3 | 48（uid 套件增 shadow_upgrade：旧 SHA-256 行登录即升级） | 109（PBKDF2 往返，检查项不变） |
+| v1.1.4 | 49（mt 套件增 stack_overflow：守护区不可映射、越界必 SIGSEGV） | 110（新增守护页越界退出码） |
+| v1.1.5 | 49（零内核改动，exec/envp ABI 由既有 argv 测试网背书） | 113（environ/export/$PATH） |
+| v1.1.6 | 49（零内核改动） | 119（wc/head/tail/which/find/cut） |
+| v1.1.7 | 50（uid 套件增 euid_boundary：SUID 抬 effective、real 不变） | 119（检查项不变，uidtest/euidtest 语义更新） |
+| v1.1.8 | 51（fs 套件增 procfs：uptime 单调、写路被拒、readdir 列文件） | 122（cat /proc/{uptime,version,meminfo,cpuinfo}） |
 
 `python build.py test`（自测）与 `python tools/test_shell.py`
 （串口自动化）双双全绿是收版的硬门槛；页账目零回退由 gate C/D/E
@@ -240,28 +263,34 @@ sched_lock  >  fs_lock / pipe locks  >  pmm_lock / heap_lock  >  console_lock
 
 ## 6. 权限与登录契约（v0.9.0 定基）
 
-"你是谁"从此有唯一权威来源：`task->uid/gid/ruid`。以下不变量是
+"你是谁"从此有唯一权威来源：`task->ruid/uid/rgid/gid`
+（real/effective 各一对，v1.1.7 起）。以下不变量是
 1.x（PAM、多用户会话、网络登录）及所有新系统调用的安全前提。
 
 ### 6.1 身份继承规则
 
-- fork：uid/gid/ruid 三者全继承。
-- exec：三者全保持（POSIX）——SUID 例外见 6.2。
+- fork：ruid/uid/rgid/gid 四个全继承。
+- exec：四个全保持（POSIX）——SUID 只抬 effective，见 6.2。
 - spawn：继承调用者（`task_fill`）；内核线程上下文一律 uid 0。
 - `setuid`：root 可任意设且 **ruid 同动**（登录式降落，登录
-  shell 里 `id` 不显示多余 ruid）；凡人只许设回自己当前的 uid。
+  shell 里 `id` 不显示多余 ruid）；凡人只许在 (ruid, euid)
+  现有对中选一，不可越权（v1.1.7 起）。
+- `setreuid`(47)/`setregid`(48)：root 任意；凡人只许在现有
+  (ruid, euid) / (rgid, egid) 对之间互换（可降可回升，不可越权）。
 - boot 任务（gate/ktest/fixup）恒 uid 0；权限测试在 boot 任务上
   直接翻 `cur->uid` 时，必须**先恢复后断言**，KT_ASSERT 提前
   return 也不许泄漏 uid 100。
 
-### 6.2 SUID 语义（教学简化：单 uid，无 euid 拆分）
+### 6.2 SUID 语义（v1.1.7：effective/real 拆分）
 
-- 二进制带 S_ISUID 且属主 ≠ 调用者 uid → 任务 uid 改采文件属主，
-  ruid 留作调用者记录（`id` 据此加显 ruid）。
+- 二进制带 S_ISUID 且属主 ≠ 调用者 uid → **euid** 改采文件属主，
+  ruid 留作调用者记录（`id` 据此加显 ruid）；gid 同理。
 - **两个入口都要应用**：`task_exec`（exec 链，getty→login）与
   `task_create_user`（spawn 链，sh 启动 /bin/passwd）——漏掉
   spawn 侧，凡人从 shell 里跑 passwd 就是自己 uid，永远写不了
   /etc/shadow（v0.9.0 实测抓出的坑）。
+- 权限判定看 effective 对；SUID 程序想按调用者身份裁决时用
+  `access(2)`(49)，它走 real 对（v1.1.7）。
 - 系统里唯一的 SUID 二进制是 `/bin/passwd`（fs_perm_fixup 授位）。
   新增 SUID 程序必须论证必要性。
 
@@ -276,8 +305,11 @@ sched_lock  >  fs_lock / pipe locks  >  pmm_lock / heap_lock  >  console_lock
     O_TRUNC/O_APPEND 按 W）；
   - read/write：复用 open 时的 fd 模式（Unix 语义，事后改
     inode 位不影响已开 fd）；
-  - unlink/mkdir：父目录 W；
-  - spawn/exec：目标文件 X。
+  - unlink/mkdir/rmdir：父目录 W；rename：新旧两个父目录 W
+    （v1.1.2=45/46）；
+  - spawn/exec：目标文件 X；
+  - access(49)：不改状态，只按调用者的 **real** 对跑同一套
+    `vfs_permitted_ids` 判定（v1.1.7）。
 - 新建文件属主 = 创建者 uid/gid（无任务上下文时为 root）。
 
 ### 6.4 FAT32 权限补正（`fs_perm_fixup`，boot 期一次性）
@@ -301,10 +333,11 @@ sched_lock  >  fs_lock / pipe locks  >  pmm_lock / heap_lock  >  console_lock
   （SysV 规则）。任何环节失败都回到 getty 提示符。
 - `login` 失败语义：错误用户名与错误密码同报 "Login incorrect"
   （不泄露账户存在性）；3 次失败 3 秒刹车后 getty 重来。
-- 密码哈希：salted SHA-256（salt 8 字符 + hex 摘要），内核/
-  ulib/构建期工具三份同算法（shadow_roundtrip 逐字节对账）；
-  **无慢因子**——离线爆破理论可行，1.x 换 PBKDF2，注释与
-  ROADMAP 均已标注。
+- 密码哈希：**PBKDF2-HMAC-SHA256**（salt 8 字符、迭代数逐行记录、
+  hex 摘要，v1.1.3 起；默认 4096 次）。内核 / ulib / 构建期工具
+  三份同算法（shadow_roundtrip 逐字节对账）；旧 salted-SHA-256
+  行在下次成功登录时原地升级为 PBKDF2。1.1.3 之前"无慢因子"
+  的欠账已回收。
 - 回显开关走 ioctl(TCSETS)，仅 fd 0-2 有效；login/passwd 读
   密码前关、读完开（login 崩溃路径也要保证——它是 exec 走的，
   进程死了 getty 重来，echo 由 console 设备按任务旗标维护，

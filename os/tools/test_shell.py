@@ -273,24 +273,57 @@ PERSIST_EXPECT = [
 # v0.7.0: run the shell session on 2 CPUs -- sockets=N so SeaBIOS reports
 # every processor in the MP table (plain -smp 2 underreports).
 # v0.8.0: FAT32 boot disk on IDE primary master + RTC with local time.
+#
+# v1.1.8: a flaky mid-session guest death was hunted with QEMU's instruction
+# trace. It never reproduced, and a full trace is ~17 MB per run, so the
+# trace is opt-in: set NOVIX_QEMU_TRACE=1 when the hunt resumes. What stays
+# always-on is the cheap part -- _dump_on_death() preserves the serial output
+# if the guest exits under the harness.
+QEMU_TRACE = os.environ.get('NOVIX_QEMU_TRACE') == '1'
+
 def start_qemu(append):
+    argv = [QEMU, '-kernel', KERNEL, '-m', '128M', '-append', append,
+            '-serial', 'stdio', '-display', 'none', '-no-reboot',
+            '-smp', '2,sockets=2,cores=1,threads=1',
+            '-drive', f'file={DISK},format=raw,if=ide,index=0,media=disk',
+            '-rtc', 'base=localtime']
+    if QEMU_TRACE:
+        argv += ['-d', 'int,cpu_reset',
+                 '-D', os.path.join(ROOT, 'build', 'qemu_trace.log')]
+    argv += ['-device', 'isa-debug-exit']
     proc = subprocess.Popen(
-        [QEMU, '-kernel', KERNEL, '-m', '128M', '-append', append,
-         '-serial', 'stdio', '-display', 'none', '-no-reboot',
-         '-smp', '2,sockets=2,cores=1,threads=1',
-         '-drive', f'file={DISK},format=raw,if=ide,index=0,media=disk',
-         '-rtc', 'base=localtime',
-         '-device', 'isa-debug-exit'],
+        argv,
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     out = bytearray()
     reader_done = threading.Event()
 
     def reader():
+        # The osh prompt carries ANSI SGR colours and a clear-screen
+        # sequence. Assertions match visible text, so escape sequences
+        # (ESC [ ... final, or ESC O x) are dropped as they stream in.
+        esc = 0
         while True:
             b = proc.stdout.read(1)
             if not b:
                 break
-            out.extend(b)
+            c = b[0]
+            if esc == 0:
+                if c == 0x1b:
+                    esc = 1
+                    continue
+                out.extend(b)
+            elif esc == 1:
+                if c == 0x1b:
+                    esc = 1
+                elif c in (0x5b, 0x4f):     # '[' CSI, 'O' SS3
+                    esc = 2
+                else:
+                    esc = 0
+            else:
+                if 0x40 <= c <= 0x7e:       # final byte ends the sequence
+                    esc = 0
+                elif c == 0x1b:
+                    esc = 1
         reader_done.set()
 
     threading.Thread(target=reader, daemon=True).start()
@@ -304,22 +337,48 @@ def wait_for(out, needle, timeout=120, count=1):
         time.sleep(0.2)
     return False
 
+def _dump_on_death():
+    # v1.1.8: QEMU exited mid-session (a flaky guest death we are hunting) --
+    # keep the captured serial output before the OSError kills the harness.
+    # The exit code separates the two silent-death modes: 1/5 = isa-debug-exit
+    # (kernel asked for it: 1 = poweroff value 0, 5 = panic value 2), 0 = the
+    # guest reset (triple fault) under -no-reboot.
+    try:
+        try:
+            code = proc.wait(timeout=2)
+        except Exception:
+            code = proc.poll()
+        reader_done.wait(2)
+        with open(os.path.join(ROOT, 'build', 'crash_dump.log'), 'wb') as f:
+            f.write(bytes(out))
+            f.write(f'\n[harness] QEMU exit code: {code}\n'.encode())
+    except Exception:
+        pass
+
 def send(c, wait=0.5):
-    proc.stdin.write(c.encode())
-    proc.stdin.flush()
+    try:
+        proc.stdin.write(c.encode())
+        proc.stdin.flush()
+    except OSError:
+        _dump_on_death()
+        raise
     time.sleep(wait)
 
 def send_typed(line, wait=0.5, char_delay=0.004, enter=True):
     """Type char-by-char: a no-flow-control 16550 FIFO (16 bytes) legitimately
     drops bytes on a full-line paste burst, and that is not the OS under test."""
-    for ch in line:
-        proc.stdin.write(ch.encode())
-        proc.stdin.flush()
-        time.sleep(char_delay)
-    if enter:
-        proc.stdin.write(b'\n')
-        proc.stdin.flush()
-        time.sleep(wait)
+    try:
+        for ch in line:
+            proc.stdin.write(ch.encode())
+            proc.stdin.flush()
+            time.sleep(char_delay)
+        if enter:
+            proc.stdin.write(b'\n')
+            proc.stdin.flush()
+    except OSError:
+        _dump_on_death()
+        raise
+    time.sleep(wait)
 
 # ---- session 1: the kernel shell (console=debug) ----
 proc, out, reader_done = start_qemu('root=/dev/hd0 interactive console=debug')

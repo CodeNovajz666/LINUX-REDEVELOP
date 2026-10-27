@@ -26,7 +26,7 @@
 
 /* 模块信息 */
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Your Name");
+MODULE_AUTHOR("CodeNovajz666");
 MODULE_DESCRIPTION("Simple Process Manager with Priority Scheduling");
 MODULE_VERSION("1.0.0");
 

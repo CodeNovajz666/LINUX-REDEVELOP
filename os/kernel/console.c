@@ -7,9 +7,25 @@
 #define VGA_MEM   ((volatile uint16_t *)0xB8000)
 #define VGA_COLS  80
 #define VGA_ROWS  25
-#define VGA_ATTR  0x0F00u   /* white on black */
 
 static int cur_row, cur_col;
+
+/* ANSI escape interpreter for the VGA text console. The serial line gets
+ * every byte verbatim -- the host terminal is itself an ANSI device, so
+ * prompt colours and screen clears work there for free. VGA text mode is
+ * not ANSI-aware, so the same stream is interpreted here: CSI m (SGR),
+ * CSI J/K (erase) and CSI H/f (cursor home) are applied; any other
+ * sequence is swallowed instead of printed. The parser state is static
+ * because the console device writes one character per call -- a sequence
+ * routinely spans several console_write() calls. */
+static int ansi_state;              /* 0 plain, 1 saw ESC, 2 CSI/SS3 body */
+static int ansi_cur;                /* numeric param being collected, -1 = empty */
+static int ansi_par[8];
+static int ansi_npar;
+static int fg_idx;                  /* base foreground 0..7 */
+static int bg_idx;                  /* base background 0..7 */
+static bool vga_bold;
+static uint8_t vga_attr = 0x0F;     /* white on black */
 
 /* v0.7.0: character-granularity output lock. Without it two CPUs writing
  * "concurrently" interleave at the cursor-update level and both the VGA
@@ -57,12 +73,16 @@ static void serial_putc(char c) {
     outb(COM1 + 0, (uint8_t)c);
 }
 
+static uint16_t vga_cell(char c) {
+    return ((uint16_t)vga_attr << 8) | (uint8_t)c;
+}
+
 static void vga_scroll(void) {
     for (int r = 1; r < VGA_ROWS; r++)
         for (int c = 0; c < VGA_COLS; c++)
             VGA_MEM[(r - 1) * VGA_COLS + c] = VGA_MEM[r * VGA_COLS + c];
     for (int c = 0; c < VGA_COLS; c++)
-        VGA_MEM[(VGA_ROWS - 1) * VGA_COLS + c] = VGA_ATTR | ' ';
+        VGA_MEM[(VGA_ROWS - 1) * VGA_COLS + c] = vga_cell(' ');
 }
 
 static void vga_update_cursor(void) {
@@ -82,11 +102,100 @@ void console_init(void) {
 void console_clear(void) {
     irq_flags_t f;
     spin_lock_irqsave(&console_lock, &f);
+    fg_idx = 7;
+    bg_idx = 0;
+    vga_bold = false;
+    vga_attr = 0x0F;
+    ansi_state = 0;
+    ansi_cur = -1;
+    ansi_npar = 0;
     for (int i = 0; i < VGA_COLS * VGA_ROWS; i++)
-        VGA_MEM[i] = VGA_ATTR | ' ';
+        VGA_MEM[i] = vga_cell(' ');
     cur_row = cur_col = 0;
     vga_update_cursor();
     spin_unlock_irqrestore(&console_lock, f);
+}
+
+/* ---- ANSI interpreter (VGA side only; serial is pass-through) ---- */
+
+static void vga_apply_attr(void) {
+    int fg = fg_idx + ((vga_bold && fg_idx < 8) ? 8 : 0);
+    vga_attr = (uint8_t)((bg_idx << 4) | fg);
+}
+
+static void vga_sgr(int p) {
+    if (p == 0) { fg_idx = 7; bg_idx = 0; vga_bold = false; }
+    else if (p == 1) vga_bold = true;
+    else if (p == 22) vga_bold = false;
+    else if (p >= 30 && p <= 37) fg_idx = p - 30;
+    else if (p == 39) fg_idx = 7;
+    else if (p >= 40 && p <= 47) bg_idx = p - 40;
+    else if (p == 49) bg_idx = 0;
+    else if (p >= 90 && p <= 97) { fg_idx = p - 90; vga_bold = true; }
+    else return;
+    vga_apply_attr();
+}
+
+static void vga_erase_cells(int from, int count) {
+    if (from < 0) { count += from; from = 0; }
+    if (count < 0) count = 0;
+    if (from + count > VGA_COLS * VGA_ROWS) count = VGA_COLS * VGA_ROWS - from;
+    for (int i = 0; i < count; i++)
+        VGA_MEM[from + i] = vga_cell(' ');
+}
+
+static void vga_erase(int mode) {
+    if (mode == 2 || mode == 3) {
+        vga_erase_cells(0, VGA_COLS * VGA_ROWS);
+        cur_row = cur_col = 0;
+    } else if (mode == 0) {
+        int pos = cur_row * VGA_COLS + cur_col;
+        vga_erase_cells(pos, VGA_COLS * VGA_ROWS - pos);
+    } else if (mode == 1) {
+        int pos = cur_row * VGA_COLS + cur_col;
+        vga_erase_cells(0, pos + 1);
+    }
+}
+
+static void vga_erase_line(int mode) {
+    int base = cur_row * VGA_COLS;
+    if (mode == 2) vga_erase_cells(base, VGA_COLS);
+    else if (mode == 1) vga_erase_cells(base, cur_col + 1);
+    else vga_erase_cells(base + cur_col, VGA_COLS - cur_col);
+}
+
+static void vga_csi(char final) {
+    if (final == 'm') {
+        if (ansi_npar == 0) vga_sgr(0);
+        else for (int i = 0; i < ansi_npar; i++) vga_sgr(ansi_par[i]);
+    } else if (final == 'J') {
+        vga_erase(ansi_npar ? ansi_par[0] : 0);
+    } else if (final == 'K') {
+        vga_erase_line(ansi_npar ? ansi_par[0] : 0);
+    } else if (final == 'H' || final == 'f') {
+        int r = (ansi_npar > 0 && ansi_par[0] > 0) ? ansi_par[0] : 1;
+        int c = (ansi_npar > 1 && ansi_par[1] > 0) ? ansi_par[1] : 1;
+        cur_row = (r - 1 < VGA_ROWS) ? r - 1 : VGA_ROWS - 1;
+        cur_col = (c - 1 < VGA_COLS) ? c - 1 : VGA_COLS - 1;
+    }
+}
+
+static void vga_putc(char c) {
+    if (c == '\n') {
+        cur_col = 0;
+        if (++cur_row >= VGA_ROWS) { vga_scroll(); cur_row = VGA_ROWS - 1; }
+    } else if (c == '\r') {
+        cur_col = 0;
+    } else if (c == '\t') {
+        cur_col = (cur_col + 8) & ~7;
+        if (cur_col >= VGA_COLS) { cur_col = 0; if (++cur_row >= VGA_ROWS) { vga_scroll(); cur_row = VGA_ROWS - 1; } }
+    } else if (c == '\b') {
+        if (cur_col > 0) cur_col--;           /* erase sequences: "\b \b" */
+    } else {
+        if (cur_col >= VGA_COLS) { cur_col = 0; if (++cur_row >= VGA_ROWS) { vga_scroll(); cur_row = VGA_ROWS - 1; } }
+        VGA_MEM[cur_row * VGA_COLS + cur_col] = vga_cell(c);
+        cur_col++;
+    }
 }
 
 /* Emit [s, s+n) in ONE locked pass: a whole kprintf message lands
@@ -98,20 +207,29 @@ void console_write(const char *s, size_t n) {
     for (size_t i = 0; i < n; i++) {
         char c = s[i];
         serial_putc(c);
-        if (c == '\n') {
-            cur_col = 0;
-            if (++cur_row >= VGA_ROWS) { vga_scroll(); cur_row = VGA_ROWS - 1; }
-        } else if (c == '\r') {
-            cur_col = 0;
-        } else if (c == '\t') {
-            cur_col = (cur_col + 8) & ~7;
-            if (cur_col >= VGA_COLS) { cur_col = 0; if (++cur_row >= VGA_ROWS) { vga_scroll(); cur_row = VGA_ROWS - 1; } }
-        } else if (c == '\b') {
-            if (cur_col > 0) cur_col--;           /* erase sequences: "\b \b" */
+        if (ansi_state == 0) {
+            if (c == 0x1B) { ansi_state = 1; continue; }
+            vga_putc(c);
+        } else if (ansi_state == 1) {
+            if (c == 0x1B) continue;
+            if (c == '[' || c == 'O') { ansi_state = 2; ansi_cur = -1; ansi_npar = 0; }
+            else ansi_state = 0;
         } else {
-            if (cur_col >= VGA_COLS) { cur_col = 0; if (++cur_row >= VGA_ROWS) { vga_scroll(); cur_row = VGA_ROWS - 1; } }
-            VGA_MEM[cur_row * VGA_COLS + cur_col] = VGA_ATTR | (uint8_t)c;
-            cur_col++;
+            if (c >= '0' && c <= '9') {
+                ansi_cur = (ansi_cur < 0 ? 0 : ansi_cur) * 10 + (c - '0');
+            } else if (c == ';') {
+                if (ansi_npar < 8) ansi_par[ansi_npar++] = ansi_cur < 0 ? 0 : ansi_cur;
+                ansi_cur = -1;
+            } else if (c == 0x1B) {
+                ansi_state = 1;
+            } else if (c >= 0x40 && c <= 0x7E) {
+                if ((ansi_cur >= 0 || ansi_npar > 0) && ansi_npar < 8)
+                    ansi_par[ansi_npar++] = ansi_cur < 0 ? 0 : ansi_cur;
+                vga_csi(c);
+                ansi_state = 0;
+            } else if (c != '?' && c != '>') {
+                ansi_state = 0;              /* malformed: swallow the rest */
+            }
         }
     }
     vga_update_cursor();

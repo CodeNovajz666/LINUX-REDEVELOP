@@ -1,7 +1,7 @@
-# Novix Design Document (English edition, v1.1.0)
+# Novix Design Document (English edition, v1.1.8)
 
 The Chinese original (`docs/DESIGN.md`) is authoritative; this edition
-mirrors its structure for the v1.1.0 milestone. Where the two disagree,
+mirrors its structure for the v1.1.8 milestone. Where the two disagree,
 the code and the Chinese text win.
 
 ## 1. Goals and non-goals
@@ -15,10 +15,13 @@ from ISO (GRUB multiboot), a scripting user shell (osh), a user-space
 init reading `/etc/init`, the documentation set — and out-of-box
 registration: the image ships zero accounts, so the first boot asks
 you to *create* your credentials (root password, then your user)
-instead of demanding ones you never chose.
+instead of demanding ones you never chose. The v1.1.x series then closed
+the honesty gaps one by one: line editing, rename/rmdir, PBKDF2,
+a guarded stack, environment variables, a text toolbox, a full
+(euid, egid, ruid, rgid) identity split, and a real `/proc`.
 
-Non-goals (kept honest, see §6): no threads, no euid split, no network,
-no slow-hash KDF, no fsck, single tty.
+Non-goals (kept honest, see §6): no threads, no network, no file-backed
+writeback mmap, no fsck, single tty.
 
 ## 2. Architecture
 
@@ -36,22 +39,25 @@ QEMU (x86_64, -smp 2, -m 128M, IDE disk + RTC localtime)
       │   clock algorithm, TLB-shootdown IPIs
       ├─ fs/: namei.c (path walk + mounts + X-bit traversal), vfs.c (VFS +
       │   fd table + POSIX permission checks), ramfs.c (+initrd), fat32.c
-      │   (persistent root, LFN read/write, slot reuse), devfs.c, pipe.c
+      │   (persistent root, LFN read/write, slot reuse), devfs.c,
+      │   procfs.c (read-only synthetic /proc, v1.1.8), pipe.c
       ├─ drivers/: driver.c (probe→init→/dev registry), ata.c (PIO LBA28,
       │   MBR, FLUSH), rtc.c (CMOS wall clock)
-      ├─ task.c: PCB, fork(COW), exec(argv), waitpid, zombie reaping
+      ├─ task.c: PCB, fork(COW), exec(argv/envp), waitpid, zombie reaping
       ├─ sched.c: one global runqueue, on_cpu ownership protocol,
       │   PRIORITY/RR/FCFS/EDF/RMS + aging
-      ├─ signal.c, isr.c (ring3 kills with 128+signo), syscall.c (38 numbers)
-      ├─ elf.c: ELF64 registered loader + argv stack push (16-byte ABI)
-      ├─ ktest.c: 43 self-tests (3 early + 19 mt + 5 fs + 3 vm + 4 smp
-      │   + 4 disk + 3 uid + 2 osh)
+      ├─ signal.c, isr.c (ring3 kills with 128+signo), syscall.c (49 numbers)
+      ├─ elf.c: ELF64 registered loader + argv/envp stack push (16-byte ABI)
+      ├─ ktest.c: 51 self-tests (3 early + 21 mt + 7 fs + 3 vm + 4 smp
+      │   + 4 disk + 5 uid + 4 osh)
       └─ shell.c: kernel debug shell (console=debug back door)
-user programs (29): crt0, ulib, sha256 (user twin), etc (shared /etc
+user programs (50): crt0, ulib, sha256 (user twin), etc (shared /etc
   parsing); hello, spawner, fault_div, fault_segv, filetest, forker,
-  forkacct, execer, malloctest, sigtest, masktest, pipetest, memhog;
-  getty, login, osh, id, whoami, who, passwd, useradd, register, cat,
-  touch, uidtest; echo, grep, init, iotest
+  forkacct, execer, malloctest, sigtest, masktest, pipetest, memhog,
+  stackovf; getty, login, osh, id, whoami, who, passwd, useradd, register,
+  cat, touch, uidtest, euidtest, shadowtest; echo, grep, init, iotest;
+  ls, pwd, rm, cp, mv, mkdir, rmdir, date, sleep, uname, clear, env;
+  wc, head, tail, which, find, cut
 build time: mkramfs.py packs /bin into the kernel; mkfatimg.py makes the
   64 MiB FAT32 disk (MBR, LFN) with /etc (an EMPTY passwd -- the
   out-of-box image ships zero accounts; shadow holds only the
@@ -84,36 +90,52 @@ variants are the default.
 Kernel low 2 MiB identity-mapped with 2 MiB pages and shared into every
 user page directory — syscalls dereference user pointers directly. User
 code at 0x40000000, sbrk heap to 0x80000000, anonymous mmap above,
-stack top 0x7FFFFFFFE000. Demand paging, COW and swap resolve for both
-privilege levels.
+stack top 0x7FFFFFFFE000. The user stack is 8 pages (32 KiB); the four
+pages below it are never mapped and the mmap ceiling
+(`USER_MMAP_LIMIT`) sits below them, so runaway recursion becomes a
+clean SIGSEGV instead of corruption (v1.1.4). Demand paging, COW and
+swap resolve for both privilege levels.
 
-### 3.5 exec argv ABI (fixed in v1.0.0)
+### 3.5 exec argv/envp ABI
 `kernel/elf.c` pushes `[rsp]=argc, [rsp+8]=argv[0]...` with rsp
 16-byte aligned. The v0.9.0 layout could leave an 8-byte gap between
 the rounded rsp and the array for particular string-length
 combinations, so argv[0] read unwritten stack; the array position is
-now pinned to `argc_off + 8`.
+now pinned to `argc_off + 8`. Since v1.1.5 the frame is
+`[argc][argv][envp][strings]` with both arrays NULL-terminated;
+crt0 publishes `environ`.
 
 ### 3.6 Filesystem
 VFS (inode/file/f_op split), POSIX owner/group/world checks with root
 bypass, per-task cwd. FAT32 persistent root with LFN and deleted-slot
 reuse (directories stop growing on churn); ramfs keeps /dev, /tmp
-(world-writable) and /var. Mount table overlays the FAT root over
-ramfs. Pipes are ring buffers with EOF/EPIPE.
+(world-writable) and /var. `rename(2)`/`rmdir(2)` landed in v1.1.2
+(rename edits the inode in place; rmdir is empty-directory only), and
+`mv` takes the rename fast path across a mount. A read-only procfs is
+mounted at `/proc` (v1.1.8): `(name, generator)` rows regenerate
+`uptime`/`version`/`meminfo`/`cpuinfo` on every read; there is no write
+path. Mount table overlays the FAT root over ramfs. Pipes are ring
+buffers with EOF/EPIPE.
 
 ### 3.7 Users and login
-uid/gid/ruid in the PCB; SUID exec (`/bin/passwd`); salted SHA-256
-shadow with a 3-strike pause; init (kernel pid 1) supervises
-`/bin/init`, which runs `/etc/init`'s one-shot lines and supervises the
-respawn service (getty). login drops privileges, writes utmp, prints
-/etc/motd and execs the account's shell. While /etc/passwd holds zero
-accounts, getty execs the registration wizard instead (§3.9).
+(ruid, euid)/(rgid, egid) in the PCB (v1.1.7); SUID exec raises only
+the effective ids (`/bin/passwd`), and `access(2)` consults the real
+pair. Shadow uses PBKDF2-HMAC-SHA256 (8-char salt, per-line iteration
+count, 4096 by default; v1.1.3) with legacy salted-SHA-256 lines
+upgraded on the next successful login. A 3-strike pause guards login;
+init (kernel pid 1) supervises `/bin/init`, which runs `/etc/init`'s
+one-shot lines and supervises the respawn service (getty). login drops
+privileges, writes utmp, prints /etc/motd and execs the account's
+shell. While /etc/passwd holds zero accounts, getty execs the
+registration wizard instead (§3.9).
 
 ### 3.8 osh (v1.0.0 user shell)
 Pipelines (`|`, dup2-wired), redirections (`>` `>>` `<`), background
 jobs (`&`, `jobs`, `wait`), shell variables (`NAME=value`, `$VAR`,
-`$?`, `$pid`), comments. Explicit scope: no quoting, variables are not
-exported, no Ctrl-C routing to jobs.
+`$?`, `$pid`), comments. Since v1.1.5 `export` promotes a variable into
+the environment passed to children, and `$PATH` decides command lookup;
+v1.1.1 added history recall and line editing. Explicit scope: no
+quoting, no Ctrl-C routing to jobs.
 
 ### 3.9 Out-of-box registration (v1.0.0)
 The image ships zero accounts. getty counts valid /etc/passwd lines
@@ -129,26 +151,35 @@ pass sees the accounts and shows the normal login prompt. Registered
 accounts live on the FAT32 disk (they survive poweroff) and the
 wizard never runs again.
 
+### 3.10 v1.1.x additions
+Line editing (v1.1.1: ↑/↓/Home/End/Ctrl-U/Ctrl-W decoded once in the
+kernel input layer), rename/rmdir (v1.1.2), PBKDF2 + legacy upgrade
+(v1.1.3), guarded 32 KiB stack (v1.1.4), environ/export/$PATH
+(v1.1.5), the text toolbox wc/head/tail/which/find/cut (v1.1.6), the
+(euid, egid, ruid, rgid) split with setreuid/setregid/access (v1.1.7),
+and procfs (v1.1.8). See the Chinese `docs/DESIGN.md` §4.13.
+
 ## 4. Build and run
 
 ```
-python build.py            # kernel + 29 user programs + 64 MiB FAT32 disk
-python build.py test       # headless: 43 tests, 2 CPUs, exit code gates
+python build.py            # kernel + 50 user programs + 64 MiB FAT32 disk
+python build.py test       # headless: 51 tests, 2 CPUs, exit code gates
 python build.py test -smp 1
 python build.py run        # boot into the registration/login world
-python tools/test_shell.py # 78 automated checks over three live sessions
+python tools/test_shell.py # 122 automated checks over three live sessions
+                           # (NOVIX_QEMU_TRACE=1 keeps a QEMU trace)
 python build.py iso        # novix.iso via grub-mkrescue (host needs
                            # grub-pc-bin + xorriso; skipped honestly
                            # when absent -- QEMU -kernel is the tested path)
 ```
 
-## 5. Differences from a production OS (v1.0)
+## 5. Differences from a production OS (v1.1.8)
 
 | Area | Novix today |
 |---|---|
 | Processes | fork/exec/COW; no threads |
-| FS | FAT32 root (no rmdir of non-empty dirs, no fsck); Unix bits are boot-time fixups in the inode cache |
-| Security | uid/gid/ruid, SUID, POSIX bits, out-of-box registration; no euid split, no KDF, no ASLR |
-| Syscalls | 38 |
+| FS | FAT32 root, procfs, rename/rmdir (rmdir is empty-directory only, no fsck); Unix bits are boot-time fixups in the inode cache |
+| Security | (ruid, euid)/(rgid, egid), SUID, POSIX bits, `access(2)`, PBKDF2 shadow, out-of-box registration; no capabilities/LSM, no ASLR |
+| Syscalls | 49 |
 | Boot | QEMU -kernel (tested, CI-covered); ISO target (grub-mkrescue, host-tool gated) |
 | Network | none |

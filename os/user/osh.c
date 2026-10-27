@@ -643,7 +643,11 @@ static void prompt(void) {
         ustrncpy(name, pw.name, sizeof(name) - 1);
     if (ugetcwd(cwd, sizeof(cwd)) < 0)
         ustrcpy(cwd, "/");
-    uprintf("%s@novix:%s%s ", name, cwd, ugetuid() == 0 ? "#" : "$");
+    /* ANSI SGR: bold green user, bold blue cwd, white "novix"/sigil.
+     * The host terminal colours the serial stream itself; the VGA console
+     * applies the same sequences in kernel/console.c. */
+    uprintf("\033[1;32m%s\033[0m@novix:\033[1;34m%s\033[0m%s ",
+            name, cwd, ugetuid() == 0 ? "#" : "$");
 }
 
 /* one parsed line -> stages; returns nstages or 0 (nothing to run) */

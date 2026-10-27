@@ -50,6 +50,11 @@ int main(int argc, char **argv) {
             }
             if (uchdir(pw.home) != 0)
                 uchdir("/");
+            /* credentials proven: start the session on a clean screen, then
+             * print /etc/motd on it. CSI 2J wipes + CSI H homes; the serial
+             * stream carries the bytes to the host terminal and the VGA
+             * console interprets them (kernel/console.c). */
+            uputs("\033[2J\033[H");
             /* v1.0.0: /etc/motd after a successful login (world-readable,
              * so this runs after the privilege drop like real login(1)) */
             int mfd = uopen("/etc/motd", U_O_RDONLY);
