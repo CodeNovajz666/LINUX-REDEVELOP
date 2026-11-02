@@ -1130,7 +1130,7 @@ shell。这一版把"用户与 OS 的交互"补齐——常用操作在 osh 内
 | v1.1.7 | 身份完整化 | euid/egid 拆分、setreuid |
 | v1.1.8 | procfs | /proc 只读回归 |
 | v1.1.9 | 债务清理 | 遗留标记回收、压力门 |
-| v1.2.0 | 线程与作业控制 | clone、pthread、进程组、Ctrl-C |
+| v1.2.0 | 线程与作业控制 | clone、pthread、进程组、Ctrl-C（**已落地 2026-10-28**） |
 | v1.3.0 | 网络入门 | 网卡驱动 + 最小 UDP |
 | v1.4.0 | TCP 与 socket | TCP 子集、socket VFS 化 |
 | v1.5.0 | 存储深化 | page cache、sync/fsync |
@@ -1214,6 +1214,14 @@ test_shell 若干项）。
   前台语义）——补齐 v1.1.0 时"无 Ctrl-C 路由"的如实边界
 - 验收：thread_hello 跨核并行证据；Ctrl-C 杀前台作业、后台作业
   存活；fork+thread 混合后页计数守恒（gate F 扩展）
+- **收版前性能二轮（2026-11-02，已落地）**：lib 拷贝宽化
+  （rep movsq/stosq）、目录枚举 foreach 单遍（原 readdir(i) 逐项
+  重扫，O(N²)）、FAT32 链尾缓存 O(1) 追加 + 整簇直读直写、fork
+  单次 CR3 重载、TLB shootdown 范围邮箱（munmap/brk 整段一次
+  广播）、exit 销毁单遍（swap 槽并入页表遍历释放）、pmm ctz/
+  next-fit 与 heap O(1) 空闲计数、ATA rep 串指令；顺带修复 unmap
+  不清 stale swap 标记（brk 缩后再 grown 同页会串读他人槽内容）
+  ——v1.5.0 的 page cache 仍是读放大的大头，本轮不替代它
 
 ### v1.3.0 —— 网络栈入门（延伸方向第一条兑现）
 
@@ -1302,8 +1310,8 @@ test_shell 若干项）。
 
 ## 延伸方向（1.x 之后，不承诺）
 
-（注：下列条目中 **TCP/IP 栈已入 v1.3.0/v1.4.0**、**线程已入 v1.2.0**、
-**procfs 已入 v1.1.8** 规划；其余仍为未承诺方向。）
+（注：下列条目中 **TCP/IP 栈已入 v1.3.0/v1.4.0 规划**、其余仍为未承诺
+方向。线程与作业控制已于 1.2.0 落地、procfs 已于 v1.1.8 落地。）
 
 - 五级页表 LA57（0.3.0 落地的是四级教学版）
 - TCP/IP 栈（参照 lwIP 设计：网卡驱动 → netif → tcp/udp → socket VFS）

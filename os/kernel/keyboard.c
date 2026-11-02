@@ -2,11 +2,38 @@
 #include "keyboard.h"
 #include "timer.h"
 #include "sched.h"
+#include "signal.h"
 
 #define KQ_SIZE 64
 static char kqueue[KQ_SIZE];
 static int q_head, q_count;
 static spinlock_t kq_lock = SPINLOCK_INIT;   /* v0.7.0: IRQ4 (BSP) vs readers */
+
+/* v1.2.0: Ctrl-C routing. The input layer owns the terminal's foreground
+ * process group (osh registers the running job through ioctl TCSETPGRP).
+ * 0x03 must be intercepted at ENQUEUE time: while a foreground job runs,
+ * nobody is reading the console, so a queue-level filter would never fire
+ * and Ctrl-C would pile up as dead bytes. With no registered group (0) the
+ * byte is dropped exactly as before -- the documented v1.1.x boundary. */
+static volatile int fg_pgid;
+
+void keyboard_set_fg_pgid(int pgid) { fg_pgid = pgid; }
+int keyboard_fg_pgid(void) { return fg_pgid; }
+
+static void input_ctrlc(void) {
+    int pg = fg_pgid;                        /* one volatile read */
+    if (pg > 0) signal_send_pgrp(pg, SIGINT);
+}
+
+/* v1.2.0: Ctrl-C is intercepted ONLY when a foreground group is registered
+ * (job control active). Without one, the byte passes through untouched --
+ * the kernel debug shell reads 0x03 itself and does its own v0.5.0
+ * routing, and dropping it there broke its contract. */
+static int input_ctrlc_routed(void) {
+    if (fg_pgid <= 0) return 0;
+    input_ctrlc();
+    return 1;
+}
 
 /* i8042 status port bits */
 #define KST_OBF 0x01            /* output buffer full */
@@ -72,8 +99,20 @@ static const char sc_to_ascii[128] = {
     '*', 0, ' ', 0,
 };
 
+static bool kbd_ctrl;                   /* v1.2.0: left-Ctrl held (PS/2 path) */
+
 static void kbd_push_scancode(uint8_t sc) {
+    /* v1.2.0: left-Ctrl shift state (set-1 make 0x1D / break 0x9D; the
+     * E0-prefixed right-Ctrl collapses onto the same flag -- its 0xE0
+     * prefix byte falls through the sc < 128 guard and is dropped) */
+    if (sc == 0x1D) { kbd_ctrl = true; return; }
+    if (sc == 0x9D) { kbd_ctrl = false; return; }
     if (sc & 0x80) return;              /* break code */
+    /* ISIG: Ctrl-C (set-1 'C' = 0x2E) becomes SIGINT for the foreground
+     * group instead of a queued byte -- checked out here, before kq_lock,
+     * because the route takes sched_lock inside. No group registered: the
+     * plain byte is enqueued (the kernel shell's own Ctrl-C path). */
+    if (kbd_ctrl && sc == 0x2E && input_ctrlc_routed()) return;
     /* v1.1.1: arrows/Home/End deliver the SAME logical key codes the
      * serial escape parser below produces -- one grammar for readers */
     static const uint8_t nav[16] = {
@@ -123,6 +162,7 @@ static int esc_state;                   /* 0 none, 1 saw ESC, 2 saw CSI/SS3 */
 static void serial_parse(char c) {
     if (esc_state == 0) {
         if (c == 0x1b) { esc_state = 1; return; }
+        if (c == 0x03 && input_ctrlc_routed()) return;   /* v1.2.0: ISIG */
         kq_put(c);
         return;
     }

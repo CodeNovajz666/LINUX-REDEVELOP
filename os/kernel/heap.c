@@ -29,6 +29,10 @@ struct blk {
 
 static struct blk *head;
 static size_t used_bytes;
+static size_t free_bytes;                       /* mirrors the used counter;
+                                                 * coalescing moves size between
+                                                 * free blocks, so it never
+                                                 * touches these two */
 static uintptr_t heap_lo;                       /* actual first heap byte */
 static spinlock_t heap_lock = SPINLOCK_INIT;
 
@@ -45,6 +49,7 @@ void heap_init(void) {
     head->size = HEAP_END - base;
     head->used = 0;
     head->next = NULL;
+    free_bytes = head->size;
 }
 
 static void heap_check(struct blk *b, const char *where) {
@@ -72,6 +77,7 @@ void *kmalloc(size_t n) {
             }
             b->used = 1;
             used_bytes += b->size;
+            free_bytes -= b->size;
             spin_unlock_irqrestore(&heap_lock, f);
             return (void *)((char *)b + HDR_SIZE);
         }
@@ -88,6 +94,7 @@ void kfree(void *p) {
     if (!b->used) panic("kfree: double free %llx", (unsigned long long)(uintptr_t)p);
     b->used = 0;
     used_bytes -= b->size;
+    free_bytes += b->size;
     /* coalesce forward */
     struct blk *cur = b;
     while (cur->next && !cur->next->used &&
@@ -107,13 +114,8 @@ void kfree(void *p) {
 }
 
 size_t heap_free_bytes(void) {
-    irq_flags_t f;
-    spin_lock_irqsave(&heap_lock, &f);
-    size_t n = 0;
-    for (struct blk *b = head; b; b = b->next)
-        if (!b->used) n += b->size;
-    spin_unlock_irqrestore(&heap_lock, f);
-    return n;
+    return free_bytes;              /* maintained at alloc/free; was an
+                                     * O(free-list) walk under the lock */
 }
 
 size_t heap_used_bytes(void) { return used_bytes; }

@@ -6,7 +6,7 @@
 #include <stdbool.h>
 #include "lib.h"
 
-#define NOVIX_VERSION "1.1.8"
+#define NOVIX_VERSION "1.2.0"
 
 /* ---- SMP (v0.7.0) ---- */
 #define SMP_MAX            4        /* QEMU -smp cap for stress runs */
@@ -40,6 +40,10 @@
 
 /* ---- task config ---- */
 #define TASK_MAX           64
+/* v1.2.0 clone(2): the only flag the teaching kernel honors (Linux's value).
+ * The child shares the parent's mm + page directory; everything else
+ * (kernel stack, fd table, signal handlers) is a fresh per-task copy. */
+#define CLONE_VM           0x00000100u
 #define TASK_NAME_LEN      16
 #define TASK_MAX_ARGV      8         /* v0.9.0: exec argv slots */
 #define TASK_MAX_ENVP      16        /* v1.1.5: exec envp slots */

@@ -73,6 +73,14 @@ struct fat32_node {
     struct fat32_sb *sb;
     uint32_t first_clus;                        /* 0 = empty file */
     bool is_dir;
+    /* chain tail cache (write path only): last_clus = tail cluster,
+     * chain_len = clusters in the chain. 0/0 = unknown -- fat_f_write
+     * walks the chain once, records it, and appends in O(1) from then
+     * on (the old code re-walked the whole chain on every write).
+     * Directory nodes never cache: only fat_f_write sets it and it
+     * refuses directories; truncate resets it. */
+    uint32_t last_clus;
+    uint32_t chain_len;
     uint32_t parent_clus;                       /* dir holding our dirent; 0 = root */
     uint8_t sname[11];                          /* raw 8.3 dirent name */
     uint32_t dirent_clus;                       /* cluster holding our dirent */
@@ -378,6 +386,97 @@ static int dir_walk(struct fat32_sb *sb, uint32_t dir_clus, dir_walk_fn fn,
 static const struct inode_operations fat_iops;
 static const struct file_operations fat_file_fops;
 
+/* ---- v1.2.0: the FAT serialization lock ----
+ *
+ * Every superblock-mutating operation (FAT table read-modify-write,
+ * cluster allocation, directory-entry edits) is a multi-I/O sequence:
+ * two CPUs running them concurrently -- two processes today, trivially
+ * two threads since clone(CLONE_VM) -- could interleave the steps and
+ * corrupt chains or lose dirents. One coarse leaf lock around each
+ * dispatched entry point; ata_lock below it already serializes the
+ * sector I/O itself, so nothing is lost at this scale. fat_i_mkdir
+ * delegates to the (locked) fat_i_create and takes no lock of its own. */
+static spinlock_t fat_lock = SPINLOCK_INIT;
+
+static struct inode *fat_i_lookup_u(struct inode *dir, const char *name);
+static int fat_i_readdir_u(struct inode *dir, int idx, char *name_out,
+                           size_t name_max);
+static struct inode *fat_i_create_u(struct inode *dir, const char *name,
+                                    uint16_t mode);
+static int fat_i_unlink_u(struct inode *dir, const char *name);
+static int fat_i_truncate_u(struct inode *ino);
+static int fat_i_rename_u(struct inode *olddir, const char *oldname,
+                          struct inode *newdir, const char *newname);
+static int fat_i_rmdir_u(struct inode *dir, const char *name);
+static int fat_f_read_u(struct file *f, void *buf, uint32_t len);
+static int fat_f_write_u(struct file *f, const void *buf, uint32_t len);
+
+static struct inode *fat_i_lookup(struct inode *dir, const char *name) {
+    irq_flags_t _f; spin_lock_irqsave(&fat_lock, &_f);
+    struct inode *rc = fat_i_lookup_u(dir, name);
+    spin_unlock_irqrestore(&fat_lock, _f);
+    return rc;
+}
+
+static int fat_i_readdir(struct inode *dir, int idx, char *name_out,
+                         size_t name_max) {
+    irq_flags_t _f; spin_lock_irqsave(&fat_lock, &_f);
+    int rc = fat_i_readdir_u(dir, idx, name_out, name_max);
+    spin_unlock_irqrestore(&fat_lock, _f);
+    return rc;
+}
+
+static struct inode *fat_i_create(struct inode *dir, const char *name,
+                                  uint16_t mode) {
+    irq_flags_t _f; spin_lock_irqsave(&fat_lock, &_f);
+    struct inode *rc = fat_i_create_u(dir, name, mode);
+    spin_unlock_irqrestore(&fat_lock, _f);
+    return rc;
+}
+
+static int fat_i_unlink(struct inode *dir, const char *name) {
+    irq_flags_t _f; spin_lock_irqsave(&fat_lock, &_f);
+    int rc = fat_i_unlink_u(dir, name);
+    spin_unlock_irqrestore(&fat_lock, _f);
+    return rc;
+}
+
+static int fat_i_truncate(struct inode *ino) {
+    irq_flags_t _f; spin_lock_irqsave(&fat_lock, &_f);
+    int rc = fat_i_truncate_u(ino);
+    spin_unlock_irqrestore(&fat_lock, _f);
+    return rc;
+}
+
+static int fat_i_rename(struct inode *olddir, const char *oldname,
+                        struct inode *newdir, const char *newname) {
+    irq_flags_t _f; spin_lock_irqsave(&fat_lock, &_f);
+    int rc = fat_i_rename_u(olddir, oldname, newdir, newname);
+    spin_unlock_irqrestore(&fat_lock, _f);
+    return rc;
+}
+
+static int fat_i_rmdir(struct inode *dir, const char *name) {
+    irq_flags_t _f; spin_lock_irqsave(&fat_lock, &_f);
+    int rc = fat_i_rmdir_u(dir, name);
+    spin_unlock_irqrestore(&fat_lock, _f);
+    return rc;
+}
+
+static int fat_f_read(struct file *f, void *buf, uint32_t len) {
+    irq_flags_t _f; spin_lock_irqsave(&fat_lock, &_f);
+    int rc = fat_f_read_u(f, buf, len);
+    spin_unlock_irqrestore(&fat_lock, _f);
+    return rc;
+}
+
+static int fat_f_write(struct file *f, const void *buf, uint32_t len) {
+    irq_flags_t _f; spin_lock_irqsave(&fat_lock, &_f);
+    int rc = fat_f_write_u(f, buf, len);
+    spin_unlock_irqrestore(&fat_lock, _f);
+    return rc;
+}
+
 static struct fat32_node *node_find(struct fat32_sb *sb, uint32_t parent_clus,
                                      const uint8_t sname[11]) {
     for (struct fat32_node *n = sb->nodes; n; n = n->next)
@@ -464,7 +563,7 @@ static int lookup_cb(void *ctx, const struct dir_scan_entry *e) {
     return 1;                                   /* stop the walk */
 }
 
-static struct inode *fat_i_lookup(struct inode *dir, const char *name) {
+static struct inode *fat_i_lookup_u(struct inode *dir, const char *name) {
     struct fat32_node *dn = node_of(dir);
     if (!dn || !dn->is_dir || !name[0]) return NULL;
     struct fat32_sb *sb = dn->sb;
@@ -495,8 +594,8 @@ static int readdir_cb(void *ctx, const struct dir_scan_entry *e) {
     return 1;
 }
 
-static int fat_i_readdir(struct inode *dir, int idx, char *name_out,
-                         size_t name_max) {
+static int fat_i_readdir_u(struct inode *dir, int idx, char *name_out,
+                           size_t name_max) {
     struct fat32_node *dn = node_of(dir);
     if (!dn || !dn->is_dir || !name_out || name_max == 0) return -1;
     struct fat32_sb *sb = dn->sb;
@@ -510,6 +609,66 @@ static int fat_i_readdir(struct inode *dir, int idx, char *name_out,
     if (rc == 1) return 0;                      /* entry copied out */
     if (rc != 0) return -1;
     return 1;                                   /* end of directory */
+}
+
+/* ---- v1.2.x: single-pass enumeration ----
+ *
+ * Snapshot-then-deliver: the directory is walked ONCE under the
+ * fat_lock > sb->lock pair and the names land in a heap buffer, then the
+ * caller's cb runs with no fs lock held. The delivery must be lock-free
+ * because the cb is allowed to re-enter the fs (ls stats every entry ->
+ * namei -> lookup -> fat_lock, which would self-deadlock if the walk
+ * delivered under it). Partial heap failure delivers the prefix collected
+ * so far (the walk stops early) -- same visible behaviour as a truncated
+ * listing. */
+struct foreach_snap {
+    char (*names)[FAT_NAME_MAX + 1];
+    int n, cap;
+};
+
+static int foreach_snap_cb(void *c, const struct dir_scan_entry *e) {
+    struct foreach_snap *S = c;
+    if (S->n == S->cap) {
+        int ncap = S->cap ? S->cap * 2 : 16;
+        char (*nn)[FAT_NAME_MAX + 1] = kmalloc(ncap * sizeof(*nn));
+        if (!nn) return 1;                      /* OOM: deliver the prefix */
+        if (S->names) {
+            memcpy(nn, S->names, S->n * sizeof(*nn));
+            kfree(S->names);
+        }
+        S->names = nn;
+        S->cap = ncap;
+    }
+    memcpy(S->names[S->n], e->name, FAT_NAME_MAX + 1);
+    S->n++;
+    return 0;
+}
+
+static int fat_i_foreach(struct inode *dir, vfs_dir_cb cb, void *ctx) {
+    struct fat32_node *dn = node_of(dir);
+    if (!dn || !dn->is_dir || !cb) return -1;
+    struct fat32_sb *sb = dn->sb;
+
+    /* Snapshot under the fat_lock > sb->lock pair, then deliver with no
+     * fs lock held: the cb may re-enter the fs (ls stats every entry ->
+     * namei -> fat_i_lookup -> fat_lock), which would self-deadlock any
+     * wrapper that kept fat_lock across the delivery. */
+    irq_flags_t _f; spin_lock_irqsave(&fat_lock, &_f);
+    irq_flags_t fl; spin_lock_irqsave(&sb->lock, &fl);
+    struct foreach_snap snap = { NULL, 0, 0 };
+    int rc = dir_walk(sb, dn->first_clus, foreach_snap_cb, &snap);
+    spin_unlock_irqrestore(&sb->lock, fl);
+    spin_unlock_irqrestore(&fat_lock, _f);
+
+    int out = 0;
+    if (rc < 0) {
+        out = -1;                               /* I/O error mid-walk */
+    } else {
+        for (int i = 0; i < snap.n; i++)
+            if (cb(ctx, snap.names[i])) { out = 1; break; }
+    }
+    kfree(snap.names);
+    return out;
 }
 
 /* find the slot a new dirent goes into: the first deleted (0xE5) or
@@ -560,8 +719,8 @@ static void dirent_fill(uint8_t *e, const uint8_t sname[11], uint8_t attr,
     st32(e + 28, size);
 }
 
-static struct inode *fat_i_create(struct inode *dir, const char *name,
-                                  uint16_t mode) {
+static struct inode *fat_i_create_u(struct inode *dir, const char *name,
+                                    uint16_t mode) {
     struct fat32_node *dn = node_of(dir);
     if (!dn || !dn->is_dir || !name[0] || strlen(name) >= FAT_NAME_MAX)
         return NULL;
@@ -671,7 +830,7 @@ static int empty_check_cb(void *ctx, const struct dir_scan_entry *e) {
     return 1;
 }
 
-static int fat_i_unlink(struct inode *dir, const char *name) {
+static int fat_i_unlink_u(struct inode *dir, const char *name) {
     struct fat32_node *dn = node_of(dir);
     if (!dn || !dn->is_dir || !name[0]) return -1;
     struct fat32_sb *sb = dn->sb;
@@ -723,7 +882,7 @@ static int fat_i_unlink(struct inode *dir, const char *name) {
     return rc;
 }
 
-static int fat_i_truncate(struct inode *ino) {
+static int fat_i_truncate_u(struct inode *ino) {
     struct fat32_node *n = node_of(ino);
     if (!n || n->is_dir) return -1;
     struct fat32_sb *sb = n->sb;
@@ -735,6 +894,8 @@ static int fat_i_truncate(struct inode *ino) {
         if (n->first_clus != 0 && chain_free(sb, n->first_clus) != 0)
             break;
         n->first_clus = 0;
+        n->last_clus = 0;                       /* chain cache: empty again */
+        n->chain_len = 0;
         n->vfs.size = 0;
         if (dirent_update(sb, n) != 0) break;
         rc = 0;
@@ -753,8 +914,8 @@ static int fat_i_truncate(struct inode *ino) {
  * would need its ".." entry rewritten; -1, honestly). Crash between the
  * delete and the append leaves the data orphaned-but-intact -- same
  * no-fsck honesty as every other FAT write here. */
-static int fat_i_rename(struct inode *olddir, const char *oldname,
-                        struct inode *newdir, const char *newname) {
+static int fat_i_rename_u(struct inode *olddir, const char *oldname,
+                          struct inode *newdir, const char *newname) {
     struct fat32_node *od = node_of(olddir), *nd = node_of(newdir);
     if (!od || !od->is_dir || !nd || !nd->is_dir) return -1;
     if (od->sb != nd->sb) return -1;               /* EXDEV: another instance */
@@ -840,7 +1001,7 @@ static int fat_i_rename(struct inode *olddir, const char *oldname,
 
 /* v1.1.2 rmdir: directories only, and only when empty ("." and ".." are
  * skipped by the walker, so an empty dir yields zero scan entries). */
-static int fat_i_rmdir(struct inode *dir, const char *name) {
+static int fat_i_rmdir_u(struct inode *dir, const char *name) {
     struct fat32_node *dn = node_of(dir);
     if (!dn || !dn->is_dir || !name[0]) return -1;
     struct fat32_sb *sb = dn->sb;
@@ -894,13 +1055,14 @@ static const struct inode_operations fat_iops = {
     .unlink = fat_i_unlink,
     .truncate = fat_i_truncate,
     .readdir = fat_i_readdir,
+    .foreach = fat_i_foreach,
     .rename = fat_i_rename,
     .rmdir = fat_i_rmdir,
 };
 
 /* ---- file operations ---- */
 
-static int fat_f_read(struct file *f, void *buf, uint32_t len) {
+static int fat_f_read_u(struct file *f, void *buf, uint32_t len) {
     struct fat32_node *n = node_of(f->inode);
     if (!n || n->is_dir) return -1;
     struct fat32_sb *sb = n->sb;
@@ -918,10 +1080,17 @@ static int fat_f_read(struct file *f, void *buf, uint32_t len) {
         uint32_t in_off = pos % sb->clus_bytes;
         uint32_t copied = 0;
         while (copied < nlen) {
-            if (clus_read(sb, c, sb->bounce) != 0) goto out;
             uint32_t chunk = sb->clus_bytes - in_off;
             if (chunk > nlen - copied) chunk = nlen - copied;
-            memcpy((uint8_t *)buf + copied, sb->bounce + in_off, chunk);
+            if (in_off == 0 && chunk == sb->clus_bytes) {
+                /* whole cluster: straight into the caller buffer, the
+                 * bounce buffer stays for partial clusters only */
+                if (ata_read_sectors(clus_lba(sb, c), sb->spc,
+                                     (uint8_t *)buf + copied) != 0) goto out;
+            } else {
+                if (clus_read(sb, c, sb->bounce) != 0) goto out;
+                memcpy((uint8_t *)buf + copied, sb->bounce + in_off, chunk);
+            }
             copied += chunk;
             in_off = 0;
             if (copied < nlen) {
@@ -939,7 +1108,7 @@ out:
     return rc;
 }
 
-static int fat_f_write(struct file *f, const void *buf, uint32_t len) {
+static int fat_f_write_u(struct file *f, const void *buf, uint32_t len) {
     struct fat32_node *n = node_of(f->inode);
     if (!n || n->is_dir || len == 0) return -1;
     struct fat32_sb *sb = n->sb;
@@ -959,25 +1128,45 @@ static int fat_f_write(struct file *f, const void *buf, uint32_t len) {
             memset(sb->bounce, 0, sb->clus_bytes);
             if (clus_write(sb, c, sb->bounce) != 0) break;
             n->first_clus = c;
+            n->last_clus = c;                       /* a fresh chain is one long */
+            n->chain_len = 1;
         }
-        uint32_t last = n->first_clus;
-        uint32_t have = 1;
-        while (have < need || last == n->first_clus) {
+
+        /* locate the chain tail. Cached tail (last_clus != 0) is one FAT
+         * entry read to confirm EOC; a cold node walks the chain once and
+         * records it -- every later append to this file is O(1) in the
+         * FAT instead of a full re-walk. */
+        uint32_t last, have;
+        if (n->last_clus != 0) {
             uint32_t next;
-            if (fat_entry(sb, last, &next) != 0) goto out;
-            if (FAT_IS_EOC(next)) break;
-            last = next;
-            have++;
-            if (have > sb->cluster_count) goto out;
+            if (fat_entry(sb, n->last_clus, &next) != 0) goto out;
+            if (!FAT_IS_EOC(next)) goto out;        /* cache disagrees: corrupt */
+            last = n->last_clus;
+            have = n->chain_len;
+        } else {
+            last = n->first_clus;
+            have = 1;
+            for (;;) {
+                uint32_t next;
+                if (fat_entry(sb, last, &next) != 0) goto out;
+                if (FAT_IS_EOC(next)) break;
+                last = next;
+                have++;
+                if (have > sb->cluster_count) goto out;
+            }
+            n->last_clus = last;
+            n->chain_len = have;
         }
         while (have < need) {
             uint32_t c = cluster_alloc(sb);
-            if (!c) break;
+            if (!c) break;                          /* disk full: partial below */
             memset(sb->bounce, 0, sb->clus_bytes);
             if (clus_write(sb, c, sb->bounce) != 0) goto out;
             if (fat_set(sb, last, c) != 0) goto out;
             last = c;
             have++;
+            n->last_clus = last;                    /* hint stays current */
+            n->chain_len = have;
         }
 
         uint32_t c = cluster_at(sb, n->first_clus, pos / sb->clus_bytes);
@@ -985,12 +1174,19 @@ static int fat_f_write(struct file *f, const void *buf, uint32_t len) {
         uint32_t in_off = pos % sb->clus_bytes;
         uint32_t copied = 0;
         while (copied < len) {
-            /* read-modify-write: partial clusters preserve their tail */
-            if (clus_read(sb, c, sb->bounce) != 0) goto out;
             uint32_t chunk = sb->clus_bytes - in_off;
             if (chunk > len - copied) chunk = len - copied;
-            memcpy(sb->bounce + in_off, (const uint8_t *)buf + copied, chunk);
-            if (clus_write(sb, c, sb->bounce) != 0) goto out;
+            if (in_off == 0 && chunk == sb->clus_bytes) {
+                /* whole cluster: write the caller buffer directly --
+                 * no read-modify-write round trip */
+                if (ata_write_sectors(clus_lba(sb, c), sb->spc,
+                                      (const uint8_t *)buf + copied) != 0) goto out;
+            } else {
+                /* partial cluster: read-modify-write preserves the tail */
+                if (clus_read(sb, c, sb->bounce) != 0) goto out;
+                memcpy(sb->bounce + in_off, (const uint8_t *)buf + copied, chunk);
+                if (clus_write(sb, c, sb->bounce) != 0) goto out;
+            }
             copied += chunk;
             in_off = 0;
             if (copied < len) {

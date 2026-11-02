@@ -635,6 +635,22 @@ static void test_vfs_lseek(void) {
     vfs_unlink(p);
 }
 
+/* vfs_dir_foreach helper: count entries and tick off expected names */
+struct kt_dir_scan {
+    const char *want[8];
+    bool saw[8];
+    int nwant;
+    int n;
+};
+
+static int kt_dir_scan_cb(void *c, const char *name) {
+    struct kt_dir_scan *s = c;
+    s->n++;
+    for (int j = 0; j < s->nwant; j++)
+        if (strcmp(name, s->want[j]) == 0) s->saw[j] = true;
+    return 0;
+}
+
 static void test_vfs_mkdir_readdir(void) {
     KT_ASSERT(vfs_mkdir("/tmp/kdir") == 0);
     struct stat st;
@@ -652,27 +668,16 @@ static void test_vfs_mkdir_readdir(void) {
         KT_ASSERT(f != NULL);
         vfs_close(f);
     }
-    bool saw[3] = { false, false, false };
-    char name[32];
-    int n = 0;
-    for (int i = 0; vfs_readdir("/tmp/kdir", i, name, sizeof(name)) == 0; i++) {
-        n++;
-        for (int j = 0; j < 3; j++)
-            if (name[0] == 'f' && name[1] == (char)('0' + j) && name[2] == 0)
-                saw[j] = true;
-    }
-    KT_ASSERT(n == 3);
-    KT_ASSERT(saw[0] && saw[1] && saw[2]);
+    struct kt_dir_scan scan = { .want = { "f0", "f1", "f2" }, .nwant = 3 };
+    vfs_dir_foreach("/tmp/kdir", kt_dir_scan_cb, &scan);
+    KT_ASSERT(scan.n == 3);
+    KT_ASSERT(scan.saw[0] && scan.saw[1] && scan.saw[2]);
 
     /* unlink one entry: it disappears from the listing */
     KT_ASSERT(vfs_unlink("/tmp/kdir/f1") == 0);
-    n = 0;
-    bool saw_f1 = false;
-    for (int i = 0; vfs_readdir("/tmp/kdir", i, name, sizeof(name)) == 0; i++) {
-        n++;
-        if (strcmp(name, "f1") == 0) saw_f1 = true;
-    }
-    KT_ASSERT(n == 2 && !saw_f1);
+    struct kt_dir_scan scan2 = { .want = { "f1" }, .nwant = 1 };
+    vfs_dir_foreach("/tmp/kdir", kt_dir_scan_cb, &scan2);
+    KT_ASSERT(scan2.n == 2 && !scan2.saw[0]);
 
     /* unlink refuses directories (rmdir(2) is the only removal path) */
     KT_ASSERT(vfs_unlink("/tmp/kdir") == -1);
@@ -747,13 +752,9 @@ static void test_devfs(void) {
     KT_ASSERT(st.st_size > 0);
 
     /* / contains at least bin and dev */
-    bool saw_bin = false, saw_dev = false;
-    char name[32];
-    for (int i = 0; vfs_readdir("/", i, name, sizeof(name)) == 0; i++) {
-        if (strcmp(name, "bin") == 0) saw_bin = true;
-        if (strcmp(name, "dev") == 0) saw_dev = true;
-    }
-    KT_ASSERT(saw_bin && saw_dev);
+    struct kt_dir_scan rootscan = { .want = { "bin", "dev" }, .nwant = 2 };
+    vfs_dir_foreach("/", kt_dir_scan_cb, &rootscan);
+    KT_ASSERT(rootscan.saw[0] && rootscan.saw[1]);
 
     /* missing paths fail cleanly */
     KT_ASSERT(vfs_open("/bin/definitely-missing", O_RDONLY) == NULL);
@@ -842,13 +843,9 @@ static void test_procfs(void) {
     KT_ASSERT(vfs_open("/proc/uptime", O_WRONLY | O_CREAT) == NULL);
 
     /* the directory lists the synthetic files */
-    int saw_mem = 0, saw_ver = 0;
-    char name[32];
-    for (int i = 0; vfs_readdir("/proc", i, name, sizeof(name)) == 0; i++) {
-        if (strcmp(name, "meminfo") == 0) saw_mem = 1;
-        if (strcmp(name, "version") == 0) saw_ver = 1;
-    }
-    KT_ASSERT(saw_mem && saw_ver);
+    struct kt_dir_scan procscan = { .want = { "meminfo", "version" }, .nwant = 2 };
+    vfs_dir_foreach("/proc", kt_dir_scan_cb, &procscan);
+    KT_ASSERT(procscan.saw[0] && procscan.saw[1]);
 }
 
 static const struct ktest_case fs_cases[] = {
@@ -935,10 +932,34 @@ static void test_swap_roundtrip(void) {
     }
 }
 
+/* test 31 (v1.2.0, the gate F extension): the fork + thread MIX. The
+ * process clone()s two threads; each thread forks a COW twin from the
+ * SHARED address space, reaps it, and hammers a mutex-guarded counter.
+ * The mm reference counting must give every page back exactly once: two
+ * thread stacks, four kernel stacks, one grandchild page directory per
+ * thread, and the shared (mm, pd) pair all die with the process. */
+static void test_thread_fork_mixed(void) {
+    sched_set_policy(SCHED_PRIORITY);
+    uint32_t free0 = pmm_free_pages();
+    struct task *t = task_spawn_path("/bin/threadmix");
+    if (!t) {
+        kprintf("  (/bin/threadmix not found in ramfs -- build error)\n");
+        cur_failed = 1;
+        return;
+    }
+    reap_expect(t, 0);                  /* the program self-checks and exits 0 */
+    if (pmm_free_pages() != free0) {
+        kprintf("  fork+thread mix: %u pages leaked (free %u -> %u)\n",
+                free0 - pmm_free_pages(), free0, pmm_free_pages());
+        cur_failed = 1;
+    }
+}
+
 static const struct ktest_case vm_cases[] = {
     { "demand_file_paging", test_demand_file_paging },
     { "mmap_anon", test_mmap_anon },
     { "swap_roundtrip", test_swap_roundtrip },
+    { "thread_fork_mixed", test_thread_fork_mixed },
 };
 
 int ktest_run_vm(void) {

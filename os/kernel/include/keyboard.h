@@ -20,4 +20,10 @@ void keyboard_serial_drain(void); /* poll COM1 rx into the input queue */
 int keyboard_getchar(void);       /* blocking; returns ascii or -1 */
 int keyboard_trychar(void);       /* non-blocking; ascii or -1 if empty */
 
+/* v1.2.0: the console's foreground process group (Ctrl-C routing). osh
+ * registers the running job's group via ioctl TCSETPGRP; Ctrl-C at the
+ * input layer becomes SIGINT for that group and never reaches a reader. */
+void keyboard_set_fg_pgid(int pgid);
+int keyboard_fg_pgid(void);
+
 #endif /* KEYBOARD_H */

@@ -64,11 +64,17 @@
 #define SYS_SETREUID    47      /* rdi = ruid, rsi = euid (-1 = unchanged) */
 #define SYS_SETREGID    48      /* rdi = rgid, rsi = egid (-1 = unchanged) */
 #define SYS_ACCESS      49      /* rdi = path, rsi = mode (R|W|X bits) */
+/* v1.2.0 -- threads & job control */
+#define SYS_CLONE       50      /* rdi = flags (CLONE_VM), rsi = usp -> tid */
+#define SYS_SETPGID     51      /* rdi = pid (0 = self), rsi = pgid (0 = new) */
+#define SYS_GETPGRP     52      /* -> pgid */
 
 /* ioctl requests (TCGETS/TCSETS subset; flags word: bit 0x8 = ECHO) */
 #define TCGETS 0
 #define TCSETS 1
 #define TCCLEAR 2              /* v1.1.0: clear the screen + home cursor */
+#define TCSETPGRP 3            /* v1.2.0: rdx = pgid -> console foreground */
+#define TCGETPGRP 4            /* v1.2.0: -> console foreground pgid */
 #define TC_ECHO 0x0008
 
 void syscall_dispatch(struct pt_regs *r);

@@ -42,6 +42,19 @@ bool task_executing_anywhere(const struct task *t) {
     return false;
 }
 
+/* v1.2.0: true while some OTHER task sharing this address space executes
+ * on any CPU. kswapd must skip such mms: even though the victim task is
+ * parked, a sibling keeps the shared CR3 (and its TLB) loaded on its CPU,
+ * and the fire-and-forget shootdown cannot close that window -- a stale
+ * translation would write into a just-freed frame. */
+bool mm_executing_elsewhere(const struct mm *mm, const struct task *exclude) {
+    if (!mm) return false;
+    for (struct task *t = task_list; t; t = t->next)
+        if (t != exclude && t->mm == mm && task_executing_anywhere(t))
+            return true;
+    return false;
+}
+
 const char *task_state_name(task_state_t s) {
     switch (s) {
     case TASK_UNUSED:   return "UNUSED";
@@ -121,6 +134,12 @@ static void task_fill(struct task *t, const char *name, int prio) {
     t->cpu = -1;
     t->on_cpu = -1;
     t->ticks_run = 0;
+    /* v1.2.0: process groups inherit like every other per-task identity;
+     * kernel threads (no current yet at boot) become their own group */
+    {
+        struct task *cur = current_task();
+        t->pgid = cur ? cur->pgid : 0;
+    }
     /* v0.9.0: Unix identity + working directory are inherited from the
      * spawner (kernel-thread spawners run as root, cwd "/") */
     {
@@ -144,6 +163,7 @@ struct task *task_create_idle(const char *name) {
     task_fill(t, name, 0);
     t->pid = 0;                               /* slot 0, forever the idle */
     t->ppid = -1;
+    t->pgid = 0;
     t->state = TASK_RUNNING;
     t->is_idle = true;
     t->on_cpu = 0;                        /* BSP owns the boot stack from creation */
@@ -176,6 +196,7 @@ struct task *task_create_kernel(const char *name, void (*entry)(void *), void *a
     {
         struct task *cur = current_task();
         t->ppid = cur ? cur->pid : -1;
+        t->pgid = t->pid;        /* kernel threads: their own group */
     }
     t->kstack_base = (uint64_t)(uintptr_t)kmalloc(KSTACK_SIZE);
     if (!t->kstack_base) { spin_unlock_irqrestore(&sched_lock, f); return NULL; }
@@ -293,18 +314,29 @@ struct task *task_fork(struct pt_regs *parent_regs) {
 
     /* v0.6.0: bring swapped pages home first -- the COW dup below clones
      * present PTEs only, so it must not see swap markers. Slots released;
-     * the fresh mappings become ordinary COW twins downstream. */
+     * the fresh mappings become ordinary COW twins downstream.
+     * v1.2.0: the twin build holds the parent's mm lock -- a sibling thread
+     * may be faulting or sbrk-ing on this shared address space right now
+     * (order: sched_lock > mm.lock). */
+    irq_flags_t mf;
+    spin_lock_irqsave(&parent->mm->lock, &mf);
     swap_prefault(parent->page_dir, parent->mm);
 
     uint64_t pd = paging_dup_user_dir(parent->page_dir);
-    if (!pd) { spin_unlock_irqrestore(&sched_lock, f); return NULL; }
+    if (!pd) {
+        spin_unlock_irqrestore(&parent->mm->lock, mf);
+        spin_unlock_irqrestore(&sched_lock, f);
+        return NULL;
+    }
 
     struct mm *mm = mm_dup(parent->mm);
     if (!mm) {
+        spin_unlock_irqrestore(&parent->mm->lock, mf);
         spin_unlock_irqrestore(&sched_lock, f);
         paging_destroy_user_dir(pd);
         return NULL;
     }
+    spin_unlock_irqrestore(&parent->mm->lock, mf);
 
     memset(t, 0, sizeof(*t));
     strncpy(t->name, parent->name, TASK_NAME_LEN - 1);
@@ -312,6 +344,7 @@ struct task *task_fork(struct pt_regs *parent_regs) {
     t->priority = t->base_priority = parent->base_priority;
     t->pid = (int)(t - tasks);
     t->ppid = parent->pid;
+    t->pgid = parent->pgid;        /* v1.2.0: groups inherit across fork */
     t->on_cpu = -1;                /* parked from birth (memset skipped task_fill) */
     t->is_user = true;
     /* v0.9.0: identity and working directory are inherited across fork
@@ -344,6 +377,82 @@ struct task *task_fork(struct pt_regs *parent_regs) {
     /* POSIX: the child inherits handlers and the break (the address space
      * is a COW twin, so brk is already true); pending signals are NOT
      * inherited. memset above zeroed sigpending for us. */
+    memcpy(t->sighandlers, parent->sighandlers, sizeof(t->sighandlers));
+    t->sigrestorer = parent->sigrestorer;
+    t->sigblocked = parent->sigblocked;
+    t->brk = parent->brk;
+
+    task_list_add(t);
+    t->state = TASK_RUNNABLE;        /* F7: after all allocations */
+    spin_unlock_irqrestore(&sched_lock, f);
+    sched_notify_new_task(t);
+    return t;
+}
+
+/* ---- clone (v1.2.0): threads -- the address space is shared ----
+ *
+ * The fork skeleton with the copy steps removed: the child task holds a
+ * REFERENCE to the parent's (mm, page_dir) pair instead of a COW twin
+ * (mm->refs counts the sharers; the last releaser tears down). Its own
+ * kernel stack, its own fd-table copy (shared open-file descriptions), a
+ * private copy of the signal handler table (teaching divergence: POSIX
+ * shares one per-process table), and a first frame equal to the parent's
+ * except rax = 0 ("child of clone") and rsp = usp -- the thread starts on
+ * the stack its creator prepared, right at the ulib trampoline.
+ *
+ * Everything downstream needs zero changes: a thread IS a task, so the
+ * on_cpu park/adopt protocol, the runqueue, signals and waitpid all work
+ * unchanged. pthread_join is simply waitpid on the thread's tid. */
+struct task *task_clone(struct pt_regs *parent_regs, uint64_t flags, uint64_t usp) {
+    struct task *parent = current_task();
+    if (!parent || !parent->is_user) {
+        kprintf("clone: %s (pid %d) is not a user process -- denied\n",
+                parent ? parent->name : "?", parent ? parent->pid : -1);
+        return NULL;
+    }
+    if (!(flags & CLONE_VM) || !usp) return NULL;
+
+    irq_flags_t f;
+    spin_lock_irqsave(&sched_lock, &f);
+    struct task *t = task_slot();
+    if (!t) { spin_unlock_irqrestore(&sched_lock, f); return NULL; }
+
+    memset(t, 0, sizeof(*t));
+    strncpy(t->name, parent->name, TASK_NAME_LEN - 1);
+    t->name[TASK_NAME_LEN - 1] = 0;
+    t->priority = t->base_priority = parent->base_priority;
+    t->pid = (int)(t - tasks);
+    t->ppid = parent->pid;
+    t->pgid = parent->pgid;
+    t->on_cpu = -1;                /* parked from birth (memset skipped task_fill) */
+    t->is_user = true;
+    t->uid = parent->uid;
+    t->gid = parent->gid;
+    t->ruid = parent->ruid;
+    t->rgid = parent->rgid;
+    strcpy(t->cwd, parent->cwd);
+    t->kstack_base = (uint64_t)(uintptr_t)kmalloc(KSTACK_SIZE);
+    if (!t->kstack_base) {
+        spin_unlock_irqrestore(&sched_lock, f);
+        return NULL;
+    }
+    t->kstack_top = t->kstack_base + KSTACK_SIZE;
+    t->page_dir = parent->page_dir;             /* shared pair, not a twin */
+    t->mm = parent->mm;
+    mm_acquire(t->mm);                          /* +1 sharer */
+
+    /* copy_thread: rsp lands on the caller-prepared stack, rax = 0 */
+    struct pt_regs *cf = (struct pt_regs *)(t->kstack_top - sizeof(struct pt_regs));
+    *cf = *parent_regs;
+    cf->rax = 0;
+    cf->rsp = usp;
+    t->kesp = (uint64_t)(uintptr_t)cf;
+
+    vfs_dup_files(t, parent);
+
+    /* handlers are copied at clone time (fork rule); pending signals are
+     * not inherited. Shared-mm divergence from POSIX documented in
+     * DESIGN.md -- a handler installed after the clone is not seen. */
     memcpy(t->sighandlers, parent->sighandlers, sizeof(t->sighandlers));
     t->sigrestorer = parent->sigrestorer;
     t->sigblocked = parent->sigblocked;

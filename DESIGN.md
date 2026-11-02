@@ -176,6 +176,7 @@ v1.1.7：新增 47-49 号 setreuid/setregid/access；uid/gid 自此是
 | v1.1.6 | 49（零内核改动） | 119（wc/head/tail/which/find/cut） |
 | v1.1.7 | 50（uid 套件增 euid_boundary：SUID 抬 effective、real 不变） | 119（检查项不变，uidtest/euidtest 语义更新） |
 | v1.1.8 | 51（fs 套件增 procfs：uptime 单调、写路被拒、readdir 列文件） | 122（cat /proc/{uptime,version,meminfo,cpuinfo}） |
+| v1.2.0 | 52（vm 套件增 thread_fork_mixed：fork+线程混合后页计数守恒，gate F 扩展） | 126（thread_hello 跨核证据 + Ctrl-C 前台杀/后台存/rc=130） |
 
 `python build.py test`（自测）与 `python tools/test_shell.py`
 （串口自动化）双双全绿是收版的硬门槛；页账目零回退由 gate C/D/E
@@ -247,8 +248,10 @@ sched_lock  >  fs_lock / pipe locks  >  pmm_lock / heap_lock  >  console_lock
   补映射）本地 `invlpg` 即够，无需广播。
 - 唯一例外：kswapd 改写**非当前运行任务**的 PTE（swap 换出/
   抛弃）→ `smp_tlb_shootdown()` 广播 IPI，对端按 CR3 匹配后
-  invlpg。新增"改他人页表"的路径（0.8.0 页缓存回写要注意）
-  必须同样广播。
+  invlpg。邮箱是 (pd, [lo, hi)) 区间（v1.2.0 优化轮起）：
+  munmap/brk 收缩整段只广播**一次**（原先每页一次），接收端对
+  宽范围（>32 页）直接重载 CR3 全量冲刷代替逐条 invlpg。新增
+  "改他人页表"的路径（0.8.0 页缓存回写要注意）必须同样广播。
 - 内核低区共享映射（2MiB 大页）对所有核一致且 boot 后不变；
   LAPIC/IOAPIC 的 MMIO 映射同理。
 
@@ -342,3 +345,73 @@ sched_lock  >  fs_lock / pipe locks  >  pmm_lock / heap_lock  >  console_lock
   密码前关、读完开（login 崩溃路径也要保证——它是 exec 走的，
   进程死了 getty 重来，echo 由 console 设备按任务旗标维护，
   新任务默认开）。
+
+## 7. 线程与作业控制契约（v1.2.0 定基）
+
+线程 = 共享 (mm, page_dir) 对的任务。调度器、on_cpu 停靠/领养协议、
+信号投递、waitpid 收割全部原样生效；本节是共享地址空间带来的新
+不变量，1.x 后续（futex、CLONE_FILES 粒度、会话与终端）以它为前提。
+
+### 7.1 mm 引用计数（`struct mm.refs`）
+
+- fork 仍是**完全复制**（新 mm refs=1、页目录 COW 孪生）——进程语义
+  一字未动；clone(CLONE_VM) 才进共享路径（`mm_acquire` 原子 +1）。
+- `mm_release` 原子 -1，**最后一个引用**才做换出槽回收、VMA 清单
+  释放、页目录销毁。销毁是**单遍页表遍历**（v1.2.0 优化轮起）：
+  paging_destroy_user_dir/free_pd 顺手把 swap 标记 PTE 经
+  `mm_swap_slot_release` 放槽——无需按 VA 预扫（原先每个 VA 一次
+  四级查表只为找标记）。共享对的 (mm, pd) 生命周期恒同步（exec
+  总是换新对），一个计数管两者。前提：munmap/brk 收缩路径放槽
+  后必须清零标记（paging_unmap_user 对非在席标记清零）—— stale
+  标记会让销毁二次释放已易主的槽。
+- exec 在 `refs > 1` 的 mm 上**拒绝**（-1）：POSIX 语义是杀掉兄弟
+  线程，教学内核选择不实现线程组终结，宁拒绝不吊 CR3。
+- 信号处理表是 clone 时刻**快照**（fork 规则）；POSIX 的进程级共享
+  sighand 未做——clone 后装的 handler 兄弟看不见（记档偏差）。
+
+### 7.2 每地址空间锁（`mm.lock`，锁序见 spinlock.h）
+
+两线程共享一张页表后，"两 CPU 并发改同一张页表"从不可能变为常态：
+demand fault / brk / mmap / munmap / kswapd 换出 / fork 复制（含
+swap_prefault + COW 孪生构建）/ COW 缺页（isr.c 补拿）全部持
+mm.lock 串行。**TLB 语义**：共享 CR3 使"受害者不在 CPU ⟹ 页目录
+无人加载"的旧前提失效——kswapd 换出用 `mm_executing_elsewhere`
+整段跳过有兄弟在跑的地址空间（恢复完全可靠性）；COW 解析后的兄弟
+旧只读 TLB 项在 isr.c 以"PTE 已 present+rw 则 invlpg 重试"吸收；
+munmap/brk 收缩依赖 fire-and-forget shootdown（整段**一次范围
+广播**，v1.2.0 优化轮起；接收端宽范围直接全量冲刷），送达窗口内
+的旧译址命中是**已知限制**（与 kswapd v0.7.0 注释同族，窗口纳秒级）。
+**进程级共享结构**：`struct file` 引用计数原子化（并发 close 的
+最后释放者收尾）；FAT32 的多步超级块操作（FAT 表 RMW、簇分配、
+目录项编辑）由粗粒度 `fat_lock` 串行（叶锁，9 个派发入口包壳，
+mkdir 委托已加锁的 create）；swap 槽位位图由叶锁 `swap_lock`
+守卫——三者在锁序图中与 pmm/heap 同居叶组。锁序 `sched_lock > fs/pipe > mm.lock > cow_lock >
+pmm/heap > console`，无反例（kswapd 与 task_fork 从 sched_lock
+进入是唯二嵌套点，方向一致）。
+
+### 7.3 进程组与 Ctrl-C 路由
+
+- `task->pgid`：fork/clone/spawn 继承；setpgid(51) 教学规则——仅可
+  设自己或自己的孩子，新组须为目标自身 pid（立组）或**已存在的组**
+  （入组）；无会话概念，"同会话"校验从简。内核线程恒自成一组。
+- 前台组注册走 ioctl **TCSETPGRP**(3)（TCGETPGRP(4) 查询），状态
+  存在 keyboard 输入层（`fg_pgid`，volatile 单字，IRQ 侧一读）。
+- Ctrl-C 在**入队时**拦截：前台作业运行期间无人读控制台，出队过滤
+  永远等不到 0x03。串口 0x03 与 PS/2（左 Ctrl 跟踪，make 0x1D /
+  break 0x9D，Ctrl+'C'=扫描码 0x2E）两条产源都拦；`signal_send_pgrp`
+  收集目标在 sched_lock 下、生成分发在锁外。
+- **未注册组时 0x03 原样放行**——内核调试 shell 读字节自己做 v0.5.0
+  路由，该契约不变（test_shell 会话 1 两个 Ctrl-C 检查背书）。
+
+### 7.4 osh 作业组化与教学偏差清单
+
+- osh 启动即 `setpgid(0,0)` + 捕获 SIGINT（提示符处 Ctrl-C 打断编辑
+  丢半行，bash 行为）；每个作业（前台后台）所有 stage 双侧 setpgid
+  进同一组（父 fork 后立刻组 stage0，再组后续；子 exec 前重申——
+  竞态闭合）；前台注册 TCSETPGRP，收割后归还自身组。exec 会把
+  捕获型信号复位为默认（内核 task_exec 既有语义），所以 Ctrl-C
+  杀得死作业、rc=130。
+- 线程教学偏差（对照 POSIX，皆有记档）：信号处理表 clone 快照而非
+  共享；join = waitpid（无线程组、无 detached）；线程栈 ummap 后
+  不随 join 释放（随进程 mm 回收）；fd 表是每线程一份的描述共享
+  （close 不跨线程传播）；`exec` 在共享 mm 上拒绝而非终结线程组。

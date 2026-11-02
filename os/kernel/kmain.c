@@ -185,18 +185,29 @@ static void fix_mode(const char *path, uint16_t perm) {
     if (ino) ino->mode = (ino->mode & S_IFMT) | perm;
 }
 
+/* /bin permission fixup, one entry per vfs_dir_foreach callback. Names are
+ * clamped to the 31 chars the old readdir(name[32]) loop fed forward. */
+struct bin_perm_ctx {
+    char full[48];
+};
+
+static int bin_perm_one(void *c, const char *name) {
+    struct bin_perm_ctx *P = c;
+    strcpy(P->full, "/bin/");
+    strncpy(P->full + 5, name, sizeof(P->full) - 6);
+    P->full[sizeof(P->full) - 1] = 0;
+    struct inode *ino = namei(P->full);
+    if (!ino || (ino->mode & S_IFMT) != S_IFREG) return 0;
+    ino->mode |= 0111;
+    if (strcmp(name, "passwd") == 0) ino->mode |= S_ISUID;
+    return 0;
+}
+
 static void fs_perm_fixup(void) {
-    /* /bin: +x for everyone; passwd is the one SUID binary */
-    char name[32], full[48];
-    for (int i = 0; vfs_readdir("/bin", i, name, sizeof(name)) == 0; i++) {
-        strcpy(full, "/bin/");
-        strncpy(full + 5, name, sizeof(full) - 6);
-        full[sizeof(full) - 1] = 0;
-        struct inode *ino = namei(full);
-        if (!ino || (ino->mode & S_IFMT) != S_IFREG) continue;
-        ino->mode |= 0111;
-        if (strcmp(name, "passwd") == 0) ino->mode |= S_ISUID;
-    }
+    /* /bin: +x for everyone; passwd is the one SUID binary (one /bin walk
+     * via foreach -- readdir(i) re-scanned the directory per entry) */
+    struct bin_perm_ctx P;
+    vfs_dir_foreach("/bin", bin_perm_one, &P);
     fix_mode("/etc/passwd", 0644);
     fix_mode("/etc/shadow", 0600);         /* the one file mortals may not read */
     fix_mode("/etc/issue", 0644);

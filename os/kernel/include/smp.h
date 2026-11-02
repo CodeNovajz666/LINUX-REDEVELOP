@@ -46,6 +46,9 @@ void smp_resched_others(void);
  * for pages someone swapped out while it was off-CPU" -- callers hold
  * sched_lock, which serializes concurrent senders of this mailbox. */
 void smp_tlb_shootdown(uint64_t page_dir, uint64_t va);
+/* same, for a whole page-aligned range [from, to): one broadcast instead
+ * of one IPI per page (the handler full-flushes when the range is wide) */
+void smp_tlb_shootdown_range(uint64_t page_dir, uint64_t from, uint64_t to);
 void smp_tlb_shootdown_handler(void);     /* isr.c: vector 0x51 */
 
 /* count of TLB shootdown IPI broadcasts actually sent (ktest 32 probe) */

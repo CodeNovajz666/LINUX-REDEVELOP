@@ -195,6 +195,11 @@ static long sys_spawn(uint64_t uname, uint64_t uargv, uint64_t uargc) {
  * register, and Unix vectors terminate with NULL anyway). */
 static long sys_exec(struct pt_regs *r, uint64_t upath, uint64_t uargv, uint64_t uenvp) {
     struct task *cur = current_task();
+    /* v1.2.0: exec replaces the (mm, page_dir) pair -- a thread whose
+     * address space is shared with siblings may not exec (the siblings'
+     * CR3 would dangle). POSIX kills the other threads here; the teaching
+     * kernel refuses instead and the caller sees -1. */
+    if (cur->mm && cur->mm->refs > 1) return -1;
     char path[80];
     if (copy_str_from_user(cur, path, upath, sizeof(path)) != 0) return -1;
     if (!path[0]) return -1;
@@ -275,6 +280,58 @@ static long sys_kill(int pid, int sig) {
     if (!t) return -1;
     if (cur->uid != 0 && t->uid != cur->uid) return -1;
     return signal_send(t, sig);
+}
+
+/* v1.2.0 clone(2): threads. rdi = flags (CLONE_VM required, any other bit
+ * rejected -- the teaching scope), rsi = usp (stack the ulib trampoline
+ * prepared; the child iretqs straight onto it). Returns the child's tid in
+ * the parent; the child's own frame carries rax = 0. The 16 bytes the
+ * trampoline touches ([usp]=fn, [usp+8]=arg, the call's push at usp+8)
+ * must be writable now; fn's own frames fault in below like any stack. */
+static long sys_clone(struct pt_regs *r) {
+    struct task *cur = current_task();
+    if (!cur || !cur->is_user) return -1;
+    if ((r->rdi & ~(uint64_t)CLONE_VM) != 0 || !(r->rdi & CLONE_VM)) return -1;
+    if (!r->rsi || !user_span_ok(cur, r->rsi, 16, 1)) return -1;
+    struct task *t = task_clone(r, r->rdi, r->rsi);
+    return t ? t->pid : -1;
+}
+
+/* v1.2.0 setpgid(2), teaching scope: a task may join/make a group for
+ * itself or for one of its own children; the new group is either the
+ * target's own pid (new group) or an existing live group. The exec'd-child
+ * EACCES rule is not tracked -- every osh child execs immediately, and the
+ * double-call (parent + child both setpgid) closes the classic race. */
+static long sys_setpgid(uint64_t upid, uint64_t upgid) {
+    struct task *cur = current_task();
+    if (!cur || !cur->is_user) return -1;
+    int pid = (int)(int32_t)upid, pgid = (int)(int32_t)upgid;
+    if (pid < 0 || pgid < 0) return -1;
+
+    irq_flags_t f;
+    spin_lock_irqsave(&sched_lock, &f);
+    struct task *target = pid == 0 ? cur : task_find(pid);
+    if (!target || !target->is_user ||
+        (target != cur && target->ppid != cur->pid)) {
+        spin_unlock_irqrestore(&sched_lock, f);
+        return -1;
+    }
+    int npg = pgid ? pgid : target->pid;
+    if (npg != target->pid) {
+        struct task *g = task_find(npg);        /* join an existing group */
+        if (!g || g->pgid != npg) {
+            spin_unlock_irqrestore(&sched_lock, f);
+            return -1;
+        }
+    }
+    target->pgid = npg;
+    spin_unlock_irqrestore(&sched_lock, f);
+    return 0;
+}
+
+static long sys_getpgrp(void) {
+    struct task *cur = current_task();
+    return cur ? cur->pgid : -1;
 }
 
 static long sys_sigaction(int sig, uint64_t handler, uint64_t restorer) {
@@ -482,6 +539,16 @@ static long sys_ioctl(uint64_t fd, uint64_t req, uint64_t uflags) {
         console_clear();
         return 0;
     }
+    /* v1.2.0: the console's foreground process group -- osh registers the
+     * running job's group here; the keyboard input layer routes Ctrl-C to
+     * it as SIGINT (and only to it). TCGETPGRP answers through the return
+     * value; TCSETPGRP carries the pgid in the third argument. */
+    if (req == TCSETPGRP) {
+        if ((int64_t)uflags <= 0) return -1;
+        keyboard_set_fg_pgid((int)(int32_t)uflags);
+        return 0;
+    }
+    if (req == TCGETPGRP) return keyboard_fg_pgid();
     if (!user_span_ok(cur, uflags, 2, 1)) return -1;
     uint16_t *fl = (uint16_t *)(uintptr_t)uflags;
     if (req == TCGETS) {
@@ -516,7 +583,7 @@ static long sys_dup2(uint64_t oldfd, uint64_t newfd) {
     if (oldfd == newfd) return (long)newfd;
     if (cur->fd[newfd]) fd_close((int)newfd);
     cur->fd[newfd] = f;
-    f->f_count++;
+    __atomic_fetch_add(&f->f_count, 1, __ATOMIC_ACQ_REL);
     return (long)newfd;
 }
 
@@ -820,6 +887,15 @@ void syscall_dispatch(struct pt_regs *r) {
         break;
     case SYS_DATETIME:
         ret = sys_datetime(r->rdi, r->rsi);
+        break;
+    case SYS_CLONE:                               /* v1.2.0 */
+        ret = sys_clone(r);
+        break;
+    case SYS_SETPGID:
+        ret = sys_setpgid(r->rdi, r->rsi);
+        break;
+    case SYS_GETPGRP:
+        ret = sys_getpgrp();
         break;
     case SYS_POWEROFF:
         kprintf("poweroff: requested by pid %d (%s)\n",

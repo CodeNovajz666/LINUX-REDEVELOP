@@ -137,6 +137,39 @@ int uexecve(const char *path, const char *const argv[], const char *const envp[]
 #define UKEY_HOME   0x84
 #define UKEY_END    0x85
 
+/* ---- v1.2.0: threads & job control ---- */
+
+#define U_CLONE_VM  0x00000100u      /* matches the kernel's CLONE_VM */
+
+/* clone(2): CLONE_VM threads. Returns the child's tid in the parent, 0 in
+ * the child (which resumes on `usp`, where pthread_create laid fn/arg),
+ * -1 on error. Direct callers must know the trampoline protocol --
+ * prefer pthread_create. */
+int uclone(unsigned flags, void *usp);
+
+/* process groups: fork/clone/spawn inherit; setpgid moves. pid 0 = self,
+ * pgid 0 = "make the target a group leader". */
+int usetpgid(int pid, int pgid);
+int ugetpgrp(void);
+
+/* console foreground group (ioctl TCSETPGRP/TCGETPGRP over fd 0): the
+ * keyboard input layer routes Ctrl-C to this group as SIGINT */
+int utcsetpgrp(int pgid);
+int utcgetpgrp(void);
+
+/* minimal pthread -- create/join/exit/mutex, ulib-only (the "join" is
+ * waitpid: a thread is a task; the mutex is a shared-memory spinlock with
+ * a yield backoff, so a preempted holder never burns the quantum). */
+typedef int pthread_t;
+typedef struct { volatile unsigned char locked; } pthread_mutex_t;
+#define PTHREAD_MUTEX_INITIALIZER { 0 }
+
+int pthread_create(pthread_t *tid, void *(*fn)(void *), void *arg);
+int pthread_join(pthread_t tid, int *exit_code);   /* exit_code may be 0 */
+void pthread_exit(int code) __attribute__((noreturn));
+int pthread_mutex_lock(pthread_mutex_t *m);
+int pthread_mutex_unlock(pthread_mutex_t *m);
+
 /* history callback for ureadline_ex: return the line `back` entries before
  * the newest one entered (back = 1 -> most recent), or NULL when the caller
  * is browsing past its oldest record */

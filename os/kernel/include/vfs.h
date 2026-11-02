@@ -66,6 +66,9 @@ struct file;
 struct inode;
 struct task;
 
+/* directory-enumeration callback (vfs_dir_foreach): return nonzero to stop */
+typedef int (*vfs_dir_cb)(void *ctx, const char *name);
+
 struct file_operations {
     int (*read)(struct file *f, void *buf, uint32_t len);
     int (*write)(struct file *f, const void *buf, uint32_t len);
@@ -80,6 +83,10 @@ struct inode_operations {
     int (*truncate)(struct inode *ino);
     /* enumerate a directory by index: 0 = entry copied out, 1 = end, -1 = err */
     int (*readdir)(struct inode *dir, int idx, char *name_out, size_t name_max);
+    /* v1.2.x: single-pass enumeration (0 = all delivered or cb stopped,
+     * -1 = error). Without it, a full listing through readdir(idx) costs
+     * one directory re-scan per entry -- O(entries²) on FAT. */
+    int (*foreach)(struct inode *dir, vfs_dir_cb cb, void *ctx);
     /* v1.1.2: rename a name inside one filesystem instance (the op is
      * resolved on olddir; implementations must reject a newdir belonging
      * to another instance). Directories may move within their parent. */
@@ -157,6 +164,11 @@ int vfs_rename(const char *oldpath, const char *newpath);
 int vfs_rmdir(const char *path);
 /* enumerate a directory by index: 0 = entry copied out, 1 = end, -1 = err */
 int vfs_readdir(const char *path, int idx, char *name_out, size_t name_max);
+/* v1.2.x: stream every entry of `path` through cb in readdir order (mounts
+ * attached to the directory come first). One path walk + one directory scan
+ * total. cb returning nonzero stops early. 0 = ok (all delivered or stopped),
+ * -1 = not a listable directory / I/O error. */
+int vfs_dir_foreach(const char *path, vfs_dir_cb cb, void *ctx);
 
 /* ---- per-task fd table (fs/vfs.c, operates on current task) ---- */
 int fd_alloc(void);                         /* lowest free fd or -1 */

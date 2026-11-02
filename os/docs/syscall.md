@@ -1,4 +1,4 @@
-# Novix 系统调用参考（v1.1.8）
+# Novix 系统调用参考（v1.2.0）
 
 对标原内核模块的 `docs/api.md`。编号在 `kernel/include/syscall.h`
 定义、`kernel/syscall.c syscall_dispatch` 分发、`user/ulib.c` 封装。
@@ -39,7 +39,7 @@
 | 30 | SETGID | gid | 0 | 同 SETUID 规则 |
 | 31 | CHDIR | path | 0 | 目录需要 X 位 |
 | 32 | GETCWD | buf / len | strlen | len≥2 |
-| 33 | IOCTL | fd(0-2) / req / u16* flags | 0 | TCGETS=0 TCSETS=1（位 0x8=ECHO）；v1.1.0 增 TCCLEAR=2（清屏回位，无 flags） |
+| 33 | IOCTL | fd(0-2) / req / u16* flags | 0 | TCGETS=0 TCSETS=1（位 0x8=ECHO）；v1.1.0 增 TCCLEAR=2（清屏回位）；v1.2.0 增 TCSETPGRP=3（rdx=pgid，注册控制台前台组）/ TCGETPGRP=4（返回前台 pgid） |
 | 34 | POWEROFF | — | — | isa-debug-exit 退出 QEMU |
 | 35 | MKDIR | path | 0 | 父目录需要 W+X |
 | 36 | CHOWN | path / uid / gid | 0 | 仅 root；FAT 下只改 inode 缓存 |
@@ -56,6 +56,9 @@
 | 47 | SETREUID | ruid / euid | 0 | v1.1.7：-1 保留原值；root 任意，凡人仅可取自身 (ruid,euid) 内的值——可降可回不可升 |
 | 48 | SETREGID | rgid / egid | 0 | v1.1.7：rgid 拆分后的组版本，同上规则 |
 | 49 | ACCESS | path / mode | 0/-1 | v1.1.7：以真实 (ruid,rgid) 做权限判定（SUID 程序问"调用者能不能"就用它）；mode 为 R=4/W=2/X=1 位组合 |
+| 50 | CLONE | flags / usp | tid | v1.2.0：线程。flags 必须恰为 CLONE_VM(0x100)，usp 为 ulib 跳板备好的新栈顶；父得 tid，子帧 rax=0。mm 引用共享（struct mm.refs）；共享 mm 上 exec 被拒；信号处理表为 clone 时快照（POSIX 共享表的偏差，见 DESIGN） |
+| 51 | SETPGID | pid(0=自身) / pgid(0=自立组) | 0 | v1.2.0：仅可设自己或自己的孩子；新组须为目标自身 pid 或已存在的组（教学版无会话概念，不做 exec 后 EACCES） |
+| 52 | GETPGRP | — | pgid | v1.2.0：调用者的进程组——Ctrl-C 路由的钥匙 |
 
 ## ABI 约定
 

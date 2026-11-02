@@ -51,9 +51,15 @@
 #define SYS_SETREUID    47
 #define SYS_SETREGID    48
 #define SYS_ACCESS      49
+/* v1.2.0 -- threads & job control */
+#define SYS_CLONE       50
+#define SYS_SETPGID     51
+#define SYS_GETPGRP     52
 #define TCGETS          0
 #define TCSETS          1
 #define TCCLEAR         2
+#define TCSETPGRP       3
+#define TCGETPGRP       4
 
 /* pipe read/write "blocking, retry" marker (see kernel fs/pipe.c) */
 #define EAGAIN_RETRY (-2L)
@@ -319,6 +325,90 @@ int uexec_argv(const char *path, const char *const argv[], int argc) {
 /* explicit environment (osh's exported-variable table) */
 int uexecve(const char *path, const char *const argv[], const char *const envp[]) {
     return (int)_sys3(SYS_EXEC, (long)path, (long)argv, (long)envp);
+}
+
+/* ---- v1.2.0: threads & job control ----
+ *
+ * clone trampoline: the kernel copies the syscall frame, sets the child's
+ * rsp to `usp` and rax to 0, so BOTH parent and child resume at the
+ * instruction after `int $0x80` -- the parent on its own stack (rax = tid,
+ * `ret`), the child on the new stack (rax = 0), where pthread_create has
+ * laid [usp] = fn, [usp+8] = arg. The child pops them and calls fn; a
+ * return falls straight into exit(0). fn entry sees rsp = usp+8, so the
+ * SysV "rsp ≡ 8 (mod 16)" rule holds when usp is 16-aligned. */
+__asm__(
+    ".globl __u_clone_trampoline\n"
+    "__u_clone_trampoline:\n"
+    "   mov $50, %eax\n"        /* SYS_CLONE: rdi = flags, rsi = usp */
+    "   int $0x80\n"
+    "   test %eax, %eax\n"
+    "   jnz 1f\n"               /* parent (or error): rax = tid / -1 */
+    "   pop %rax\n"             /* child: fn */
+    "   pop %rdi\n"             /*        arg */
+    "   call *%rax\n"
+    "   mov %eax, %edi\n"       /* return == pthread_exit(return value) */
+    "   mov $1, %eax\n"         /* SYS_EXIT */
+    "   int $0x80\n"
+    "   hlt\n"
+    "1: ret\n"
+);
+extern int __u_clone_trampoline(unsigned flags, void *usp);
+
+int uclone(unsigned flags, void *usp) {
+    return __u_clone_trampoline(flags, usp);
+}
+
+int usetpgid(int pid, int pgid) { return (int)_sys3(SYS_SETPGID, pid, pgid, 0); }
+int ugetpgrp(void) { return (int)_sys3(SYS_GETPGRP, 0, 0, 0); }
+/* console foreground group: the fd-0 ioctl pair (requests 3/4) */
+int utcsetpgrp(int pgid) { return (int)_sys3(SYS_IOCTL, 0, TCSETPGRP, pgid); }
+int utcgetpgrp(void) { return (int)_sys3(SYS_IOCTL, 0, TCGETPGRP, 0); }
+
+/* pthread_create: 32 KiB of fresh anonymous stack from the shared mmap
+ * region (every thread of a process sees it), fn/arg laid at the top, then
+ * the clone. The stack is never unmapped on join -- waitpid reaps the task,
+ * the VAs are reclaimed with the process (documented teaching scope). */
+int pthread_create(pthread_t *tid, void *(*fn)(void *), void *arg) {
+    if (!tid || !fn) return -1;
+    unsigned long sz = 8 * 4096UL;
+    unsigned long base = (unsigned long)ummap(sz);
+    if (!base) return -1;
+    unsigned long usp = base + sz - 16;          /* 16-aligned */
+    ((unsigned long *)usp)[0] = (unsigned long)fn;
+    ((unsigned long *)usp)[1] = (unsigned long)arg;
+    int t = uclone(U_CLONE_VM, (void *)usp);
+    if (t < 0) { umunmap((void *)base, sz); return -1; }
+    *tid = t;
+    return 0;
+}
+
+/* a thread is a task: join is a plain blocking waitpid on the tid, and the
+ * status is whatever the thread passed to pthread_exit (128+signo if a
+ * default-action signal killed it) */
+int pthread_join(pthread_t tid, int *exit_code) {
+    int st = 0;
+    if (_sys3(SYS_WAITPID, tid, 0, (long)&st) < 0) return -1;
+    if (exit_code) *exit_code = st;
+    return 0;
+}
+
+void pthread_exit(int code) { uexit(code); }
+
+/* shared-memory spinlock with a yield backoff: under contention the loser
+ * yields its quantum instead of burning CPU, so a preempted holder always
+ * makes progress and the scheduler stays the arbiter. No kernel support
+ * (no futex) -- the one-lock-at-a-time discipline is the caller's job. */
+int pthread_mutex_lock(pthread_mutex_t *m) {
+    if (!m) return -1;
+    while (__atomic_test_and_set(&m->locked, __ATOMIC_ACQUIRE))
+        uyield();
+    return 0;
+}
+
+int pthread_mutex_unlock(pthread_mutex_t *m) {
+    if (!m) return -1;
+    __atomic_store_n(&m->locked, 0, __ATOMIC_RELEASE);
+    return 0;
 }
 
 /* ---- v1.1.1 line editor ----

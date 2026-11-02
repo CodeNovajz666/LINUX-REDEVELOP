@@ -210,7 +210,7 @@ LOGIN_EXPECT = [
     ('osh procfs cpuinfo',   'ncpu 2'),
     ('osh procfs version',   'x86_64 -- a real OS'),
     ('osh date local',       'local (unix'),    # the RTC line, kernel-formatted
-    ('osh uname',            'Novix 1.1.8'),    # uname and the banners agree
+    ('osh uname',            'Novix 1.2.0'),    # uname and the banners agree
                                                 # on the version again (v1.1.0)
     # v1.1.1: the history ring numbers entries chronologically and retires
     # the oldest past 32 -- the listing shows the raw (pre-expansion) lines
@@ -219,6 +219,15 @@ LOGIN_EXPECT = [
     # v1.1.1 editor: Ctrl-U ran `date` instead of the cancelled line (the
     # second RTC line of this session)
     ('osh ctrl-u clear',     ' local (unix '),
+    # v1.2.0: pthreads really share the address space (exact counter under
+    # a mutex) and really ran on two cpus at once (combined mask)
+    ('osh thread counter',   'shared counter 20000 (want 20000)'),
+    ('osh thread cross-cpu', 'cross-cpu evidence OK'),
+    # v1.2.0: Ctrl-C kills ONLY the foreground job -- 130 = 128+SIGINT(2)
+    # is the reaped foreground status, and the background sleep (30 s, a
+    # few seconds old) still lists as a live job afterwards
+    ('osh ctrl-c kills fg',  'rc=130'),
+    ('osh ctrl-c bg alive',  '[1] sleep 30 pid'),
 ]
 LOGIN_COUNT_EXPECT = [
     # register's own retype prompt, then passwd's roundtrip one
@@ -232,7 +241,7 @@ LOGIN_COUNT_EXPECT = [
     # v1.0.0: 'cat /etc/motd | grep Novix > /tmp/x' + cat -- the needle
     # hits the boot banner (1), motd at each of the two logins (2) and the
     # redirected copy (1)
-    ('osh motd pipeline', 'Novix 1.1.8 -- a real OS', 4),
+    ('osh motd pipeline', 'Novix 1.2.0 -- a real OS', 4),
     # variable + redirect + pipe + grep + cat: two cats of derived files;
     # the echoed command lines only ever contain '$p-pipe', never the value
     ('osh var+pipe+redirect', 'zz-pipe', 2),
@@ -639,6 +648,20 @@ send_typed('rm /tmp/hh.txt', wait=0.5)
 send_typed('cat /proc/meminfo', wait=0.5)
 send_typed('cat /proc/cpuinfo', wait=0.5)
 send_typed('cat /proc/version', wait=0.5)
+# ---- v1.2.0: threads & job control ----
+# pthreads: two clone(CLONE_VM) threads, one mutex-guarded counter, one
+# combined cross-cpu mask (the program self-reports and exits 0/1)
+send_typed('thread_hello', wait=10.0)
+wait_for(out, b'cross-cpu evidence OK')
+# Ctrl-C: the foreground job dies (status 130), the background job and the
+# prompt itself survive -- the kernel input layer SIGINTs the job's group
+send_typed('sleep 30 &', wait=0.8)
+wait_for(out, b'[1] pid ')
+send_typed('sleep 30', wait=0.8)                # foreground holds the console
+send('\x03', wait=1.2)                          # SIGINT -> the job's group
+send_typed('echo rc=$?', wait=0.8)              # 130 = 128+SIGINT(2)
+send_typed('sleep 2', wait=3.0)                 # the prompt is usable again
+send_typed('jobs', wait=0.8)                    # the background job survived
 send_typed('cd /home/ktest', wait=0.6)       # home again for passwd/logout
 # passwd roundtrip: ktest execs the SUID binary and changes its own password
 send_typed('passwd')

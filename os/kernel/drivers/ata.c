@@ -39,6 +39,22 @@ static bool disk_present;
 static uint32_t nsectors;
 static spinlock_t ata_lock = SPINLOCK_INIT;
 
+/* one string op per sector instead of 256 single-word port I/Os (each
+ * inb/outw costs a slow bus cycle; rep amortizes the port decode) */
+static inline void ata_insw(uint16_t port, void *buf, uint32_t words) {
+    __asm__ volatile("rep insw"
+                     : "+D"(buf), "+c"(words)
+                     : "d"(port)
+                     : "memory");
+}
+
+static inline void ata_outsw(uint16_t port, const void *buf, uint32_t words) {
+    __asm__ volatile("rep outsw"
+                     :
+                     : "d"(port), "S"(buf), "c"(words)
+                     : "memory");
+}
+
 /* wait for BSY to clear; then require DRQ unless idle_ok */
 static int ata_wait(bool need_drq) {
     for (int i = 0; i < 200000; i++) {
@@ -129,8 +145,7 @@ int ata_read_sectors(uint32_t lba, uint32_t count, void *buf) {
         uint16_t *out = (uint16_t *)buf;
         for (uint32_t s = 0; s < count; s++) {
             if (ata_wait(true) != 0) goto out;
-            for (int i = 0; i < ATA_SECTOR_SIZE / 2; i++)
-                out[i] = (uint16_t)inw(ATA_PORT_DATA);
+            ata_insw(ATA_PORT_DATA, out, ATA_SECTOR_SIZE / 2);
             out += ATA_SECTOR_SIZE / 2;
         }
         rc = 0;
@@ -158,8 +173,7 @@ int ata_write_sectors(uint32_t lba, uint32_t count, const void *buf) {
         const uint16_t *in = (const uint16_t *)buf;
         for (uint32_t s = 0; s < count; s++) {
             if (ata_wait(true) != 0) goto out;
-            for (int i = 0; i < ATA_SECTOR_SIZE / 2; i++)
-                outw(ATA_PORT_DATA, in[i]);
+            ata_outsw(ATA_PORT_DATA, in, ATA_SECTOR_SIZE / 2);
             in += ATA_SECTOR_SIZE / 2;
         }
         /* flush through to the medium: this is what makes "poweroff right

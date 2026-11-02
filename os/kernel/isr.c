@@ -125,10 +125,31 @@ uint64_t isr_handler(struct pt_regs *r) {
         if (n == 14 && cur && cur->is_user) {
             uint64_t cr2;
             __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
-            if ((r->err_code & 0x3) == 0x3 &&               /* write+present: COW */
-                paging_cow_fault(cur->page_dir, cr2) == 0) {
-                g_mmstat.fault_cow++;                       /* resolved: resume */
-                goto done;
+            if ((r->err_code & 0x3) == 0x3 && cur->mm) {    /* write+present: COW */
+                /* v1.2.0: the COW resolution rewrites page tables that a
+                 * sibling thread may be faulting into on another CPU -- hold
+                 * the shared mm's lock around it (order: mm.lock > cow_lock) */
+                irq_flags_t mf;
+                spin_lock_irqsave(&cur->mm->lock, &mf);
+                int rc = paging_cow_fault(cur->page_dir, cr2);
+                bool stale_retry = false;
+                if (rc != 0) {
+                    /* a sibling resolved this COW page a moment ago: our TLB
+                     * still holds the old read-only translation while the
+                     * (shared) PTE is already present+rw -- invalidate and
+                     * resume instead of killing an innocent thread */
+                    uint64_t pte = paging_pte_read(cur->page_dir, cr2);
+                    if ((pte & PTE_P) && (pte & PTE_RW)) {
+                        rc = 0;
+                        stale_retry = true;
+                    }
+                }
+                spin_unlock_irqrestore(&cur->mm->lock, mf);
+                if (rc == 0) {
+                    __asm__ volatile("invlpg (%0)" :: "r"(cr2) : "memory");
+                    if (!stale_retry) g_mmstat.fault_cow++;
+                    goto done;                              /* resolved: resume */
+                }
             }
             if ((r->err_code & 0x1) == 0 &&                 /* non-present: demand */
                 mm_fault(cur, cr2, (int)(r->err_code & 0x2)) == 0)

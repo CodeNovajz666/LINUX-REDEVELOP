@@ -15,6 +15,11 @@ static uint64_t ram_top;
 static uint32_t bitmap[RAM_TOP_MAX / PAGE_SIZE / 32];
 static uint8_t refcount[RAM_TOP_MAX / PAGE_SIZE];
 static uint32_t free_count, total_count;
+/* next-fit scan cursor: alloc starts at the word after the last hit, so a
+ * dense head (initrd, kernel tables) stops being re-scanned on every call.
+ * Bits past total_count in the last word stay SET (pmm_init only clears
+ * [0, total_count)), so the ctz below can never land on them. */
+static uint32_t scan_hint;
 
 /* v0.7.0: cli/sti only fenced off THIS CPU's interrupts; any other CPU
  * could race the bitmap scan. Leaf lock in the global order (spinlock.h):
@@ -39,17 +44,20 @@ void pmm_init(uint64_t top) {
 
 uint64_t pmm_alloc(void) {
     irq_flags_t f; spin_lock_irqsave(&pmm_lock, &f);
-    for (uint32_t i = 0; i < total_count; i++) {
-        uint32_t w = bitmap[i >> 5];
-        if (w == 0xFFFFFFFFu) { i += 31; continue; }
-        uint32_t b = i & 31;
-        if (!(w & (1u << b))) {
-            bitmap[i >> 5] |= 1u << b;
-            refcount[i] = 0;                    /* exclusive owner */
-            free_count--;
-            spin_unlock_irqrestore(&pmm_lock, f);
-            return PMM_START + (uint64_t)i * PAGE_SIZE;
-        }
+    uint32_t words = (total_count + 31) / 32;
+    uint32_t wi = scan_hint;
+    for (uint32_t n = 0; n < words; n++, wi++) {
+        if (wi >= words) wi = 0;                /* wrap: next-fit over the bitmap */
+        uint32_t w = bitmap[wi];
+        if (w == 0xFFFFFFFFu) continue;
+        uint32_t b = __builtin_ctz(~w);         /* first free bit, one op */
+        uint32_t idx = (wi << 5) | b;
+        bitmap[wi] = w | (1u << b);
+        refcount[idx] = 0;                      /* exclusive owner */
+        free_count--;
+        scan_hint = wi;                         /* this word may still have room */
+        spin_unlock_irqrestore(&pmm_lock, f);
+        return PMM_START + (uint64_t)idx * PAGE_SIZE;
     }
     spin_unlock_irqrestore(&pmm_lock, f);
     return 0;

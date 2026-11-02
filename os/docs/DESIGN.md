@@ -7,7 +7,7 @@ Novix 的灵感来自 **Linux 的 PCB（进程控制块）进程管理模型**�
 不再模拟进程管理，而是真正引导、真正切换 CPU 上下文、真正管理页表、
 真正从 ring0 进入 ring3 运行用户程序、真正在多个核心上并行调度。
 
-本文描述 v1.1.8 的架构现状。跨版本"定死不动"的契约
+本文描述 v1.2.0 的架构现状。跨版本"定死不动"的契约
 （地址空间分区、信号编号、syscall ABI、SMP 不变量）见仓库根目录
 [DESIGN.md](../../DESIGN.md)，版本计划见 [ROADMAP.md](../../ROADMAP.md)。
 
@@ -24,8 +24,8 @@ Novix 的灵感来自 **Linux 的 PCB（进程控制块）进程管理模型**�
 - 真实内存管理：物理页位图 + 引用计数、内核堆、四级页表
   （**Rust 模块** paging.rs）、按需分页、COW fork、交换
   （kswapd 时钟算法）、匿名 mmap
-- ring3 用户态：int 0x80 系统调用（49 个，含 dup2/rename/rmdir/
-  setreuid/access）、ELF64 加载器、
+- ring3 用户态：int 0x80 系统调用（52 个，含 dup2/rename/rmdir/
+  setreuid/access/clone/setpgid）、ELF64 加载器、
   每进程独立地址空间、sbrk 堆 + 用户态 malloc/free、信号
   （捕获/屏蔽/sigreturn 蹦床）、管道、argv/envp 传递
   （main(argc,argv) + environ）
@@ -48,11 +48,11 @@ Novix 的灵感来自 **Linux 的 PCB（进程控制块）进程管理模型**�
   交互 shell（Tab 补全 / 命令历史 / 行编辑 / Ctrl+C）
 - **v1.1.x 交互与安全补齐**：行编辑、rename/rmdir、PBKDF2、
   守护栈、environ、文本工具箱、身份四元组、procfs（见 §4.13）
-- C + Rust 双语言内核；内建自测试套件（无断言不发布，51 项），
+- C + Rust 双语言内核；内建自测试套件（无断言不发布，52 项），
   串口日志可用于 CI
 
-**非目标（1.2+）**
-- 网络、线程、文件回写 mmap、fsck/日志、ATA 中断模式
+**非目标（1.3+；线程已在 1.2.0 兑现）**
+- 网络、文件回写 mmap、fsck/日志、ATA 中断模式
   （以上均在 ROADMAP）
 
 ## 2. 从模块到 OS 的映射
@@ -68,8 +68,8 @@ Novix 的灵感来自 **Linux 的 PCB（进程控制块）进程管理模型**�
 | signal.c 打印日志 | signal.c | 真信号：生成/投递/sigreturn 蹦床三段式（v0.5.0）✅ |
 | security.c 明文口令 | user/（login/passwd/register/etc.c）+ sha256.c | 真登录：PBKDF2-HMAC-SHA256 /etc/shadow、getty→login→osh、SUID（v0.9.0）+ 首启注册向导（v1.0.0）✅ |
 | smp.c 空壳 | smp/（mp.c + apic.c + smp.c + trampoline.S）| 真多核：AP 启动/自旋锁/IPI/TLB shootdown（v0.7.0）✅ |
-| procman ioctl | syscall.c int 0x80 | 真正跨越特权级，49 个编号；原来的假 /proc/procman 由真 procfs（v1.1.8）接棒 |
-| comprehensive_test 无断言 | ktest.c | 全部带断言 + CI 退出码，51 项 |
+| procman ioctl | syscall.c int 0x80 | 真正跨越特权级，52 个编号；原来的假 /proc/procman 由真 procfs（v1.1.8）接棒 |
+| comprehensive_test 无断言 | ktest.c | 全部带断言 + CI 退出码，52 项 |
 
 ## 3. 架构
 
@@ -103,21 +103,21 @@ QEMU (x86_64, -smp 2, -m 128M, IDE 硬盘 + RTC localtime)
       ├─ signal.c: 生成/投递（两投递点）/sigreturn 蹦床/sigprocmask
       ├─ isr.c: 异常分流（ring3 杀进程 128+signo / ring0 panic）、
       │   IPI 处理、dump_regs（CR3/CR2/LAPIC id/GS base 分诊行）
-      ├─ syscall.c: int 0x80 → 49 个编号（exit..access）
+      ├─ syscall.c: int 0x80 → 52 个编号（exit..getpgrp）
       ├─ elf.c: ELF64 登记式加载（FILE VMA 惰性映射）+ argv/envp 压栈
-      ├─ ktest.c: 51 项自测（3 early + 21 mt + 7 fs + 3 vm + 4 smp
+      ├─ ktest.c: 52 项自测（3 early + 21 mt + 7 fs + 4 vm + 4 smp
       │   + 4 disk + 5 uid + 4 osh）
       └─ shell.c: 串口/键盘交互 shell（20 命令 + Tab 补全 + 历史，
           v0.9.0 起 console=debug 调试后门；v1.0.0 起默认路径是
           内核 pid 1 监督用户态 /bin/init）
-用户程序 os/user/（50 个）: crt0 + ulib(malloc/printf/syscall 包装)
+用户程序 os/user/（52 个）: crt0 + ulib(malloc/printf/syscall 包装)
   + sha256(用户态孪生) + etc(登录世界共用 /etc 解析)，
   hello, spawner, fault_div, fault_segv, stackovf, filetest, forker,
   forkacct, execer, malloctest, sigtest, masktest, pipetest, memhog,
   getty, login, osh, id, whoami, who, passwd, useradd, register,
   cat, touch, uidtest, euidtest, shadowtest, echo, grep, init, iotest,
   ls, pwd, rm, cp, mv, mkdir, rmdir, date, sleep, uname, clear, env,
-  wc, head, tail, which, find, cut
+  wc, head, tail, which, find, cut, thread_hello, threadmix
 构建期: tools/mkramfs.py 将用户 ELF64 打包为 NRFS initrd 嵌入内核，
         启动时 ramfs_mount_initrd() 解包到 /bin/；tools/mkfatimg.py
         生成 64 MiB FAT32 镜像（MBR + LBA 2048 分区 + LFN 项）作
@@ -184,7 +184,10 @@ cs=0x1B|3/ss=0x23|3+用户栈。
 - TLB 语义（页目录单加载不变量）：用户页目录至多同时加载在一核
   （on_cpu 所有权的推论），任务切换必重载 CR3 全量冲刷——改写
   **当前任务** PTE（COW/munmap/缺页）本地 invlpg 即够；唯 kswapd
-  改写**他人** PTE 时广播 shootdown IPI（对端按 CR3 匹配）
+  改写**他人** PTE 时广播 shootdown IPI（对端按 CR3 匹配）。
+  shootdown 邮箱是 (pd, [lo,hi)) 区间（v1.2.0 优化轮起）——
+  munmap/brk 收缩整段一次广播，接收端宽范围（>32 页）直接全量
+  冲刷；fork 的 COW 复制也改为收尾一次 CR3 重载（原逐页 invlpg）
 
 ### 4.5 SMP 启动（v0.7.0）
 - `mp.c` 解析 MP Table（`_MP_` 浮动指针三段扫描 + PCMP 表 CPU
@@ -207,7 +210,7 @@ cs=0x1B|3/ss=0x23|3+用户栈。
 - 两路汇入同一环形队列；`keyboard_getchar()` 轮询时顺带排水串口
   RX（锁保护），即使中断丢失也能收到字符——CI 场景的关键可靠性
 - 行编辑：Backspace（0x08/0x7F 双收）、Tab 补全（命令表 +
-  `spawn` 参数经 vfs_readdir 实时枚举 /bin，多匹配 bash 式列出）、
+  `spawn` 参数经 vfs_dir_foreach 单遍枚举 /bin，多匹配 bash 式列出）、
   ↑/↓ 历史（16 条环形，串口 ESC[A/B 与 PS/2 0x48/0x50 统一翻译）、
   Ctrl+C → SIGINT 给前台任务
 
@@ -215,7 +218,10 @@ cs=0x1B|3/ss=0x23|3+用户栈。
 Linux VFS 的教学级缩影，核心是两类操作表的分离：
 
 - **`inode_operations`（目录树形）**：`lookup/create/mkdir/unlink/
-  truncate/readdir`——路径解析（namei.c）只通过它逐级下钻
+  truncate/readdir/foreach`——路径解析（namei.c）只通过它逐级下钻；
+  foreach（v1.2.0）是单遍目录枚举，`vfs_dir_foreach` 一次解析 +
+  一次扫描流式交付全部表项（readdir(idx) 逐项取会 O(N²) 重扫；
+  FAT 实现为锁内快照 + 锁外交付——ls 的回调会 stat 再进 fat_lock）
 - **`file_operations`（打开后行为）**：`read/write/close`——设备、
   普通文件与管道在此统一（"/dev/console 是一个文件"的最小实现）
 - **ramfs**：节点树 + 数据缓冲住内核堆，扩容走"分配-复制-释放"
@@ -230,11 +236,13 @@ Linux VFS 的教学级缩影，核心是两类操作表的分离：
   爬回父目录，readdir 先列挂载点再列本体（`ls /` 里 dev、tmp 与
   FAT 本体同框），`vfs_unmount` 干净拆除
 - **FAT32**（fat32.c，v0.8.0）：BPB + 全 FAT 扫描定空闲簇（FSInfo
-  只是参考）；`dir_walk` 单遍扫描器统一 lookup/readdir/create/
-  unlink 四路径；LFN 读写（8.3 别名恒大写，`needs_lfn` 须大小写
-  敏感比较）；写 = 簇分配 + FAT 链接 + dirent 追加/尺寸回写，
-  删 = 0xE5（含 LFN 区间）+ 簇链归还；per-instance 锁 + 512B
-  bounce 缓冲；inode 按 (父簇, sname) 键控缓存
+  只是参考）；`dir_walk` 单遍扫描器统一 lookup/readdir/foreach/
+  create/unlink 五路径；LFN 读写（8.3 别名恒大写，`needs_lfn` 须
+  大小写敏感比较）；写 = 簇分配 + FAT 链接 + dirent 追加/尺寸回写
+  ——链尾缓存 (last_clus, chain_len) 使追加 O(1)（v1.2.0，原每次
+  写全链遍历），整簇读写直取直写调用者缓冲、bounce 仅服务部分簇
+  ；删 = 0xE5（含 LFN 区间）+ 簇链归还；fat_lock + per-instance
+  锁；inode 按 (父簇, sname) 键控缓存
 - **根文件系统切换**（kmain.c）：`root=/dev/hd0` 时 FAT32 根取代
   ramfs 根，ramfs 只留 /dev、/tmp 两个目录钉在 FAT 根下；无 FAT
   卷则诚实回退 ramfs
@@ -370,6 +378,28 @@ DESIGN.md §6。
   read 现生成；/proc/{uptime,version,meminfo,cpuinfo}，目录 0555、
   文件 0444，无写路径
 
+### 4.14 线程、作业控制与性能二轮（v1.2.0）
+
+- **clone(2)（50 号）**：CLONE_VM 线程共享引用计数的 (mm, page_dir)
+  对（`struct mm.refs` 原子计数），自有内核栈与 fd 表副本；每地址
+  空间锁 `mm.lock` 串行共享 CR3 上的并发 fault/sbrk/mmap/kswapd；
+  exec 在共享 mm 上拒绝。fork 语义一字未动（完全 COW 复制）
+- **最小 pthread**（ulib）：create/join/exit/mutex 四件，
+  /bin/thread_hello 双线程互斥计数 20000 分毫不差并自证跨核并行
+- **进程组与 Ctrl-C**：setpgid(51)/getpgrp(52)；osh 每个作业一个
+  进程组，前台组经 ioctl TCSETPGRP 注册进键盘输入层，Ctrl-C 在
+  **入队时**拦截并广播 SIGINT（前台作业 rc=130，后台与提示符存活）
+- **销毁单遍**：mm_release 的 swap 槽回收并入页表销毁遍历
+  （paging.rs free_pd 经 `mm_swap_slot_release` 放槽）——原按 VA
+  预扫每页一次四级查表；前提是 unmap 清零 stale swap 标记
+- **收版前性能二轮（2026-11-02）**：lib 宽化（rep movsq/stosq）、
+  目录枚举 foreach 单遍（原 readdir(i) 逐项重扫 O(N²)）、FAT32
+  链尾缓存 O(1) 追加 + 整簇直读直写、fork 单次 CR3 重载、TLB
+  shootdown 范围邮箱、pmm ctz/next-fit、heap O(1) 空闲计数、
+  ATA rep 串指令
+- 契约全文见根目录 DESIGN.md §7（mm 引用计数、每地址空间锁、
+  进程组路由、教学偏差清单）
+
 ## 5. 构建与运行
 - 编译器：zig cc（clang+lld，`-target x86_64-freestanding`，
   `-mno-red-zone`）+ rustc（`x86_64-unknown-none` staticlib，
@@ -377,10 +407,10 @@ DESIGN.md §6。
 - `python build.py` 全量构建；`build.py run` QEMU 交互（默认
   2 CPU）；`build.py test [-smp N]` 无人值守自测（串口日志 +
   isa-debug-exit 退出码，1 = 全过）
-- `python tools/test_shell.py`：交互式 shell 自动化（122 项检查，
+- `python tools/test_shell.py`：交互式 shell 自动化（126 项检查，
   三会话：console=debug 内核 shell 全量回归 54 项 + 首启注册/
-  登录/脚本化/工具箱 66 项 + 注册账户断电存续 2 项，会话跑在
-  2 CPU 上；脚本启动时自行从 build/user 重建零账户镜像）
+  登录/脚本化/工具箱/线程作业控制 70 项 + 注册账户断电存续 2 项，
+  会话跑在 2 CPU 上；脚本启动时自行从 build/user 重建零账户镜像）
 - 用户程序构建为 ELF64 后由 `tools/mkramfs.py` 打包 NRFS initrd
   嵌入内核，启动时解包挂到 `/bin/`；`tools/mkfatimg.py` 同步生成
   64 MiB FAT32 镜像（同一批 /bin + novix.txt 标记文件）挂 IDE
@@ -392,25 +422,27 @@ DESIGN.md §6。
 - 收版硬门槛：`build.py test -smp 2` 与 `-smp 1` 双跑 +
   `test_shell.py` 三者全绿
 
-## 6. 与真实 OS 的差距（v1.1.8）
+## 6. 与真实 OS 的差距（v1.2.0）
 
 Novix 在"机制"意义上是真实 OS：真引导、真抢占、真跨特权级、
 真多核。但与 Linux 等生产级 OS 相比仍有实质差距，如实列出
 （与当初"诚实移除假子系统"同一精神）：
 
-| 维度 | 真实 OS（以 Linux 为参照） | Novix 1.1.8 现状 |
+| 维度 | 真实 OS（以 Linux 为参照） | Novix 1.2.0 现状 |
 |---|---|---|
-| 进程创建 | fork()/exec()/COW、线程 | fork/exec/COW 已落地；**无线程** |
+| 进程创建 | fork()/exec()/COW、线程 | fork/exec/COW **与线程**已落地（v1.2.0：clone(CLONE_VM) 共享引用计数地址空间、每地址空间锁、ulib pthread 四件）；无 CLONE_FILES/SIGHAND 粒度共享 |
 | 文件系统 | VFS + 持久化文件系统 | VFS/ramfs/devfs/procfs/管道/FAT32 持久根（LFN）+ 权限位 + per-task cwd 已落地；rename/rmdir 已有（rmdir 限空目录）、无 fsck、权限不落盘 |
 | 虚拟内存 | 按需分页、COW、交换、mmap、brk、rmap | 前四者 + 32 KiB 守护栈已落地；无反向映射、无文件回写 mmap |
 | IPC 与信号 | 信号、管道、共享内存、socket | 信号+管道已落地；无 shm/socket |
 | 多核与同步 | per-CPU 队列、RCU、可抢占内核 | 单全局就绪队列（教学规模够用）；仅自旋锁 |
 | 设备驱动 | 统一驱动模型，磁盘/网络/USB | VGA、COM1、PS/2、PIT/LAPIC、ATA 磁盘、RTC 已统一注册进 /dev；无网络/USB/GPU |
-| 系统调用 | 300+ | 49 个 |
+| 系统调用 | 300+ | 52 个 |
 | 安全 | 用户/权限/能力/LSM、ASLR | (ruid,euid)/(rgid,egid) + 登录链 + 开箱注册 + VFS 权限位 + SUID + access(2) + PBKDF2 已落地；无能力/LSM/ASLR |
 | 平台 | 64 位、UEFI/ACPI、真实硬件 | 64 位 ✅；仅 QEMU -kernel；poweroff 依赖 isa-debug-exit |
 | 网络 | 完整 TCP/IP 协议栈 | 无 |
 | 时钟 | HPET/RTC 墙钟、时区 | 每核单调 tick + RTC 墙钟（`date` 打本地时间）；无时区机制 |
 
-上述差距即 ROADMAP 的主要来源：1.2 线程与作业控制、1.3-1.4
-网络、2.0 架构演进（真机引导、man 手册等）。
+上述差距即 ROADMAP 的主要来源：1.3-1.4 网络、2.0 架构演进
+（真机引导、man 手册等）。线程与作业控制已在 1.2.0 落地
+（clone(CLONE_VM) + mm 引用计数/每地址空间锁 + pthread 四件 +
+进程组 Ctrl-C 路由，契约见根 DESIGN.md §7）。

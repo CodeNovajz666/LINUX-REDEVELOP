@@ -100,11 +100,12 @@ int vfs_write(struct file *f, const void *buf, uint32_t len) {
 int vfs_close(struct file *f) {
     if (!f) return -1;
     /* fork shares the struct (Unix open-file description semantics: one
-     * shared file offset); the last closer releases it (v0.4.0) */
-    if (f->f_count > 1) {
-        f->f_count--;
+     * shared file offset); the last closer releases it (v0.4.0).
+     * v1.2.0: atomic RMW -- two processes (and now two threads) sharing a
+     * description can close it on different CPUs at the same moment; a
+     * plain check-then-dec double-freed or leaked the struct. */
+    if (__atomic_fetch_sub(&f->f_count, 1, __ATOMIC_ACQ_REL) > 1)
         return 0;
-    }
     if (f->inode && f->inode->f_op && f->inode->f_op->close)
         f->inode->f_op->close(f);
     kfree(f);
@@ -218,6 +219,36 @@ int vfs_readdir(const char *path, int idx, char *name_out, size_t name_max) {
     return ino->i_op->readdir(ino, idx - nm, name_out, name_max);
 }
 
+/* v1.2.x: single-pass directory enumeration. The index form above made
+ * every full listing O(entries^2) -- each call re-resolved the path AND
+ * re-scanned the directory from its first cluster. Here the directory is
+ * resolved once and the fs streams its entries through cb; filesystems
+ * without a foreach op fall back to the index loop (still one path walk). */
+int vfs_dir_foreach(const char *path, vfs_dir_cb cb, void *ctx) {
+    if (!cb) return -1;
+    struct inode *ino = namei(path);
+    if (!ino || (ino->mode & S_IFMT) != S_IFDIR) return -1;
+    /* v0.9.0: enumerating a directory is search permission on it */
+    if (!vfs_permitted(ino, VFS_PERM_X)) return -1;
+
+    int nm = vfs_mount_count(ino);              /* mounts first, as readdir */
+    for (int i = 0; i < nm; i++) {
+        const char *n = vfs_mount_name_at(ino, i);
+        if (n && cb(ctx, n)) return 0;
+    }
+    if (!ino->i_op) return -1;
+    if (ino->i_op->foreach)
+        return ino->i_op->foreach(ino, cb, ctx) < 0 ? -1 : 0;
+    if (!ino->i_op->readdir) return -1;
+    char name[64];
+    for (int i = 0;; i++) {
+        int r = ino->i_op->readdir(ino, i, name, sizeof(name));
+        if (r < 0) return -1;
+        if (r > 0) return 0;                    /* end of directory */
+        if (cb(ctx, name)) return 0;
+    }
+}
+
 /* ---- per-task fd table ---- */
 
 int fd_alloc(void) {
@@ -267,7 +298,7 @@ void vfs_dup_files(struct task *dst, const struct task *src) {
     for (int i = 0; i < TASK_MAX_FD; i++) {
         struct file *f = src->fd[i];
         dst->fd[i] = f;
-        if (f) f->f_count++;
+        if (f) __atomic_fetch_add(&f->f_count, 1, __ATOMIC_ACQ_REL);
     }
 }
 

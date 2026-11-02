@@ -56,7 +56,7 @@ python build.py test -smp 2; python build.py test -smp 1; python tools/test_shel
 | `make shell` | `python tools/test_shell.py` |
 | `make run` | `python build.py run` |
 
-**当前基线（v1.1.8）**：门禁 1 = 51/51，门禁 2 = 51/51，门禁 3 = 122/122。
+**当前基线（v1.2.0）**：门禁 1 = 52/52，门禁 2 = 52/52，门禁 3 = 126/126。
 
 ---
 
@@ -64,8 +64,8 @@ python build.py test -smp 2; python build.py test -smp 1; python tools/test_shel
 
 | 层 | 载体 | 规模 | 覆盖 |
 |----|------|------|------|
-| 一、内核自测 | `kernel/ktest.c`，由 `kmain` 驱动 | 51 项 | 内核机制：内存、调度、COW、信号、管道、VMA/swap、SMP、磁盘、身份、osh 管道、调试报告、用户工具箱 |
-| 二、串口自动化 | `tools/test_shell.py` 驱动 QEMU `-serial stdio` | 122 项 | 端到端：内核 shell 全量回归、首启注册、登录世界、脚本化 shell、osh 调试命令、交互工具箱（v1.1.0）、交互检索与行编辑（v1.1.1）、断电存续 |
+| 一、内核自测 | `kernel/ktest.c`，由 `kmain` 驱动 | 52 项 | 内核机制：内存、调度、COW、信号、管道、VMA/swap、SMP、磁盘、身份、osh 管道、调试报告、用户工具箱 |
+| 二、串口自动化 | `tools/test_shell.py` 驱动 QEMU `-serial stdio` | 126 项 | 端到端：内核 shell 全量回归、首启注册、登录世界、脚本化 shell、osh 调试命令、交互工具箱（v1.1.0）、交互检索与行编辑（v1.1.1）、线程与作业控制（v1.2.0）、断电存续 |
 | 三、辅助校验 | `tools/` 下若干脚本 | 随用随跑 | syscall 表一致性、ELF/GOT 检查、镜像 dump 等 |
 
 三层互补：第一层证明**内核机制**正确（可观测行为，非打印语句），
@@ -86,7 +86,7 @@ python build.py test -smp 1   # 单核回归
 
 - 构建内核后，QEMU 无头运行，串口日志写入 `build/serial.log` 并回显到终端
 - 超时 180s；超时视为失败
-- 通过判据：串口出现 `GATES-OK` 与 `KTEST SUMMARY: 51/51 passed, 0 failed`
+- 通过判据：串口出现 `GATES-OK` 与 `KTEST SUMMARY: 52/52 passed, 0 failed`
 
 **退出码语义**
 
@@ -106,7 +106,7 @@ python build.py test -smp 1   # 单核回归
 | gate | 套件 | 断言要点 |
 |------|------|----------|
 | （early，无字母） | early（3 项） | 在**开中断前**运行：paging 测试会来回切 CR3，抢占 tick 会恢复错目录 |
-| C | ring3 hello | `/bin/hello` 以 ring3 运行、退出码 42、用户任务页**全回收**（此项不计入 51，是 kmain 里的独立检查） |
+| C | ring3 hello | `/bin/hello` 以 ring3 运行、退出码 42、用户任务页**全回收**（此项不计入 52，是 kmain 里的独立检查） |
 | D | multitasking（21 项） | 套件全过 + 页账目零泄漏 |
 | E | filesystem（7 项） | 套件全过 + 页账目零泄漏（fs 套件不 spawn 用户进程，故用 PMM 页为硬通货） |
 | F | vm（3 项） | 页**与** swap 槽零泄漏（水位强制拉高后校验再复原） |
@@ -118,7 +118,7 @@ python build.py test -smp 1   # 单核回归
 `-smp 1` 与 `-smp 2` 双跑的意义：SMP 套件断言随核数自适应，单核跑用于**回归**，
 确保多核协议（`on_cpu` 所有权、TLB shootdown IPI）的修复没有在单核路径引入退化。
 
-### 4.3 51 项明细
+### 4.3 52 项明细
 
 **early（3）** — 开中断前
 
@@ -166,13 +166,14 @@ python build.py test -smp 1   # 单核回归
 | `fd_exhaust` | fd 表耗尽边界 |
 | `devfs_initrd` | /dev 设备节点 + initrd 打包的 /bin |
 
-**vm（3）** — gate F
+**vm（4）** — gate F
 
 | 项 | 验证内容 |
 |----|----------|
 | `demand_file_paging` | FILE 页按需缺页装入 |
 | `mmap_anon` | 匿名 mmap 映射与清零页 |
 | `swap_roundtrip` | 强制水位触发的换出/换回往返（含 TLB shootdown IPI 计数断言） |
+| `thread_fork_mixed` | fork+线程混合后页计数守恒：线程里 fork COW 孪生并收割、互斥计数自检，退出后 `pmm_free_pages` 分页不少（v1.2.0，gate F 扩展） |
 
 **smp（4）** — gate G
 
@@ -233,13 +234,13 @@ python tools/test_shell.py
 
 | 会话 | 启动方式 | 检查数 | 内容 |
 |------|----------|--------|------|
-| 1 | `root=/dev/hd0 interactive console=debug` | 54 | 直接进内核调试 shell，跑 v0.2.0–v1.1.8 全量命令回归 |
-| 2 | 默认启动（零账户镜像） | 66 | getty 发现零账户 → 首启注册向导 → 登录世界 → 脚本化 shell → osh 调试命令 → 文本/文件工具箱 |
+| 1 | `root=/dev/hd0 interactive console=debug` | 54 | 直接进内核调试 shell，跑 v0.2.0–v1.2.0 全量命令回归 |
+| 2 | 默认启动（零账户镜像） | 70 | getty 发现零账户 → 首启注册向导 → 登录世界 → 脚本化 shell → osh 调试命令 → 文本/文件工具箱 → 线程与 Ctrl-C 作业控制（v1.2.0） |
 | 3 | 全新启动 | 2 | 断电后注册账户存续、注册向导**不再运行**、仅会话 2 改过的密码可用 |
 
-合计 **122** 项。
+合计 **126** 项。
 
-### 5.3 122 项明细
+### 5.3 126 项明细
 
 **会话 1（内核 shell，54 项）**
 
@@ -257,7 +258,7 @@ python tools/test_shell.py
 | 行编辑/信号 | `ctrl-c echo`、`ctrl-c kill`、`backspace edit` |
 | Tab 补全/历史 | `tab list`、`tab uptime`、`tab forker`、`history recall`、`tab forker rerun` |
 
-**会话 2（首启注册 + 登录世界 + 交互工具箱，54 项）**
+**会话 2（首启注册 + 登录世界 + 交互工具箱 + 线程作业控制，70 项）**
 
 | 分组 | 检查项 |
 |------|--------|
@@ -269,6 +270,7 @@ python tools/test_shell.py
 | osh 调试 | `osh ps header`（任务表表头）、`osh ps shell row`（osh 任务行）、`osh cpus header`（CPU 表头）、`osh mem lines`（内存统计）、`osh upt`（开机毫秒）、`osh kill no task`（kill 错误路径）、`osh kill bad pid`（pid 0 拒解析）、`osh kill mortal guard`（uid 100 杀不动 kswapd） |
 | osh 交互检索（v1.1.1） | `osh up-up recall + history`（↑↑ 召回次新行重跑+两次 history 列表）、`osh home insert`（Home+行首插入）、`osh ctrl-u clear`、精确计数 `osh ctrl-u killed line`、`osh ctrl-w killed word` |
 | osh 工具箱 | v1.1.0 九件端到端：`osh ls dir tag`（`<dir>` 标注）、`osh pwd home`（登录家目录）、`osh cd tmp prompt`（prompt 跟随 cwd）、`osh touch ls`、`osh cp+mv roundtrip`（cat 证内容搬运）、`osh rm missing`（失败文案）、`osh date local`（RTC 行）、`osh uname`（版本行）、`osh history`（编号列出） |
+| 线程与作业控制（v1.2.0） | `osh thread counter`（双线程互斥计数 20000 精确）、`osh thread cross-cpu`（跨核并行证据）、`osh ctrl-c kills fg`（前台作业死，rc=130=128+SIGINT）、`osh ctrl-c bg alive`（后台作业存活、提示符可用） |
 
 **会话 3（断电存续，2 项）**
 
@@ -302,7 +304,7 @@ python tools/test_shell.py
 ## 7. 构建与运行（非测试但常用）
 
 ```powershell
-python build.py                 # 构建：内核 + 50 个用户程序 + 64MiB FAT32 镜像
+python build.py                 # 构建：内核 + 52 个用户程序 + 64MiB FAT32 镜像
 python build.py run             # 构建并交互启动（默认 2 CPU；首启进注册向导）
 python build.py run -smp 1      # 单核交互启动
 python build.py clean           # 清空 build/
@@ -314,7 +316,7 @@ python build.py iso             # 生成 novix.iso（需 grub-mkrescue + xorriso
 | 路径 | 内容 |
 |------|------|
 | `build/kernel.elf` | 内核（Multiboot1 + a.out-kludge，QEMU `-kernel` 直启） |
-| `build/user/*` | 50 个 ring3 用户程序 |
+| `build/user/*` | 52 个 ring3 用户程序 |
 | `build/novix-hd.img` | 64 MiB FAT32 持久化根（零账户出厂镜像） |
 | `build/novix.iso` | GRUB multiboot ISO（`iso` 目标产出） |
 | `build/serial.log` | `test` 目标的串口日志 |
@@ -331,7 +333,7 @@ python build.py iso             # 生成 novix.iso（需 grub-mkrescue + xorriso
 
 Windows 没有原生 grub-mkrescue（MSYS2 只有 xorriso、没有 grub 包），
 **必须借 Linux 环境**。WSL2 是推荐路径（2026-10 已在本机验证，
-`novix.iso` 经 GRUB 引导跑完全部 51 项内核自测）。
+`novix.iso` 经 GRUB 引导跑完全部 52 项内核自测）。
 
 一次性安装（管理员 PowerShell 装 WSL，工具在 Ubuntu 内装）：
 
@@ -377,19 +379,19 @@ wsl -d Ubuntu-22.04 -- bash -c "cd /mnt/d/Projects/LINUX-REDEVELOP/os && \
 - **SMP 拓扑要显式**：`-smp 2` 裸参数下 SeaBIOS 的 MP 表只报 1 CPU
   （gate G 自适应通过但只有单核）；`-smp 2,sockets=2,cores=1,threads=1`
   才能双核上线（见根 DESIGN.md 的 SeaBIOS 教训）
-- grub.cfg（2026-10-15 起）为**三菜单项**：默认 `Novix 1.1.8 -- run`
+- grub.cfg（2026-10-15 起）为**三菜单项**：默认 `Novix 1.2.0 -- run`
   （`root=/dev/hd0 interactive`，进注册/登录世界，登录后是用户态
-  shell osh）、第二项 `kernel self-test`（51 项自测后
+  shell osh）、第二项 `kernel self-test`（52 项自测后
   `NOVIX-BOOT-OK` 停机）、第三项 `kernel debug shell`
-  （`console=debug`，51 项自测后进内核调试 shell `novix>`，可用
+  （`console=debug`，52 项自测后进内核调试 shell `novix>`，可用
   ps/cpus/spawn 等调试命令；osh 也已内建 ps/cpus/mem/upt/kill 的
   只读版本，内核 shell 保留为急救路径）。
-  注意 run/debug 模式**每次开机先跑完全部 51 项自测再进 shell**
+  注意 run/debug 模式**每次开机先跑完全部 52 项自测再进 shell**
   （开箱完整性门禁，约多花十几秒），登录提示出现前的大段 [TEST]
   输出不是卡死
 - **纯 ISO（无盘）也受支持**：去掉上面命令里的 `-drive` 整段即
   可——root 自动回退 ramfs，initrd 携带 /bin 与零账户 /etc，首启
-  注册向导照常工作（disk 套件如实 skipped，仍 51/51）。VMware 等
+  注册向导照常工作（disk 套件如实 skipped，仍 52/52）。VMware 等
   不想挂虚拟硬盘的场景用这个路径
 
 ---
@@ -443,4 +445,5 @@ wsl -d Ubuntu-22.04 -- bash -c "cd /mnt/d/Projects/LINUX-REDEVELOP/os && \
 | v1.1.5 | 49（零内核改动） | 113 |
 | v1.1.6 | 49（零内核改动） | 119 |
 | v1.1.7 | 50（uid 增 euid_boundary） | 119 |
-| **v1.1.8** | **51（fs 增 procfs，双跑）** | **122（54 内核 shell + 66 首启/登录/工具箱 + 2 断电注册存续）** |
+| v1.1.8 | 51（fs 增 procfs，双跑） | 122（54 内核 shell + 66 首启/登录/工具箱 + 2 断电注册存续） |
+| **v1.2.0** | **52（vm 增 thread_fork_mixed）** | **126（54 + 70：线程跨核证据 + Ctrl-C 前后台语义）** |

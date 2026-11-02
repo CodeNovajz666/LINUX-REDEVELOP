@@ -97,3 +97,26 @@ int signal_send(struct task *target, int sig) {
         smp_resched_others();                /* it may be parked on any CPU */
     return 0;
 }
+
+/* v1.2.0: signal every live user task in a process group -- the console
+ * input layer's Ctrl-C path. Targets are collected under sched_lock (the
+ * same lock signal_send may take per target), then generated outside it.
+ * Group members without a SIGINT handler die by the default action, a
+ * handler catches it -- plain Unix semantics. 0 = at least one task was
+ * signaled, -1 = the group is empty (or the arguments are bad). */
+int signal_send_pgrp(int pgid, int sig) {
+    if (sig < SIG_MIN || sig > SIG_MAX || pgid <= 0) return -1;
+    struct task *targets[TASK_MAX];
+    int n = 0;
+    irq_flags_t f;
+    spin_lock_irqsave(&sched_lock, &f);
+    for (struct task *t = task_first(); t && n < TASK_MAX; t = task_next(t)) {
+        if (t->pgid == pgid && t->is_user &&
+            t->state != TASK_UNUSED && t->state != TASK_ZOMBIE)
+            targets[n++] = t;
+    }
+    spin_unlock_irqrestore(&sched_lock, f);
+    for (int i = 0; i < n; i++)
+        signal_send(targets[i], sig);
+    return n ? 0 : -1;
+}

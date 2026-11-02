@@ -9,8 +9,13 @@
  * Explicit teaching scope (v1.0.0 honesty):
  *   - no quoting/escaping: words split on blanks, operators always split
  *   - variables are shell-local; they are NOT exported to children
- *   - no Ctrl-C routing to foreground jobs (v1.2.0 scope) and no Ctrl-D/EOF
+ *   - no Ctrl-D/EOF
  *   - globs, here-docs, conditionals are 1.x territory
+ *
+ * v1.2.0: job control lands -- osh leads its own process group, every job
+ * (foreground or background) runs in one group of its own, and the
+ * console's foreground group is osh's IOCtl(TCSETPGRP) register: Ctrl-C
+ * becomes SIGINT for exactly the running foreground job.
  *
  * v1.1.1: interactive recall -- Up/Down walk the history ring through
  * ureadline_ex's editor (Left/Right/Home/End/Ctrl-U/Ctrl-W included); the
@@ -69,6 +74,14 @@ static struct osh_job jobs[OSH_JOB_MAX];
 static struct osh_var vars[OSH_VAR_MAX];
 static int nvars;
 static int last_status;                         /* $? */
+
+/* v1.2.0 job groups: the pgid the NEXT fork's child should adopt -- 0 = "no
+ * group yet, you are the leader candidate" (stage 0), otherwise "join the
+ * job's existing group" (stages 1+). Parent AND child both call setpgid
+ * with the same target (the classic double-call): whichever runs first
+ * wins, the loser's call re-affirms, and no stage can exec outside its
+ * job's group. */
+static int child_pgid;
 
 /* v1.1.0: command history -- raw (pre-expansion) lines in a true ring.
  * v1.1.1: fixed the "pseudo ring" (a full table used to overwrite only the
@@ -339,7 +352,8 @@ static int run_stage(const struct osh_stage *st, int pipe_in, int pipe_out) {
         uputs("osh: fork failed\n");
         return -1;
     }
-    if (pid == 0) {                             /* child: wire, exec, never back */
+    if (pid == 0) {                             /* child: group, wire, exec */
+        if (child_pgid) usetpgid(0, child_pgid);
         wire_child_fds(st, pipe_in, pipe_out);
         uexecve(path, st->argv, envp);
         uprintf("osh: %s: not found\n", st->argv[0]);
@@ -387,6 +401,10 @@ static int run_pipeline(struct osh_stage *stages, int nstages, bool background) 
             pipe_w = pfds[1];
             pout = pipe_w;
         }
+        /* v1.2.0: every stage of the job lands in ONE process group led by
+         * stage 0 -- that group is what Ctrl-C hits when the job holds the
+         * console (parent side of the double-call below). */
+        child_pgid = (i == 0) ? 0 : pids[0];
         pids[i] = run_stage(&stages[i], pin, pout);
         if (pin >= 0) uclose(pin);              /* parent drops stage ends */
         if (pout >= 0) uclose(pout);
@@ -394,6 +412,7 @@ static int run_pipeline(struct osh_stage *stages, int nstages, bool background) 
             kill_stage_pids(pids, i);
             return 1;
         }
+        usetpgid(pids[i], pids[0]);
     }
 
     if (background) {
@@ -425,9 +444,16 @@ static int run_pipeline(struct osh_stage *stages, int nstages, bool background) 
         return 1;
     }
 
-    /* foreground: every stage is reaped; the last stage's status becomes $? */
+    /* foreground: the job's group owns the console while it runs -- Ctrl-C
+     * becomes SIGINT for exactly that group (job dies, background jobs and
+     * osh itself are untouched). Stages fork-inherit osh's SIGINT handler,
+     * but every stage execs and exec resets caught signals to the default,
+     * so SIGINT kills them (status 130) unless the program catches it. */
+    if (pids[0] > 0) utcsetpgrp(pids[0]);
+    /* every stage is reaped; the last stage's status becomes $? */
     for (int i = 0; i < nstages; i++)
         last_status = uwaitpid(pids[i]);
+    utcsetpgrp(ugetpgrp());     /* prompt again: osh's own group holds it */
     return last_status;
 }
 
@@ -524,12 +550,15 @@ static int run_builtin(struct osh_stage *st) {
               "               export NAME[=value] (children see it; $PATH lookup)\n"
               "scripting: a|b, a>b a>>b a<b, a&, $VAR ${VAR} $? $pid,\n"
               "           NAME=value assignments, # comments\n"
+              "jobs: Ctrl-C stops the foreground job (background jobs and the\n"
+              "      prompt itself survive); each job runs in its own group\n"
               "editing: Up/Down history, Left/Right/Home/End cursor,\n"
               "         Backspace, Ctrl-U kill line, Ctrl-W kill word\n"
               "/bin tools: ls pwd cat cp mv rm mkdir rmdir touch echo grep env wc head tail\n"
               "            date sleep uname clear id whoami who passwd useradd ...\n"
-              "limits: no quoting, unexported vars stay local, no Ctrl-C to\n"
-              "        jobs, built-ins are single-stage (no pipe/redirect)\n");
+              "            thread_hello (threads across cpus) ...\n"
+              "limits: no quoting, unexported vars stay local, built-ins are\n"
+              "        single-stage (no pipe/redirect)\n");
         last_status = 0;
         return 0;
     }
@@ -634,6 +663,14 @@ static int run_builtin(struct osh_stage *st) {
 
 /* ---- prompt and main loop ---- */
 
+/* v1.2.0: Ctrl-C at the prompt is aimed at osh's own group -- catch it and
+ * carry on (the real shells' behavior; the byte itself is consumed by the
+ * kernel's input layer and never reaches the line editor). A Ctrl-C while
+ * a line is half-typed kills the line: the handler latches the flag and
+ * the main loop throws the buffer away, like bash does. */
+static volatile int got_sigint;
+static void on_sigint(int sig) { (void)sig; got_sigint = 1; }
+
 static void prompt(void) {
     char cwd[80];
     char name[24];
@@ -707,10 +744,22 @@ int main(int argc, char **argv) {
     struct osh_stage stages[OSH_STAGE_MAX];
     last_status = 0;
 
+    /* v1.2.0: the job-control shell bootstrap -- osh leads its own process
+     * group, catches the Ctrl-C meant for it at the prompt, and starts out
+     * owning the console's foreground */
+    usetpgid(0, 0);
+    usignal(U_SIGINT, on_sigint);
+    utcsetpgrp(ugetpgrp());
+
     for (;;) {
         reap_finished_jobs();
         prompt();
+        got_sigint = 0;
         ureadline_ex(line, sizeof(line), hist_back, 0);      /* v1.1.1: ↑/↓ */
+        if (got_sigint) {                       /* Ctrl-C: the line is dead */
+            uputs("\n");
+            continue;
+        }
         hist_add(line);                         /* v1.1.0: raw line, pre-expansion */
         expand_line(line, exp, sizeof(exp));
 

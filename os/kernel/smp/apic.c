@@ -51,10 +51,6 @@ static inline void lapic_write(uint32_t reg, uint32_t v) {
     lapic[reg >> 2] = v;
 }
 
-static uint32_t ioapic_read(uint8_t reg) {
-    ioapic[IOAPIC_REGSEL >> 2] = reg;
-    return ioapic[IOAPIC_WIN >> 2];
-}
 static void ioapic_write(uint8_t reg, uint32_t v) {
     ioapic[IOAPIC_REGSEL >> 2] = reg;
     ioapic[IOAPIC_WIN >> 2] = v;

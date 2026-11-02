@@ -18,7 +18,7 @@ thing.
   /  |/ / __ `/ __ \/ /
  / /|  / /_/ / /_/ /  \
 /_/ |_/\__,_/\____/_/\_\
-Novix 1.1.8 -- a real OS, grown out of a kernel module
+Novix 1.2.0 -- a real OS, grown out of a kernel module
 ```
 
 ## What actually works
@@ -30,9 +30,9 @@ Novix 1.1.8 -- a real OS, grown out of a kernel module
 | Interrupts | ✅ | IDT64 gates, IOAPIC/LAPIC delivery (8259 parked), LAPIC timer as per-core preemption source (PIT stays as the BSP calibration base) |
 | Memory | ✅ | Bitmap physical allocator with page refcounts, free-list kernel heap, **four-level page tables (a Rust module)**, demand paging (FILE/ANON/swap-in fault paths), copy-on-write `fork`, clock-algorithm swap driven by a kswapd kernel thread, anonymous `mmap`/`munmap` |
 | Multitasking | ✅ | Preemptive on every core; one global runqueue under `sched_lock`; 5 policies (PRIORITY / RR / FCFS / EDF / RMS) switchable at runtime; aging anti-starvation; sleep/wait/zombie states |
-| User space | ✅ | ring3 ELF64 loader, per-process address spaces, `sbrk` heap + user-space malloc/free, `int 0x80` syscalls (49, incl. `dup2`/`getdents`/`unlink`/`datetime`/`rename`/`rmdir`/`setreuid`/`setregid`/`access`), NULL-terminated `argv`/`envp` vectors on the user stack (argc/envc derived by the kernel), `waitpid`/zombie reaping, orphan reparenting |
-| IPC & signals | ✅ | signals 1..31 (catch / block / sigreturn trampoline, SIGKILL unblockable), pipes (ring buffer + EOF/EPIPE), shell Ctrl+C → SIGINT |
-| File system | ✅ | VFS (inode/file/file_operations split), ramfs, devfs (`/dev/console`, `/dev/null`), read-only **procfs** at `/proc` (v1.1.8: `uptime`/`version`/`meminfo`/`cpuinfo`, regenerated per read), mount table (shadowing + readdir merge), **FAT32 persistent root** (LFN read+write) booted via `root=/dev/hd0`, per-task fd table + per-task cwd, initrd-packed `/bin` (50 programs) |
+| User space | ✅ | ring3 ELF64 loader, per-process address spaces, `sbrk` heap + user-space malloc/free, `int 0x80` syscalls (52, incl. `dup2`/`getdents`/`unlink`/`datetime`/`rename`/`rmdir`/`setreuid`/`setregid`/`access`), NULL-terminated `argv`/`envp` vectors on the user stack (argc/envc derived by the kernel), `waitpid`/zombie reaping, orphan reparenting |
+| IPC & signals | ✅ | signals 1..31 (catch / block / sigreturn trampoline, SIGKILL unblockable), pipes (ring buffer + EOF/EPIPE), process groups + **Ctrl+C → SIGINT to the foreground job's group** (v1.2.0: osh jobs survive it, background and shell alike) |
+| File system | ✅ | VFS (inode/file/file_operations split), ramfs, devfs (`/dev/console`, `/dev/null`), read-only **procfs** at `/proc` (v1.1.8: `uptime`/`version`/`meminfo`/`cpuinfo`, regenerated per read), mount table (shadowing + readdir merge), **FAT32 persistent root** (LFN read+write) booted via `root=/dev/hd0`, per-task fd table + per-task cwd, initrd-packed `/bin` (52 programs) |
 | Storage, drivers & clock (v0.8.0) | ✅ | ATA PIO disk (IDENTIFY, LBA28, MBR partitions, FLUSH CACHE), unified driver model (probe → init → `/dev` registry: console/null/zero/hd0), CMOS RTC wall clock + `date`; the power-cycle test re-mounts the disk in a fresh instance to prove data reached the platter |
 | Users & login (v0.9.0) | ✅ | (euid, egid, ruid, rgid) identity in the PCB (fork inherits, exec keeps, v1.1.7), POSIX owner/group/world permission checks in the VFS (root bypass, `access(2)` judges by the *real* ids), boot-time permission fixup for FAT32, SUID exec (`/bin/passwd` is the one SUID binary), the login chain init→getty→login→osh driven by `/etc/inittab` (respawn on logout), **PBKDF2-HMAC-SHA256** `/etc/passwd`+`/etc/shadow` password verification (v1.1.3; legacy hashes upgrade on the next successful login) with terminal echo off via TCGETS/TCSETS ioctl, `id`/`whoami`/`who`/`passwd`/`useradd` commands; password changes survive poweroff on the FAT32 disk |
 | Out-of-box registration (v1.0.0) | ✅ | the disk image ships **zero accounts**; getty detects the empty `/etc/passwd` and runs the two-step wizard instead of login — set the root password, then create the first user (uid ≥ 100, empty name = root-only system). Credentials are created by the first person to boot the machine, survive poweroff on the FAT32 disk, and the wizard never runs again |
@@ -48,8 +48,10 @@ Novix 1.1.8 -- a real OS, grown out of a kernel module
 | Text toolbox (v1.1.6) | ✅ | `wc`, `head`, `tail`, `which`, `find`, `cut` — user space only, built on existing `read`/`stat`/`getdents`/`environ` |
 | Full identity (v1.1.7) | ✅ | (euid, egid, ruid, rgid) split, `setreuid`/`setregid` (47/48) and `access` (49); POSIX setuid/setgid drop-and-regain rules, so a SUID program can shed privilege and ask "can the *real* caller do this?" |
 | procfs (v1.1.8) | ✅ | read-only synthetic `/proc` with `uptime`, `version`, `meminfo`, `cpuinfo`, generated live on every read; no write path at all — the original module's fake `/proc/procman` made real |
-| init & userspace infra (v1.0.0) | ✅ | `/bin/init` reads `/etc/init` (one-shot lines + one supervised `respawn` service, SysV rule), `/etc/motd` after login, `echo`/`grep` in /bin; ISO build target (`build.py iso`, grub multiboot menu, host-tool gated); docs set: `docs/syscall.md` (49 entries, CI-checked against the header), `docs/driver-writer-guide.md`, `docs/DESIGN.en.md` |
-| Testing | ✅ | 51/51 kernel self-tests (run on 2 CPUs **and** re-run on 1 CPU for regression) + 122/122 automated shell checks over three live sessions: kernel-shell regression, first-boot registration + login/scripting/toolbox smoke test, persistence of the registered accounts across poweroff |
+| Threads & job control (v1.2.0) | ✅ | `clone(2)` with `CLONE_VM` — threads share one reference-counted (mm, page_dir) pair, each with its own kernel stack; a per-mm lock makes shared-CR3 faults/sbrk/kswapd safe on SMP; minimal **pthread** in ulib (`create`/`join`/`exit`/`mutex`, `/bin/thread_hello` shows two threads on two cpus at once); `setpgid`/`getpgrp` (51/52); osh jobs each run in one process group and the console foreground group (ioctl `TCSETPGRP`) is what Ctrl-C SIGINTs — foreground job dies (status 130), background jobs and the prompt survive |
+| Kernel fast paths (v1.2.0 perf round) | ✅ | word-wide `memcpy`/`memset`/`memmove` (`rep movsq`/`stosq`), `rep insw`/`outsw` ATA PIO, single-pass directory enumeration (`vfs_dir_foreach` — a listing used to cost one full directory re-scan per entry, O(entries²) on FAT), FAT32 O(1) appends via a chain-tail cache plus whole-cluster I/O straight to the caller buffer (no bounce copy, no read-modify-write for full clusters), one CR3 reload per `fork` instead of per-page `invlpg`, a ranged TLB-shootdown mailbox (one broadcast per region, full flush when wide), O(1) `pmm` bit-scan + heap free counter, and a one-pass exit teardown that frees swap slots inside the page-table walk |
+| init & userspace infra (v1.0.0) | ✅ | `/bin/init` reads `/etc/init` (one-shot lines + one supervised `respawn` service, SysV rule), `/etc/motd` after login, `echo`/`grep` in /bin; ISO build target (`build.py iso`, grub multiboot menu, host-tool gated); docs set: `docs/syscall.md` (52 entries, CI-checked against the header), `docs/driver-writer-guide.md`, `docs/DESIGN.en.md` |
+| Testing | ✅ | 52/52 kernel self-tests (run on 2 CPUs **and** re-run on 1 CPU for regression) + 126/126 automated shell checks over three live sessions: kernel-shell regression, first-boot registration + login/scripting/toolbox smoke test, persistence of the registered accounts across poweroff |
 
 Tests verify observable behavior, not print statements: scheduling
 *order* under four policies, cross-CPU execution proofs (six threads
@@ -73,10 +75,10 @@ tools under `tools/`.
 cd os
 
 python build.py              # build kernel + user programs + 64 MiB FAT32 disk image
-python build.py test         # headless self-test: 51 tests, 2 CPUs, exit 1 on pass
+python build.py test         # headless self-test: 52 tests, 2 CPUs, exit 1 on pass
 python build.py test -smp 1  # single-CPU regression run
 python build.py run          # interactive: boot into the login world (getty)
-python tools/test_shell.py   # 122 automated checks over three live serial sessions
+python tools/test_shell.py   # 126 automated checks over three live serial sessions
                              # (NOVIX_QEMU_TRACE=1 also keeps a QEMU instruction trace)
 python build.py iso          # novix.iso via grub-mkrescue (needs grub-pc-bin + xorriso)
 ```
@@ -107,22 +109,22 @@ Retype new password:
 register: account 'ktest' created (uid 100, home /home/ktest)
 
 Registration complete. Please log in.
-Novix 1.1.8 (tty1) -- authorized users only
+Novix 1.2.0 (tty1) -- authorized users only
 
 login: ktest
 Password:
-Novix 1.1.8 -- a real OS, grown out of a kernel module
+Novix 1.2.0 -- a real OS, grown out of a kernel module
 osh: pipelines a|b, redirects a>b a>>b a<b, jobs a&, $VAR $?
 ktest@novix:/home/ktest$ id
 uid=100(ktest) gid=100(ktest)
 ktest@novix:/home/ktest$ cat /etc/motd | grep Novix > /tmp/x
 ktest@novix:/home/ktest$ cat /tmp/x
-Novix 1.1.8 -- a real OS, grown out of a kernel module
+Novix 1.2.0 -- a real OS, grown out of a kernel module
 ktest@novix:/home/ktest$ hello &
 [1] pid 12
 ktest@novix:/home/ktest$ wait
 ktest@novix:/home/ktest$ logout
-Novix 1.1.8 (tty1) -- authorized users only
+Novix 1.2.0 (tty1) -- authorized users only
 login:
 ```
 
@@ -148,7 +150,8 @@ os/                     ← the real OS (Novix)
 │                       the file/system toolbox (ls, pwd, rm, cp, mv, mkdir,
 │                       rmdir, date, sleep, uname, clear, env) and the text
 │                       toolbox (wc, head, tail, which, find, cut), plus the
-│                       scripting tools (echo, grep, init, iotest)
+│                       scripting tools (echo, grep, init, iotest) and the
+│                       thread demo (thread_hello, threadmix)
 ├── tools/              build helpers: ramfs image packer, FAT32 image
 │                       maker, shell test driver, syscall-doc checker,
 │                       ELF/symbol inspectors
@@ -156,7 +159,7 @@ os/                     ← the real OS (Novix)
 │                       ELF64 loading probe that chose Multiboot1 + a.out-kludge
 ├── docs/DESIGN.md      architecture document (Chinese)
 ├── docs/DESIGN.en.md   architecture document (English edition)
-├── docs/syscall.md     the 49-entry syscall reference (CI-checked)
+├── docs/syscall.md     the 52-entry syscall reference (CI-checked)
 ├── docs/driver-writer-guide.md   how to add a /dev driver
 ├── grub.cfg            GRUB menu staged into novix.iso by `build.py iso`
 ├── build.py            build / run / test / iso / clean (-smp N)
@@ -232,23 +235,23 @@ production OS such as Linux, substantial gaps remain. They are listed
 here honestly (the same spirit that removed the original module's fake
 subsystems rather than keeping them):
 
-| Area | Real OS (e.g. Linux) | Novix 1.1.8 today |
+| Area | Real OS (e.g. Linux) | Novix 1.2.0 today |
 |---|---|---|
-| Process creation | `fork()`/`exec()`/COW, threads | fork/exec/COW done; **no threads yet** |
+| Process creation | `fork()`/`exec()`/COW, threads | fork/exec/COW **and threads** (v1.2.0: `clone(CLONE_VM)` with a reference-counted shared address space, per-mm fault/brk locking, ulib pthread create/join/mutex/exit) — no CLONE_FILES/CLONE_SIGHAND granular sharing |
 | File system | VFS + persistent file systems (ext4, FAT…) | VFS/ramfs/devfs/**procfs** + **FAT32 persistent root** (LFN, power-cycle tested); `rename(2)`/`rmdir(2)` done (empty-directory rmdir only), no `mkdir -p`-style recursive helpers, no fsck; permission bits enforced (owner/group/world + root bypass) but only fixable at boot (FAT stores no Unix bits) |
 | Virtual memory | demand paging, COW, swapping, `mmap`, `brk` | demand paging / COW / swap / anon-mmap / 32 KiB guarded user stack done; no reverse mappings, no file-backed mmap, no THP |
 | IPC & signals | signals, pipes, shared memory, sockets | signals + pipes done; no shm/sockets |
 | SMP & locking | per-CPU runqueues, RCU, preemptible kernel | one global runqueue (fine at this scale); spinlocks only; kernel not preemptible in the strict sense |
 | Device drivers | unified driver model, disk, network, USB, GPU | VGA text, COM1, PS/2, PIT/LAPIC, ATA disk, RTC behind one unified driver model (/dev registry); no network/USB/GPU |
-| Syscalls | 300+ | 49 |
+| Syscalls | 300+ | 52 |
 | Security | users, permissions, capabilities, LSM, ASLR | users & login done ((euid,egid,ruid,rgid), SUID exec, POSIX permission checks incl. `access(2)`, PBKDF2-HMAC-SHA256 login chain); no capabilities/LSM/ASLR |
 | Platform | UEFI/ACPI, real hardware | QEMU `-kernel` is the tested path; `build.py iso` emits a GRUB multiboot ISO (host-tool gated, untested on bare metal); `poweroff` relies on the isa-debug-exit device |
 | Network | full TCP/IP stack | none |
 | Time | HPET/RTC wall clock, timezones | monotonic per-core tick + RTC wall clock (`date`, local time); no timezones |
 
-These gaps are exactly what the roadmap is about: 1.2 (threads, job
-control), 1.3-1.4 (TCP/IP), 2.0 (the architectural break). procfs
-landed in 1.1.8. See `ROADMAP.md`.
+These gaps are exactly what the roadmap is about: 1.3-1.4 (TCP/IP),
+2.0 (the architectural break). procfs landed in 1.1.8, threads and
+job control in 1.2.0. See `ROADMAP.md`.
 
 ## License
 

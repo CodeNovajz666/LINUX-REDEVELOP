@@ -44,10 +44,15 @@ extern void ap_context_enter(uint64_t kesp);       /* trampoline.S */
 
 static volatile bool smp_gate;                     /* set by smp_release */
 
-/* TLB shootdown mailbox: one slot, senders serialized by tlb_lock,
- * fire-and-forget (no ack -- see the header contract). */
+/* TLB shootdown mailbox: one (pd, range) slot, senders serialized by
+ * tlb_lock, fire-and-forget (no ack -- see the header contract). The range
+ * lets the unmap / brk-shrink paths cover a whole region with ONE broadcast
+ * instead of one IPI per page; the handler flushes outright when the range
+ * is wide, since N invlpg would cost more than a CR3 reload. */
+#define TLB_RANGE_FLUSH_PAGES 32         /* wider ranges: full flush, not invlpg */
+
 static spinlock_t tlb_lock = SPINLOCK_INIT;
-static volatile uint64_t tlb_pd, tlb_va;
+static volatile uint64_t tlb_pd, tlb_lo, tlb_hi;   /* [lo, hi), page-aligned */
 static uint32_t tlb_broadcasts;
 
 static inline void invlpg(uint64_t va) {
@@ -174,20 +179,33 @@ void smp_resched_others(void) {
 }
 
 void smp_tlb_shootdown(uint64_t page_dir, uint64_t va) {
-    if (ncpu < 2) return;
+    smp_tlb_shootdown_range(page_dir, va, va + PAGE_SIZE);
+}
+
+/* invalidate [from, to) (page-aligned) on every CPU currently running
+ * page_dir: one broadcast IPI covers the whole range */
+void smp_tlb_shootdown_range(uint64_t page_dir, uint64_t from, uint64_t to) {
+    if (ncpu < 2 || from >= to) return;
     irq_flags_t f;
     spin_lock_irqsave(&tlb_lock, &f);
     tlb_pd = page_dir;
-    tlb_va = va;
+    tlb_lo = from;
+    tlb_hi = to;
     tlb_broadcasts++;
     apic_ipi_broadcast(IPI_TLB_SHOOTDOWN);
     spin_unlock_irqrestore(&tlb_lock, f);
 }
 
-/* isr.c vector 0x51: invalidate va locally if we run this page directory */
+/* isr.c vector 0x51: invalidate the range locally if we run this page dir */
 void smp_tlb_shootdown_handler(void) {
-    if (paging_cur_cr3() == tlb_pd)
-        invlpg(tlb_va);
+    if (paging_cur_cr3() != tlb_pd) return;
+    uint64_t lo = tlb_lo, hi = tlb_hi;
+    if (hi - lo > (uint64_t)TLB_RANGE_FLUSH_PAGES * PAGE_SIZE) {
+        paging_load_cr3(paging_cur_cr3());      /* wide range: one full flush */
+        return;
+    }
+    for (uint64_t va = lo; va < hi; va += PAGE_SIZE)
+        invlpg(va);
 }
 
 uint32_t smp_tlb_ipis_sent(void) { return tlb_broadcasts; }

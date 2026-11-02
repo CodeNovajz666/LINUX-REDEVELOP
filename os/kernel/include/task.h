@@ -23,6 +23,9 @@ typedef enum {
 struct task {
     int pid;
     int ppid;
+    int pgid;               /* v1.2.0: process group id -- Ctrl-C routing
+                             * key (keyboard input layer) and job identity;
+                             * fork/clone/spawn inherit it, setpgid moves it */
     char name[TASK_NAME_LEN];
     task_state_t state;
     int priority;           /* effective (aging may boost) */
@@ -81,6 +84,12 @@ struct task *task_spawn_argv(const char *path, const char *const argv[], int arg
 
 /* fork/exec (v0.4.0) */
 struct task *task_fork(struct pt_regs *parent_regs); /* child of current, or NULL */
+/* v1.2.0 clone(2): a thread -- the parent's address space is SHARED (the
+ * caller must hold a reference: task_clone bumps mm->refs), the frame is a
+ * copy of the parent's with rax = 0 and rsp = usp. flags must carry
+ * CLONE_VM (the only honored bit); usp is the stack the ulib trampoline
+ * prepared. Returns the new task or NULL. */
+struct task *task_clone(struct pt_regs *parent_regs, uint64_t flags, uint64_t usp);
 /* v0.9.0: exec gains argv -- the strings are pushed onto the fresh user stack
  * so main(argc, argv) works (crt0 reads them off the initial rsp).
  * v1.1.5: envp rides along (envp/envc, NULL-terminated world), and crt0
@@ -102,6 +111,9 @@ void task_sleep_until(struct task *t, uint64_t tick);
 bool task_wake(struct task *t);
 /* v0.7.0: true while some online CPU still executes t (zombie reaping guard) */
 bool task_executing_anywhere(const struct task *t);
+/* v1.2.0: true while another task sharing this address space executes
+ * anywhere (kswapd eviction guard for clone(CLONE_VM) threads) */
+bool mm_executing_elsewhere(const struct mm *mm, const struct task *exclude);
 
 struct task *task_find(int pid);
 struct task *task_first(void);                          /* head of all-task list */

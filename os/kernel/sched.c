@@ -96,6 +96,7 @@ static struct task *pick_rr(struct cpu *c) {
 }
 
 static struct task *pick_policy(struct task *current_t) {
+    (void)current_t;                     /* policies key off task state only */
     if (policy == SCHED_ROUND_ROBIN) {
         struct task *t = pick_rr(this_cpu());
         if (t) return t;
@@ -201,15 +202,15 @@ uint64_t schedule(struct pt_regs *r) {
 
 /* ---- tick: wake sleepers, aging, decide preemption (per-CPU) ---- */
 
-static void wake_sleepers(uint64_t tick) {
+/* one pass over the task list per tick: flip expired sleepers to RUNNABLE
+ * and credit the runnable-but-not-run with aging (the original two loops
+ * were behavior-identical -- a task woken this tick was aged by the second
+ * pass anyway -- but they walked the whole list twice under sched_lock on
+ * every tick of every CPU) */
+static void wake_and_age(uint64_t tick) {
     for (struct task *t = task_first(); t; t = task_next(t)) {
         if (t->state == TASK_SLEEPING && tick >= t->wake_tick)
             t->state = TASK_RUNNABLE;
-    }
-}
-
-static void do_aging(void) {
-    for (struct task *t = task_first(); t; t = task_next(t)) {
         if (t->state != TASK_RUNNABLE || task_is_idle(t)) continue;
         t->wait_ticks++;
         if (t->wait_ticks >= AGING_INTERVAL && t->priority < PRIO_MAX) {
@@ -222,8 +223,7 @@ static void do_aging(void) {
 void sched_on_tick(uint64_t tick) {
     irq_flags_t f;
     spin_lock_irqsave(&sched_lock, &f);
-    wake_sleepers(tick);
-    do_aging();
+    wake_and_age(tick);
 
     struct task *cur = this_cpu()->current;
     if (!cur) { this_cpu()->need_resched = true; spin_unlock_irqrestore(&sched_lock, f); return; }

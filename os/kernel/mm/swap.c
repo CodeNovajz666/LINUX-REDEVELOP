@@ -48,6 +48,12 @@ static uint64_t swap_store[SWAP_SLOTS];          /* frame PA per slot */
 static uint64_t swap_map[(SWAP_SLOTS + 63) / 64];/* used bitmap */
 static int swap_slots;                           /* reserved (may be < max) */
 static uint32_t swap_watermark = SWAP_WATERMARK;
+/* v1.2.0: leaf lock for the slot bitmap. Before, only same-mm operations
+ * were serialized (the mm lock): a fault on mm_A and kswapd evicting mm_B
+ * could run swap_slot_alloc on two CPUs at once and hand out the SAME
+ * slot -- two pages aliasing one slot. Sits below everything (pmm/heap
+ * leaf group; callers always hold mm.lock or sched_lock first). */
+static spinlock_t swap_lock = SPINLOCK_INIT;
 
 void swap_init(void) {
     for (int i = 0; i < SWAP_SLOTS; i++) {
@@ -59,23 +65,40 @@ void swap_init(void) {
 }
 
 int swap_slot_alloc(void) {
+    irq_flags_t f;
+    spin_lock_irqsave(&swap_lock, &f);
     for (int w = 0; w < (int)(sizeof(swap_map) / sizeof(swap_map[0])); w++) {
         if (swap_map[w] == ~0ull) continue;
         for (int b = 0; b < 64; b++) {
             int s = w * 64 + b;
-            if (s >= swap_slots) return -1;
+            if (s >= swap_slots) { spin_unlock_irqrestore(&swap_lock, f); return -1; }
             if (!(swap_map[w] & (1ull << b))) {
                 swap_map[w] |= 1ull << b;
+                spin_unlock_irqrestore(&swap_lock, f);
                 return s;
             }
         }
     }
+    spin_unlock_irqrestore(&swap_lock, f);
     return -1;
 }
 
 void swap_slot_free(int slot) {
     if (slot < 0 || slot >= swap_slots) return;
+    irq_flags_t f;
+    spin_lock_irqsave(&swap_lock, &f);
     swap_map[slot / 64] &= ~(1ull << (slot % 64));
+    spin_unlock_irqrestore(&swap_lock, f);
+}
+
+/* v1.2.x: destroy-walk hook (called from paging.rs's free_pd). Every
+ * swap-marker PTE the teardown walk finds releases its slot here, so
+ * exit/exec needs no separate VA-by-VA scan. Markers reaching this point
+ * are live: the shrink/munmap paths free their slots AND zero their PTEs
+ * (paging_unmap_user), so a marker in the tables is still owned by this mm. */
+void mm_swap_slot_release(uint64_t pte) {
+    if (pte & PTE_SWP)
+        swap_slot_free((int)(pte >> 12));
 }
 
 void swap_read(int slot, uint64_t frame_pa) {
@@ -106,7 +129,9 @@ void swap_set_watermark(uint32_t pages) {
 
 /* fork helper: bring every swapped page back so paging_dup_user_dir (which
  * clones present PTEs only) sees the whole address space. The slot is
- * released; the fresh mapping becomes ordinary COW material downstream. */
+ * released; the fresh mapping becomes ordinary COW material downstream.
+ * v1.2.0: the CALLER holds mm->lock (task_fork) -- a sibling thread may be
+ * faulting on this shared address space while the twin is built. */
 void swap_prefault(uint64_t pd, const struct mm *mm) {
     if (!mm) return;
     for (const struct vma *v = mm->vmas; v; v = v->next) {
@@ -125,15 +150,23 @@ void swap_prefault(uint64_t pd, const struct mm *mm) {
 /* one second-chance pass over every user address space. v0.7.0: the whole
  * pass runs under sched_lock -- task list, task->mm and the cpus[i].current
  * snapshot must agree, or the scan could chase a page directory another CPU
- * is tearing down (exit/exec) mid-walk. */
+ * is tearing down (exit/exec) mid-walk. v1.2.0: each victim's PTE rewrite
+ * additionally holds that mm's lock -- a sibling thread may be faulting or
+ * sbrk-ing on the same shared CR3 right now (order: sched_lock > mm.lock). */
 static void swap_scan_pass(void) {
     int evicted = 0;
     irq_flags_t f;
     spin_lock_irqsave(&sched_lock, &f);
-    for (struct task *t = task_first(); t; t = task_next(t)) {
+    for (struct task *t = task_first(); t && evicted < SWAP_BATCH; t = task_next(t)) {
         if (!t->is_user || !t->mm || t->state == TASK_UNUSED) continue;
         if (task_executing_anywhere(t)) continue;   /* on a CPU right now */
-        for (struct vma *v = t->mm->vmas; v; v = v->next) {
+        /* v1.2.0: a parked thread's SIBLING may still run the shared CR3
+         * on another CPU -- evicting under it would leave that CPU's stale
+         * translations pointing at freed frames. Skip the whole mm. */
+        if (mm_executing_elsewhere(t->mm, t)) continue;
+        irq_flags_t mf;
+        spin_lock_irqsave(&t->mm->lock, &mf);
+        for (struct vma *v = t->mm->vmas; v && evicted < SWAP_BATCH; v = v->next) {
             for (uint64_t va = v->start; va < v->end && evicted < SWAP_BATCH;
                  va += PAGE_SIZE) {
                 uint64_t pte = paging_pte_read(t->page_dir, va);
@@ -153,7 +186,11 @@ static void swap_scan_pass(void) {
                     /* anon page, or a dirty file page (private change: the
                      * bytes live only in this frame now, not in the inode) */
                     int slot = swap_slot_alloc();
-                    if (slot < 0) { spin_unlock_irqrestore(&sched_lock, f); return; }
+                    if (slot < 0) {
+                        spin_unlock_irqrestore(&t->mm->lock, mf);
+                        spin_unlock_irqrestore(&sched_lock, f);
+                        return;
+                    }
                     swap_write(slot, frame);
                     paging_pte_write(t->page_dir, va, PTE_SWP | PTE_SLOT(slot));
                     smp_tlb_shootdown(t->page_dir, va);
@@ -162,8 +199,8 @@ static void swap_scan_pass(void) {
                 }
                 evicted++;
             }
-            if (evicted >= SWAP_BATCH) { spin_unlock_irqrestore(&sched_lock, f); return; }
         }
+        spin_unlock_irqrestore(&t->mm->lock, mf);
     }
     spin_unlock_irqrestore(&sched_lock, f);
 }

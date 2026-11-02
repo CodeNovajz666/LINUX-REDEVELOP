@@ -3,6 +3,122 @@
 版本号约定见 ROADMAP.md：次版本号递增 = 交付一个完整子系统；
 修订号递增 = 稳定性/小改进。
 
+## v1.2.0 —— 线程与作业控制：clone、pthread、进程组、Ctrl-C（2026-10-28）
+
+ROADMAP 1.2.0 兑现：轻量执行流 + 前台作业语义。线程在这里是"共享
+地址空间的任务"——调度器、on_cpu 停靠/领养协议、信号、waitpid 全部
+原样生效，内核新增的只有 clone 本体、mm 引用计数和一把每地址空间锁。
+
+**新增**
+- CLONE(50)：仅支持 CLONE_VM(0x100)。子线程持父 (mm, page_dir) 对的
+  **引用**（`struct mm.refs` 原子计数）：自有内核栈、自有 fd 表副本
+  （共享打开文件描述）、信号处理表 clone 时刻快照（教学偏差：POSIX
+  为进程级共享）、首帧复制父帧（rax=0、rsp=usp——ulib 跳板在栈顶摆
+  [fn][arg]，child 落地即调 fn，返回值即退出码）
+- **mm 引用计数**：fork 仍是完全复制（refs=1）；最后一个引用释放才
+  走 vma 清扫 + 页表销毁——共享 CR3 的线程不再随同伙退出被拆台。
+  exec 在共享 mm 上拒绝（POSIX 会杀兄弟线程；教学内核选择拒绝）
+- **每地址空间锁（mm.lock）**：两线程共享一张页表后，两 CPU 并发
+  demand fault / sbrk / mmap / munmap / kswapd 换出 / fork 复制才成
+  为可能——全部串到 mm.lock 上（锁序 sched_lock > fs/pipe >
+  mm.lock > cow_lock > pmm/heap > console）；COW 路径在 isr.c 补拿
+- SETPGID(51)/GETPGRP(52)：进程组——fork/clone/spawn 继承，教学版
+  规则（仅自身或自己的孩子；新组须为自身 pid 或已存在的组）
+- IOCTL 扩展 TCSETPGRP(3)/TCGETPGRP(4)：控制台前台组注册/查询
+- **Ctrl-C 路由**：keyboard 输入层在**入队时**拦截 0x03（串口直取
+  + PS/2 左 Ctrl 修饰跟踪），向前台组广播 SIGINT——前台作业运行时
+  没人读控制台，出队拦截永远等不到字节；未注册组时字节照旧放行
+  （内核 shell 自己的 v0.5.0 Ctrl-C 契约不变）
+- **最小 pthread**（ulib）：create（ummap 32KiB 栈 + clone 跳板）、
+  join（waitpid——线程就是任务）、exit、mutex（共享内存自旋 +
+  让渡退避，无内核参与）；/bin/thread_hello：双线程互斥计数 20000
+  分毫不差，错峰 + 每块间小睡把唤醒窗口送给另一颗 CPU，组合 cpu
+  掩码 ≥2 位即跨核并行的自证
+- **osh 作业控制**：启动即 setpgid(0,0) + 捕获 SIGINT；每个作业
+  （前台后台）全 stage 进一个进程组（父子双侧 setpgid 关经典竞态）；
+  前台作业经 TCSETPGRP 注册，收割完把前台还给 osh 自身组；Ctrl-C
+  打断编辑时丢弃半行（bash 行为）
+
+**测试**
+- ktest 51→52：vm 套件 `thread_fork_mixed`（gate F 扩展）——线程里
+  fork 出 COW 孪生、线程收割自己的 fork、互斥计数自检，进程退出后
+  pmm_free_pages 分页不少（两线程栈、四内核栈、两份孙进程页目录、
+  共享 (mm,pd) 对全部回收）
+- test_shell 122→126：thread_hello 计数 + 跨核证据；Ctrl-C 杀前台
+  （rc=130 = 128+SIGINT）、后台 sleep 30 存活、提示符照常可用
+- 三门禁全绿收版：52/52（smp=2，3 次连跑稳定）、126/126
+
+**修复（复查发现，收版前闭环）**
+- 线程共享 CR3 打破了 kswapd"受害者不在 CPU ⟹ 页目录无人加载"的
+  TLB 前提：停靠线程的兄弟仍让共享页目录驻留另一核，旧 TLB 项会写
+  进刚释放的物理页——swap_scan_pass 增 `mm_executing_elsewhere`
+  守卫，凡有兄弟在执行就整段跳过该地址空间
+- COW 解析后兄弟的旧只读 TLB 项触发假缺页，`paging_cow_fault` 见
+  PTE 已非 COW 返 -1 会把无辜线程打成 SIGSEGV——isr.c 增"PTE 已
+  present+rw 则仅 invlpg 重试"路径
+- munmap/brk 收缩清 PTE 后补发 `smp_tlb_shootdown`（发后不管的
+  送达窗口作为已知限制记档，DESIGN §7.2）
+
+**性能与加固（内核优化轮，收版前落地）**
+- dev_console_write 由逐字符 console_putchar（每字符一次
+  console_lock 往返 + 4 次 VGA 光标 outb，4 KiB 输出 = 4096 次加锁）
+  合并为单次 console_write 批处理——锁往返降为 1，串口日志行不再被
+  其他 CPU 的输出打散；ANSI 解析状态本就跨调用，批处理行为等价
+- sched_on_tick 的唤醒扫描与老化扫描合并为单次遍历（原先每 CPU 每
+  tick 在 sched_lock 下全表走两遍；单遍语义逐位等价——本 tick 唤醒
+  的任务原先也会被第二遍老化统计）
+- **共享结构竞态收口**（既有缺陷，线程化后触发面扩大）：
+  `struct file` 引用计数原子化（fork 共享描述的并发 close 原先
+  check-then-dec，会双释放/泄漏——fetch_sub 语义，最后一个释放者
+  收尾）；FAT32 超级块操作加粗粒度 fat_lock（FAT 表 RMW/簇分配/
+  目录项编辑是多步 I/O 序列，并发交错会损坏簇链——9 个派发入口
+  包壳，mkdir 委托已加锁的 create 故不自带锁，叶锁不取任何锁）；
+  swap 槽位位图加叶锁 swap_lock（mm_A 缺页换入与 kswapd 换出 mm_B
+  并发时会领到同一槽位，两页别名一槽）
+- pick_policy 的未用参数警告（既有，曾被构建日志过滤掩盖）补
+  (void)；spinlock.h 锁序注释收录 fat_lock/swap_lock 叶位置
+
+**性能二轮（内核优化，2026-11-02）**
+
+- **lib 宽化**：memcpy/memset/memmove 由逐字节循环改为 8 字节对齐
+  + `rep movsq/stosq`（用 rep 串指令而非字循环——编译器 loop-idiom
+  识别会把拷贝循环再变成 memcpy 调用造成自递归）。COW 缺页 4 KiB
+  复制、swap 读写、FAT bounce、ELF 装载全部受益
+- **目录枚举 O(N²)→O(N)**：新增 `vfs_dir_foreach` 单遍枚举
+  （inode_operations 增 foreach 操作；FAT 为锁内快照 + 锁外交付
+  ——ls 的回调会对每项 stat 再进 fat_lock，锁内交付自死锁；
+  ramfs/procfs 单遍实现，无 foreach 的 fs 回退索引循环）。ls/
+  getdents/spawn 补全/kmain 权限修复/ktest 共 8 处调用方接入
+  ——原先每次 readdir(path, i) 都重走路径 + 从首簇重扫目录
+- **FAT32 写 O(1) 追加**：fat32_node 增链尾缓存 (last_clus,
+  chain_len)——首次写记录、之后追加不再全链遍历；整簇读写直接
+  ata_read/write_sectors 进出调用者缓冲（跳过 bounce 的两次拷贝），
+  整簇写不再读-改-写（I/O 减半）；truncate 重置缓存
+- **fork 单次 CR3 重载**：paging_dup_user_dir 的逐页 invlpg 改为
+  遍历后一次 CR3 重载全量冲刷——fork 成本从 O(映射页) 降为
+  O(表页)
+- **TLB shootdown 范围化**：邮箱从单 va 改 (pd, [lo, hi)) 区间，
+  munmap/brk 收缩整段一次广播（原每页一次）；接收端对宽范围
+  （>32 页）直接重载 CR3 全量冲刷代替逐条 invlpg
+- **exit 销毁单遍**：mm_release 不再按 VA 预扫 swap 标记（每 VA
+  一次四级查表）——paging_destroy_user_dir 的页表遍历经新钩子
+  mm_swap_slot_release 直接放槽，销毁从两遍变一遍
+- **分配器**：pmm_alloc 用 __builtin_ctz 定位空闲位 + next-fit
+  扫描 hint；heap_free_bytes 由全链求和改 O(1) 计数器（与
+  used_bytes 对称维护）
+- **ATA rep 串指令**：PIO 逐字 inb/outw 改 rep insw/outsw
+- **顺手修掉的隐藏 bug**：paging_unmap_user 遇非在席 swap 标记
+  PTE 不清除——brk 缩小再重新 grown 到同一页时，缺页路径会按旧
+  标记换入他人现占的槽（数据串页），销毁路径还会二次释放已易主
+  的槽。现在 unmap 清零标记（brk_shrink/munmap 先放槽、unmap 清
+  PTE，顺序闭环），销毁折叠以此为前提
+- 验证：`build.py test -smp 2` 与 `-smp 1` 双跑均 52/52
+
+**已知偶发（非本版引入，如实记档）**
+- shadow_upgrade（gate I）在 test_shell 会话启动中出现过一次
+  "cannot plant legacy line"（FAT 写路径时序），build.py test 连跑
+  3 次未复现；既有 v1.1.8 开发期同类记录在案
+
 ## v1.1.8 —— procfs：/proc 只读回归（2026-10-26）
 
 ROADMAP 1.1.x 第八步：原内核模块 /proc/procman 的"假变真"叙事闭环

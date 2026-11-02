@@ -26,15 +26,22 @@ use core::fmt::Write;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /* ---- PTE flag bits ---- */
+/* P_ACCESSED/P_DIRTY/P_SWP have no Rust user today (the clock algorithm
+ * and the swap markers live in the C half: mm/swap.c + mm/vma.c) -- they
+ * stay because this set is the hand-mirrored cross-language PTE
+ * vocabulary (include/mm.h's PTE_* table). */
 
 const P_PRESENT: u64 = 1 << 0;
 const P_RW: u64 = 1 << 1;
 const P_USER: u64 = 1 << 2;
+#[allow(dead_code)]
 const P_ACCESSED: u64 = 1 << 5; // cpu sets on any access (clock hand clears it)
+#[allow(dead_code)]
 const P_DIRTY: u64 = 1 << 6; // cpu sets on write (writeback hint)
 const P_PS: u64 = 1 << 7; // page-size bit: 2 MiB leaf at PD level
 const P_COW: u64 = 1 << 9; // software bit: write-fault on this page = copy-on-write (v0.4.0)
-const P_SWP: u64 = 1 << 10; // software bit: non-present PTE whose frame is in a swap slot (v0.6.0)
+const P_SWP: u64 = 1 << 10; // software bit: non-present PTE whose frame is in a swap slot (v0.6.0;
+                            // unmap + destroy now read it on the Rust side too)
 
 const ENTRIES: usize = 512;
 const PAGE_SIZE: u64 = 4096;
@@ -52,6 +59,11 @@ extern "C" {
     fn pmm_free(pa: u64); // refcount-aware since v0.4.0
     fn pmm_ref_inc(pa: u64);
     fn pmm_ref_get(pa: u64) -> u32;
+
+    // v1.2.x: teardown hook -- the destroy walk (free_pd) hands every
+    // non-present swap-marker PTE to the C swap manager, which releases
+    // the slot. Keeps exit/exec teardown to a single table pass.
+    fn mm_swap_slot_release(pte: u64); // kernel/mm/swap.c
 
     // v1.0.1 (F5): COW-fault serialization (pmm.c) -- held across the whole
     // refcount-sample/copy/ref-drop/PTE-rebase sequence below so two CPUs
@@ -278,12 +290,12 @@ pub extern "C" fn paging_dup_user_dir(parent_pa: u64) -> u64 {
                         let e1 = ppt.add(m).read_volatile();
                         if e1 & P_PRESENT == 0 { continue; }
                         let frame = e1 & ADDR_MASK;
-                        let va = ((i as u64) << 39) | ((j as u64) << 30)
-                               | ((k as u64) << 21) | ((m as u64) << 12);
 
-                        // parent: read-only + COW marker
+                        // parent: read-only + COW marker. No invlpg here --
+                        // one CR3 reload after the walk flushes every stale
+                        // translation in one operation, which keeps fork
+                        // linear in TABLE pages instead of mapped pages.
                         ppt.add(m).write_volatile(e1 & !P_RW | P_COW);
-                        core::arch::asm!("invlpg [{}]", in(reg) va, options(preserves_flags));
 
                         // child: same frame, same flags minus RW, plus COW
                         pmm_ref_inc(frame);
@@ -292,6 +304,13 @@ pub extern "C" fn paging_dup_user_dir(parent_pa: u64) -> u64 {
                 }
             }
         }
+
+        // The parent's PTEs all went read-only above: flush this CPU's TLB
+        // once instead of one invlpg per mapped page (fork runs with IF=0
+        // inside the syscall, so the reload is atomic with the walk).
+        let cr3: u64;
+        core::arch::asm!("mov {0}, cr3", out(reg) cr3, options(nomem, preserves_flags));
+        core::arch::asm!("mov cr3, {0}", in(reg) cr3, options(nomem, preserves_flags));
         pml4_pa
     }
 }
@@ -300,6 +319,11 @@ pub extern "C" fn paging_dup_user_dir(parent_pa: u64) -> u64 {
 /// pmm_free's refcount-aware path, so a COW-shared frame just drops one
 /// reference. Missing intermediate levels or a non-present leaf are a no-op
 /// (idempotent); huge leaves are never created by us, so they read as absent.
+///
+/// A non-present SWAP-MARKER leaf is zeroed as well (without touching its
+/// slot -- callers release slots themselves): a stale marker would make a
+/// later re-grow of the same va read whatever page has taken the slot since,
+/// and the destroy walk would release the slot a second time.
 #[no_mangle]
 pub extern "C" fn paging_unmap_user(pml4_pa: u64, va: u64) -> i32 {
     if va & (PAGE_SIZE - 1) != 0 { return -1; }
@@ -315,7 +339,10 @@ pub extern "C" fn paging_unmap_user(pml4_pa: u64, va: u64) -> i32 {
         if e2 & P_PRESENT == 0 || e2 & P_PS != 0 { return 0; }
         let pte_p = table_of(e2).add(idx_pt(va));
         let e1 = pte_p.read_volatile();
-        if e1 & P_PRESENT == 0 { return 0; }           // already gone
+        if e1 & P_PRESENT == 0 {
+            if e1 & P_SWP != 0 { pte_p.write_volatile(0); }   // stale marker
+            return 0;                                          // already gone
+        }
 
         pmm_free(e1 & ADDR_MASK);                      // refcount-aware drop
         pte_p.write_volatile(0);
@@ -435,6 +462,8 @@ pub extern "C" fn paging_cow_fault(pml4_pa: u64, va: u64) -> i32 {
 
 /// Free every table and page owned by a user directory. The kernel PD
 /// shared through PDPT[0] stays alive (it belongs to the kernel PML4).
+/// Swap-marker PTEs release their slot through the C hook, so this single
+/// walk is the whole teardown (frames + slots).
 #[no_mangle]
 pub extern "C" fn paging_destroy_user_dir(pml4_pa: u64) {
     unsafe {
@@ -460,7 +489,10 @@ pub extern "C" fn paging_destroy_user_dir(pml4_pa: u64) {
     }
 }
 
-/// Free a PD, every PT under it and every mapped 4 KiB frame.
+/// Free a PD, every PT under it and every mapped 4 KiB frame. Present leaves
+/// go back through pmm_free; non-present swap-marker leaves hand their slot
+/// to the C swap manager (mm_swap_slot_release), so exit/exec teardown needs
+/// no separate VA-by-VA scan for swap markers.
 unsafe fn free_pd(pd_entry: u64) {
     let pd = table_of(pd_entry);
     for k in 0..ENTRIES {
@@ -472,6 +504,8 @@ unsafe fn free_pd(pd_entry: u64) {
             let e1 = pt.add(m).read_volatile();
             if e1 & P_PRESENT != 0 {
                 pmm_free(e1 & ADDR_MASK);
+            } else if e1 & P_SWP != 0 {
+                mm_swap_slot_release(e1);
             }
         }
         pmm_free(e2 & ADDR_MASK); // the PT

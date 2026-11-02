@@ -214,6 +214,14 @@ static int ramfs_i_readdir(struct inode *dir, int idx, char *name_out, size_t na
     return 0;
 }
 
+/* v1.2.x: one walk over the sibling list (readdir(idx) re-walked it per entry) */
+static int ramfs_i_foreach(struct inode *dir, vfs_dir_cb cb, void *ctx) {
+    if ((dir->mode & S_IFMT) != S_IFDIR) return -1;
+    for (struct ramfs_node *c = node_of(dir)->children; c; c = c->sibling)
+        if (cb(ctx, c->name)) return 1;
+    return 0;
+}
+
 static const struct inode_operations ramfs_dir_iops = {
     .lookup = ramfs_i_lookup,
     .create = ramfs_i_create,
@@ -221,6 +229,7 @@ static const struct inode_operations ramfs_dir_iops = {
     .unlink = ramfs_i_unlink,
     .truncate = ramfs_i_truncate,
     .readdir = ramfs_i_readdir,
+    .foreach = ramfs_i_foreach,
     .rename = ramfs_i_rename,
     .rmdir = ramfs_i_rmdir,
 };

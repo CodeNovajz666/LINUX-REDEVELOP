@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include "novix.h"
+#include "spinlock.h"
 
 /*
  * v0.6.0 memory manager: per-process VMA list + demand paging + swap.
@@ -49,6 +50,18 @@ struct vma {
 struct mm {
     struct vma *vmas;
     uint64_t mmap_top;         /* next mmap base, grows up from USER_HEAP_LIMIT */
+    int refs;                  /* v1.2.0: tasks sharing this (mm, page_dir)
+                                * pair. 1 for a normal process; clone(2)
+                                * CLONE_VM threads hold references too, and
+                                * the LAST releaser tears the pair down.
+                                * Atomic: sharers run on other CPUs. */
+    spinlock_t lock;           /* v1.2.0: serializes vma/pte mutation on the
+                                * SHARED address space -- two threads faulting
+                                * (or sbrk/mmap/munmap/fault + kswapd) on one
+                                * CR3 used to be impossible (fork copies
+                                * everything); now it is the common case.
+                                * Order: sched_lock > fs/pipe > mm.lock >
+                                * cow_lock > pmm/heap > console. */
 };
 
 /* whole-kernel accounting for `mem -v` and the ktest gates */
@@ -65,7 +78,10 @@ extern struct mm_stat g_mmstat;
 struct task;
 
 struct mm *mm_create(void);
-/* reap-time cleanup: free swapped slots, the page tables and the vma list */
+/* v1.2.0: claim one more share of an (mm, page_dir) pair (clone CLONE_VM) */
+void mm_acquire(struct mm *mm);
+/* reap/exec-time cleanup: drop this task's reference; only the LAST
+ * releaser frees swapped slots, the page tables and the vma list */
 void mm_release(struct task *t);
 /* free just the vma list + struct (no page tables): failure-path rollback */
 void mm_free_vmas(struct mm *mm);

@@ -113,9 +113,17 @@ static int proc_i_readdir(struct inode *dir, int idx, char *name_out,
     return 0;
 }
 
+static int proc_i_foreach(struct inode *dir, vfs_dir_cb cb, void *ctx) {
+    (void)dir;
+    for (int i = 0; i < PROC_NFILES; i++)
+        if (cb(ctx, proc_files[i].name)) return 1;
+    return 0;
+}
+
 static const struct inode_operations proc_iops = {
     .lookup = proc_i_lookup,
     .readdir = proc_i_readdir,
+    .foreach = proc_i_foreach,
 };
 
 /* ---- init + mount ---- */

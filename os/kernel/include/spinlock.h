@@ -14,13 +14,20 @@
  *
  * LOCK ORDER (acquire in this order only, release in reverse):
  *
- *   sched_lock  >  fs_lock / pipe locks  >  cow_lock  >  pmm_lock / heap_lock  >  console_lock
+ *   sched_lock  >  fs_lock / pipe locks  >  mm.lock  >  cow_lock  >  pmm_lock / heap_lock  >  console_lock
  *
  * sched_lock guards task state, the per-CPU runqueues and the task list.
  * cow_lock (v1.0.1) serializes COW fault resolution: a #PF raised inside
  * an fs/pipe critical section (copyout to a COW page) resolves under it,
- * and the fault's allocator/free calls put pmm below it. pmm/heap/console
- * are leaves: they never acquire another lock. A caller
+ * and the fault's allocator/free calls put pmm below it. mm.lock
+ * (v1.2.0, one per struct mm) serializes vma/pte mutation on a SHARED
+ * address space -- clone(CLONE_VM) threads fault, sbrk, mmap and meet
+ * kswapd on one CR3; it sits below fs/pipe (a pipe copyout may demand-
+ * fault) and above cow_lock (isr.c holds mm.lock around the COW path).
+ * fat_lock (v1.2.0) and swap_lock (v1.2.0) are leaves in the pmm/heap
+ * group: FAT superblock mutation and the swap-slot bitmap take nothing
+ * beyond themselves (their callers already hold mm.lock or sched_lock).
+ * pmm/heap/console are leaves: they never acquire another lock. A caller
  * may hold sched_lock and then take any other lock; the reverse is a
  * deadlock. Violations are easier to audit than to debug -- keep it linear.
  */

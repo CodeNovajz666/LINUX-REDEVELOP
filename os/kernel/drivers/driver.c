@@ -91,10 +91,13 @@ static int dev_console_read(struct file *f, void *buf, uint32_t len) {
 
 static int dev_console_write(struct file *f, const void *buf, uint32_t len) {
     (void)f;
-    irq_flags_t fl = irq_save();
-    for (uint32_t i = 0; i < len; i++)
-        console_putchar(((const char *)buf)[i]);
-    irq_restore(fl);
+    /* one locked console_write pass, not len console_putchar round trips:
+     * every per-char call re-took console_lock and re-programmed the VGA
+     * cursor (4 outb), so a 4 KiB output cost 4096 lock acquisitions --
+     * and interleaved its bytes with other CPUs' lines in the serial log
+     * the test harness greps. The ANSI parser state is static and spans
+     * calls, so batching is behavior-identical. */
+    console_write(buf, len);
     return (int)len;
 }
 

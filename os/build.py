@@ -126,7 +126,10 @@ USER_PROGRAMS = ['hello', 'spawner', 'fault_div', 'fault_segv', 'stackovf', 'fil
                  # SYS_GETDENTS/UNLINK/DATETIME + ioctl TCCLEAR)
                  'ls', 'pwd', 'rm', 'cp', 'mv', 'mkdir', 'rmdir', 'date',
                  'sleep', 'uname', 'clear', 'env',
-                 'wc', 'head', 'tail', 'which', 'find', 'cut']
+                 'wc', 'head', 'tail', 'which', 'find', 'cut',
+                 # v1.2.0: threads & job control (SYS_CLONE/SETPGID/GETPGRP;
+                 # threadmix is the gate F fork+thread page-conservation probe)
+                 'thread_hello', 'threadmix']
 
 def run(cmd, **kw):
     printable = ' '.join(str(c) for c in cmd)

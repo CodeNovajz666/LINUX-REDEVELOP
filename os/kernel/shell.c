@@ -157,6 +157,43 @@ static void cmd_kill(const char *arg) {
 
 /* ---- filesystem commands ---- */
 
+/* shared between shell_report_dir and its foreach callback */
+struct ls_ctx {
+    shell_emit_t emit;
+    void *ectx;
+    char *full;                 /* directory prefix, NUL-terminated at dlen */
+    uint32_t dlen;
+    char row[64];
+    int n;
+};
+
+/* one ls row (vfs_dir_foreach callback): stat the entry and stream the line.
+ * Names are clamped to the same 31 chars the old readdir(name[32]) loop
+ * showed, and `full` has room for exactly that. */
+static int ls_emit_one(void *c, const char *name) {
+    struct ls_ctx *L = c;
+    char nb[32];
+    strncpy(nb, name, sizeof(nb) - 1);
+    nb[sizeof(nb) - 1] = 0;
+    strcpy(L->full + L->dlen, nb);
+    struct stat es;
+    int w;
+    if (vfs_stat(L->full, &es) != 0)
+        w = ksnprintf(L->row, sizeof(L->row), "  %-24s ?\n", nb);
+    else if ((es.st_mode & S_IFMT) == S_IFDIR)
+        w = ksnprintf(L->row, sizeof(L->row), "  %-24s <dir>\n", nb);
+    else if ((es.st_mode & S_IFMT) == S_IFCHR)
+        w = ksnprintf(L->row, sizeof(L->row), "  %-24s <chr>\n", nb);
+    else if ((es.st_mode & S_IFMT) == S_IFBLK)
+        w = ksnprintf(L->row, sizeof(L->row), "  %-24s <blk>\n", nb);
+    else
+        w = ksnprintf(L->row, sizeof(L->row), "  %-24s %u bytes\n",
+                      nb, es.st_size);
+    L->emit(L->row, w, L->ectx);
+    L->n++;
+    return 0;                                   /* list everything */
+}
+
 /* v1.1.0: the `ls` listing as a streaming report -- the same bytes go to
  * the kernel debug shell's console and to the /bin/ls program's buffer via
  * sys_getdents (which also checks the caller's read permission on the
@@ -188,29 +225,14 @@ void shell_report_dir(shell_emit_t emit, void *ctx, const char *path) {
     memcpy(full, path, dlen);
     if (dlen && full[dlen - 1] != '/') full[dlen++] = '/';
 
-    char name[32];
-    char row[64];
-    int n = 0;
-    for (int i = 0; vfs_readdir(path, i, name, sizeof(name)) == 0; i++) {
-        strcpy(full + dlen, name);
-        struct stat es;
-        int w;
-        if (vfs_stat(full, &es) != 0)
-            w = ksnprintf(row, sizeof(row), "  %-24s ?\n", name);
-        else if ((es.st_mode & S_IFMT) == S_IFDIR)
-            w = ksnprintf(row, sizeof(row), "  %-24s <dir>\n", name);
-        else if ((es.st_mode & S_IFMT) == S_IFCHR)
-            w = ksnprintf(row, sizeof(row), "  %-24s <chr>\n", name);
-        else if ((es.st_mode & S_IFMT) == S_IFBLK)
-            w = ksnprintf(row, sizeof(row), "  %-24s <blk>\n", name);
-        else
-            w = ksnprintf(row, sizeof(row), "  %-24s %u bytes\n",
-                          name, es.st_size);
-        emit(row, w, ctx);
-        n++;
-    }
-    int w = ksnprintf(row, sizeof(row), "%d entr%s\n", n, n == 1 ? "y" : "ies");
-    emit(row, w, ctx);
+    /* v1.2.x: one directory walk via vfs_dir_foreach. The old
+     * readdir(path, i) loop re-resolved the path and re-scanned the
+     * whole directory for EVERY entry -- O(entries^2) disk reads on FAT. */
+    struct ls_ctx L = { emit, ctx, full, dlen, {0}, 0 };
+    vfs_dir_foreach(path, ls_emit_one, &L);
+    int w = ksnprintf(L.row, sizeof(L.row), "%d entr%s\n",
+                      L.n, L.n == 1 ? "y" : "ies");
+    emit(L.row, w, ctx);
 }
 
 static void cmd_ls(const char *path) {
@@ -327,6 +349,28 @@ static const char *const cmd_names[] = {
     "clear", "reboot", "poweroff", "exit", NULL
 };
 
+/* spawn-argument completion: collect /bin names matching the word so far */
+struct spawn_comp_ctx {
+    const char *word;
+    int wl;
+    char (*pool)[32];
+    const char **matches;
+    int nmatch;
+};
+
+static int spawn_comp_one(void *c, const char *name) {
+    struct spawn_comp_ctx *K = c;
+    if (K->nmatch >= 16) return 1;              /* pool full: stop the walk */
+    if (strncmp(name, K->word, K->wl) == 0) {
+        strncpy(K->pool[K->nmatch], name, 31);  /* names may be longer than
+                                                   the 32-char pool slots */
+        K->pool[K->nmatch][31] = 0;
+        K->matches[K->nmatch] = K->pool[K->nmatch];
+        K->nmatch++;
+    }
+    return 0;
+}
+
 /* replace the edited line (screen + buffer) with s */
 static void line_set(char *line, int *n, int cap, const char *s) {
     while (*n > 0) { (*n)--; kprintf("\b \b"); }
@@ -377,16 +421,10 @@ static void tab_complete(char *line, int *n, int cap) {
         for (const char *q = line + ws; *q; q++)
             if (*q == '/') { has_slash = 1; break; }
         if (!has_slash) {
-            char name[32];
-            for (int i = 0;
-                 vfs_readdir("/bin", i, name, sizeof(name)) == 0 && nmatch < 16;
-                 i++) {
-                if (!strncmp(name, line + ws, wl)) {
-                    strcpy(pool[nmatch], name);
-                    matches[nmatch] = pool[nmatch];
-                    nmatch++;
-                }
-            }
+            /* v1.2.x: one /bin scan (foreach) instead of readdir(i) from 0 */
+            struct spawn_comp_ctx K = { line + ws, wl, pool, matches, 0 };
+            vfs_dir_foreach("/bin", spawn_comp_one, &K);
+            nmatch = K.nmatch;
         }
     }
     if (nmatch == 0) return;
