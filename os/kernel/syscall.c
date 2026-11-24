@@ -386,6 +386,16 @@ static long sys_sigreturn(struct pt_regs *r) {
 
     struct pt_regs saved;
     memcpy(&saved, (const void *)(uintptr_t)uframe, sizeof(saved));
+    /* Security: the frame is user-writable, so it must never be trusted to
+     * describe a ring-0 continuation.  Only a genuine ring-3 frame is
+     * accepted; a forged cs=SEL_KCODE would turn iretq into a privilege
+     * escalation. */
+    if (saved.cs != SEL_UCODE || saved.ss != SEL_UDATA) return -1;
+    if (saved.rip < USER_CODE_BASE || saved.rip >= USER_STACK_TOP) return -1;
+    if (saved.rsp < USER_CODE_BASE || saved.rsp >= USER_STACK_TOP) return -1;
+    /* strip IOPL/NT/VM/RF/TF; bit 1 is architecturally always set */
+    saved.rflags &= ~(0x3000ull | 0x4000ull | 0x10000ull | 0x20000ull | 0x100ull);
+    saved.rflags |= 0x2ull;
     memcpy(r, &saved, sizeof(*r));
     /* dispatch overwrites rax with our return value: hand back the saved
      * rax so the interrupted syscall's result survives the signal */
@@ -424,6 +434,7 @@ static long sys_getgid(void) {
 static long sys_setuid(uint64_t uid) {
     struct task *cur = current_task();
     if (!cur || !cur->is_user) return -1;
+    if (uid > 0xFFFFull) return -1;      /* no 16-bit truncation aliasing */
     uint16_t u = (uint16_t)uid;
     if (cur->uid == 0) {
         cur->uid = cur->ruid = u;
@@ -439,6 +450,7 @@ static long sys_setuid(uint64_t uid) {
 static long sys_setgid(uint64_t gid) {
     struct task *cur = current_task();
     if (!cur || !cur->is_user) return -1;
+    if (gid > 0xFFFFull) return -1;      /* no 16-bit truncation aliasing */
     uint16_t g = (uint16_t)gid;
     if (cur->uid == 0) {
         cur->gid = cur->rgid = g;
@@ -457,6 +469,8 @@ static long sys_setreuid(uint64_t ruid, uint64_t euid) {
     struct task *cur = current_task();
     if (!cur || !cur->is_user) return -1;
     int64_t r = (int64_t)ruid, e = (int64_t)euid;
+    if (r != -1 && (r < 0 || r > 0xFFFF)) return -1;
+    if (e != -1 && (e < 0 || e > 0xFFFF)) return -1;
     if (r != -1) {
         uint16_t v = (uint16_t)r;
         if (cur->uid != 0 && v != cur->ruid && v != cur->uid) return -1;
@@ -474,6 +488,8 @@ static long sys_setregid(uint64_t rgid, uint64_t egid) {
     struct task *cur = current_task();
     if (!cur || !cur->is_user) return -1;
     int64_t r = (int64_t)rgid, e = (int64_t)egid;
+    if (r != -1 && (r < 0 || r > 0xFFFF)) return -1;
+    if (e != -1 && (e < 0 || e > 0xFFFF)) return -1;
     if (r != -1) {
         uint16_t v = (uint16_t)r;
         if (cur->uid != 0 && v != cur->rgid && v != cur->gid) return -1;

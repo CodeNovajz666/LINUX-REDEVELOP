@@ -172,7 +172,8 @@ jobs and the prompt survive). A pre-release performance round rounded
 it off: word-wide lib copies (`rep movsq`/`stosq`), single-pass
 directory enumeration (`vfs_dir_foreach`), FAT32 O(1) appends with
 whole-cluster I/O, one CR3 reload per fork instead of per-page
-`invlpg`, a ranged TLB-shootdown mailbox, O(1) allocator bits, and a
+`invlpg`, a ranged TLB-shootdown ring (64 entries; a lagging CPU
+full-flushes instead of losing a range), O(1) allocator bits, and a
 one-pass exit teardown (swap slots freed inside the page-table walk,
 which also required zeroing stale swap-marker PTEs on unmap). See the
 Chinese `docs/DESIGN.md` §4.14.

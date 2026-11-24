@@ -15,13 +15,13 @@ struct idt_gate {
 static struct idt_gate idt[256];
 static struct { uint16_t limit; uint64_t base; } __attribute__((packed)) idtp;
 
-static void idt_set(int n, void (*handler)(void), uint8_t dpl) {
+static void idt_set(int n, void (*handler)(void), uint8_t dpl, uint8_t ist) {
     uint64_t off = (uint64_t)(uintptr_t)handler;
     idt[n].offset_lo = off & 0xFFFF;
     idt[n].offset_mid = (off >> 16) & 0xFFFF;
     idt[n].offset_hi = (uint32_t)(off >> 32);
     idt[n].selector = SEL_KCODE;
-    idt[n].ist = 0;
+    idt[n].ist = ist;                     /* 1 = IST1 (#DF stack) */
     idt[n].zero = 0;
     idt[n].type_attr = 0x8E | (dpl << 5);
 }
@@ -32,7 +32,9 @@ void idt_init(void) {
     memset(idt, 0, sizeof(idt));
     for (int n = 0; n < 256; n++) {
         if (isr_stub_table[n])
-            idt_set(n, isr_stub_table[n], n == 0x80 ? 3 : 0);
+            /* #DF gets IST1 so a kernel-stack overflow can still be
+             * reported instead of silently triple-faulting */
+            idt_set(n, isr_stub_table[n], n == 0x80 ? 3 : 0, n == 8 ? 1 : 0);
     }
     idtp.limit = sizeof(idt) - 1;
     idtp.base = (uint64_t)(uintptr_t)idt;

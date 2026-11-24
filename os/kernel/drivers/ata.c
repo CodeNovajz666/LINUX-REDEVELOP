@@ -128,7 +128,7 @@ bool ata_present(void) { return disk_present; }
 uint32_t ata_sector_count(void) { return nsectors; }
 
 int ata_read_sectors(uint32_t lba, uint32_t count, void *buf) {
-    if (!disk_present || count == 0 || !buf) return -1;
+    if (!disk_present || count == 0 || count > 255 || !buf) return -1;
     if ((uint64_t)lba + count > nsectors) return -1;
 
     irq_flags_t fl;
@@ -156,7 +156,7 @@ out:
 }
 
 int ata_write_sectors(uint32_t lba, uint32_t count, const void *buf) {
-    if (!disk_present || count == 0 || !buf) return -1;
+    if (!disk_present || count == 0 || count > 255 || !buf) return -1;
     if ((uint64_t)lba + count > nsectors) return -1;
 
     irq_flags_t fl;

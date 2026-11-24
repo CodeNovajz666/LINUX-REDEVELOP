@@ -44,15 +44,19 @@ extern void ap_context_enter(uint64_t kesp);       /* trampoline.S */
 
 static volatile bool smp_gate;                     /* set by smp_release */
 
-/* TLB shootdown mailbox: one (pd, range) slot, senders serialized by
- * tlb_lock, fire-and-forget (no ack -- see the header contract). The range
- * lets the unmap / brk-shrink paths cover a whole region with ONE broadcast
- * instead of one IPI per page; the handler flushes outright when the range
- * is wide, since N invlpg would cost more than a CR3 reload. */
+/* TLB shootdown ring: every invalidation request is published as an entry
+ * before the IPI is broadcast.  A single mailbox was racy -- the sender
+ * releases tlb_lock and may overwrite it before the target CPU's IPI is
+ * even delivered, losing the previous range.  The ring keeps the last
+ * TLB_RING_SIZE requests; a CPU that falls further behind than that just
+ * reloads CR3 (full flush), which is always correct. */
 #define TLB_RANGE_FLUSH_PAGES 32         /* wider ranges: full flush, not invlpg */
+#define TLB_RING_SIZE 64                 /* power of two */
+struct tlb_req { uint64_t pd, lo, hi; };
 
 static spinlock_t tlb_lock = SPINLOCK_INIT;
-static volatile uint64_t tlb_pd, tlb_lo, tlb_hi;   /* [lo, hi), page-aligned */
+static struct tlb_req tlb_ring[TLB_RING_SIZE];
+static volatile uint32_t tlb_head;       /* total requests published */
 static uint32_t tlb_broadcasts;
 
 static inline void invlpg(uint64_t va) {
@@ -188,24 +192,41 @@ void smp_tlb_shootdown_range(uint64_t page_dir, uint64_t from, uint64_t to) {
     if (ncpu < 2 || from >= to) return;
     irq_flags_t f;
     spin_lock_irqsave(&tlb_lock, &f);
-    tlb_pd = page_dir;
-    tlb_lo = from;
-    tlb_hi = to;
+    uint32_t idx = tlb_head;
+    tlb_ring[idx & (TLB_RING_SIZE - 1)] = (struct tlb_req){ page_dir, from, to };
+    __atomic_store_n(&tlb_head, idx + 1, __ATOMIC_RELEASE);
+    /* the PTE update must be globally visible before the IPI can cause a
+     * remote CPU to re-walk the tables; x86 does not order a store against
+     * interrupt delivery on another CPU without a fence */
+    __sync_synchronize();
     tlb_broadcasts++;
     apic_ipi_broadcast(IPI_TLB_SHOOTDOWN);
     spin_unlock_irqrestore(&tlb_lock, f);
 }
 
-/* isr.c vector 0x51: invalidate the range locally if we run this page dir */
+/* isr.c vector 0x51: process every ring entry this CPU has not seen yet */
 void smp_tlb_shootdown_handler(void) {
-    if (paging_cur_cr3() != tlb_pd) return;
-    uint64_t lo = tlb_lo, hi = tlb_hi;
-    if (hi - lo > (uint64_t)TLB_RANGE_FLUSH_PAGES * PAGE_SIZE) {
-        paging_load_cr3(paging_cur_cr3());      /* wide range: one full flush */
+    struct cpu *c = this_cpu();
+    uint32_t head = __atomic_load_n(&tlb_head, __ATOMIC_ACQUIRE);
+    uint32_t seen = c->tlb_seen;
+    if (head == seen) return;
+    if (head - seen >= TLB_RING_SIZE) {
+        paging_load_cr3(paging_cur_cr3());      /* fell behind: full flush */
+        c->tlb_seen = head;
         return;
     }
-    for (uint64_t va = lo; va < hi; va += PAGE_SIZE)
-        invlpg(va);
+    uint64_t cr3 = paging_cur_cr3();
+    for (uint32_t i = seen; i != head; i++) {
+        const struct tlb_req *q = &tlb_ring[i & (TLB_RING_SIZE - 1)];
+        if (q->pd != cr3) continue;             /* entry for another space */
+        if (q->hi - q->lo > (uint64_t)TLB_RANGE_FLUSH_PAGES * PAGE_SIZE) {
+            paging_load_cr3(cr3);               /* wide range: one full flush */
+        } else {
+            for (uint64_t va = q->lo; va < q->hi; va += PAGE_SIZE)
+                invlpg(va);
+        }
+    }
+    c->tlb_seen = head;
 }
 
 uint32_t smp_tlb_ipis_sent(void) { return tlb_broadcasts; }

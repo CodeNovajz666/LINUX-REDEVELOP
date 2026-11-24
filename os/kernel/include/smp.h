@@ -40,11 +40,11 @@ int  smp_cpus_online(void);               /* through ap_entry */
  * runqueues; parked APs ignore it) */
 void smp_resched_others(void);
 
-/* Fire-and-forget invalidation of one page on every CPU currently running
- * `page_dir` (CR3 match). The primary SMP invariant here is "CR3 is
- * reloaded on every switch-in, so a task never executes with TLB entries
- * for pages someone swapped out while it was off-CPU" -- callers hold
- * sched_lock, which serializes concurrent senders of this mailbox. */
+/* Invalidate one page on every CPU currently running `page_dir` (CR3
+ * match).  Requests are published into a fixed ring before the broadcast,
+ * so a slow target CPU cannot lose a range to a newer request; if it falls
+ * more than TLB_RING_SIZE behind it reloads CR3 (full flush) instead.
+ * Callers hold sched_lock, which serializes concurrent senders. */
 void smp_tlb_shootdown(uint64_t page_dir, uint64_t va);
 /* same, for a whole page-aligned range [from, to): one broadcast instead
  * of one IPI per page (the handler full-flushes when the range is wide) */

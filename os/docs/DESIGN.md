@@ -185,9 +185,11 @@ cs=0x1B|3/ss=0x23|3+用户栈。
   （on_cpu 所有权的推论），任务切换必重载 CR3 全量冲刷——改写
   **当前任务** PTE（COW/munmap/缺页）本地 invlpg 即够；唯 kswapd
   改写**他人** PTE 时广播 shootdown IPI（对端按 CR3 匹配）。
-  shootdown 邮箱是 (pd, [lo,hi)) 区间（v1.2.0 优化轮起）——
+  shootdown 请求进入 (pd, [lo,hi)) 环形队列（64 项）——
   munmap/brk 收缩整段一次广播，接收端宽范围（>32 页）直接全量
-  冲刷；fork 的 COW 复制也改为收尾一次 CR3 重载（原逐页 invlpg）
+  冲刷，落后超过队列深度则重载 CR3；旧单槽邮箱会被新请求覆盖而
+  丢失范围，环形队列消除了这一竞态。fork 的 COW 复制仍为收尾
+  一次 CR3 重载（原逐页 invlpg）
 
 ### 4.5 SMP 启动（v0.7.0）
 - `mp.c` 解析 MP Table（`_MP_` 浮动指针三段扫描 + PCMP 表 CPU
@@ -395,7 +397,7 @@ DESIGN.md §6。
 - **收版前性能二轮（2026-11-02）**：lib 宽化（rep movsq/stosq）、
   目录枚举 foreach 单遍（原 readdir(i) 逐项重扫 O(N²)）、FAT32
   链尾缓存 O(1) 追加 + 整簇直读直写、fork 单次 CR3 重载、TLB
-  shootdown 范围邮箱、pmm ctz/next-fit、heap O(1) 空闲计数、
+  shootdown 范围环形队列、pmm ctz/next-fit、heap O(1) 空闲计数、
   ATA rep 串指令
 - 契约全文见根目录 DESIGN.md §7（mm 引用计数、每地址空间锁、
   进程组路由、教学偏差清单）

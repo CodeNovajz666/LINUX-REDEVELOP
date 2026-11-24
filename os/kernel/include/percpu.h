@@ -19,8 +19,9 @@ struct task;
  * stay global, guarded by sched_lock (see spinlock.h for the order).
  */
 
-/* x86_64 TSS: privilege stacks are RSP0/1/2 at offsets 4/12/20 (ISTs
- * unused). iomap_base at offset 92 terminates the (empty) I/O bitmap. */
+/* x86_64 TSS: privilege stacks are RSP0/1/2 at offsets 4/12/20; IST1
+ * (ist[0]) carries the per-CPU double-fault stack. iomap_base at offset 92
+ * terminates the (empty) I/O bitmap. */
 struct tss64 {
     uint32_t prev;
     uint64_t rsp0, rsp1, rsp2;
@@ -41,8 +42,12 @@ struct cpu {
     volatile bool need_resched;
     struct task *rr_last;      /* SCHED_ROUND_ROBIN rotation cursor */
     uint32_t lapic_ticks;      /* calibrated LAPIC-timer count per tick */
+    volatile uint32_t tlb_seen;/* last TLB-shootdown ring entry processed */
     uint64_t gdt[7] __attribute__((aligned(8)));   /* 5 descriptors + TSS64 */
     struct tss64 tss __attribute__((aligned(16)));
+    /* IST1: double-fault stack.  A #DF caused by kernel-stack overflow must
+     * not use the broken stack again, or the CPU triple-faults silently. */
+    uint8_t df_stack[4096] __attribute__((aligned(16)));
 };
 
 extern struct cpu cpus[SMP_MAX];

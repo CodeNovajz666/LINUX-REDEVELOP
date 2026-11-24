@@ -35,8 +35,8 @@
  * reload flushes whatever entries survived, closing the loop. The IPI
  * broadcast after every PTE rewrite is defense in depth: it invalidates
  * on any CPU that happens to run the same CR3 (normally none, since the
- * victim is off-CPU -- which is also why the fire-and-forget mailbox
- * race is harmless here).
+ * victim is off-CPU; the shootdown ring keeps the request queued even if
+ * it is switched in concurrently, so the range is never lost).
  */
 
 #define SWAP_SLOTS      1024                     /* 4 MiB of 4 KiB frames */

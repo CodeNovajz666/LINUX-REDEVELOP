@@ -378,9 +378,11 @@ mm.lock 串行。**TLB 语义**：共享 CR3 使"受害者不在 CPU ⟹ 页目�
 无人加载"的旧前提失效——kswapd 换出用 `mm_executing_elsewhere`
 整段跳过有兄弟在跑的地址空间（恢复完全可靠性）；COW 解析后的兄弟
 旧只读 TLB 项在 isr.c 以"PTE 已 present+rw 则 invlpg 重试"吸收；
-munmap/brk 收缩依赖 fire-and-forget shootdown（整段**一次范围
-广播**，v1.2.0 优化轮起；接收端宽范围直接全量冲刷），送达窗口内
-的旧译址命中是**已知限制**（与 kswapd v0.7.0 注释同族，窗口纳秒级）。
+munmap/brk 收缩走 shootdown 环形队列（整段**一次范围广播**，64 项；
+接收端宽范围直接全量冲刷，落后超过队列深度则重载 CR3），
+新请求不会再覆盖尚未处理的旧范围；从 PTE 改写至 IPI 送达之间仍有
+纳秒级旧译址窗口（与 kswapd v0.7.0 注释同族，属 shootdown 固有
+窗口），但不再有请求丢失。
 **进程级共享结构**：`struct file` 引用计数原子化（并发 close 的
 最后释放者收尾）；FAT32 的多步超级块操作（FAT 表 RMW、簇分配、
 目录项编辑）由粗粒度 `fat_lock` 串行（叶锁，9 个派发入口包壳，

@@ -6,6 +6,38 @@
 #include "smp.h"
 #include "spinlock.h"
 #include "lib.h"
+#include "paging.h"
+#include "mm.h"
+
+/* Frame preparation failed (OOM or an unusable stack).  `task_kill_task`
+ * takes sched_lock, which schedule() already holds while delivering to the
+ * task it is about to switch to -- only the interrupt-return path (t ==
+ * current) may kill here; the schedule path drops the signal instead of
+ * iretq'ing into a freshly-made zombie. */
+static void signal_fail_delivery(struct task *t, int sig) {
+    atomic_and32(&t->sigpending, ~(1u << (sig - 1)));
+    if (t == current_task()) task_kill_task(t, sig);
+}
+
+/* Make [va, va+len) safe for a kernel-side write before copying the signal
+ * frame onto the user stack.  Demand-zero pages, swap markers and COW
+ * copies all need resolving here: this runs from the interrupt return path
+ * (and from schedule(), holding sched_lock), where taking a #PF would
+ * re-enter schedule()/the fault path and can deadlock or triple-fault. */
+static int signal_prefault_frame(struct task *t, uint64_t va, uint64_t len) {
+    uint64_t first = va & ~(uint64_t)(PAGE_SIZE - 1);
+    uint64_t last = (va + len - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+    for (uint64_t p = first; p <= last; p += PAGE_SIZE) {
+        uint64_t pte = paging_pte_read(t->page_dir, p);
+        if (pte & PTE_P) {
+            if ((pte & PTE_COW) && paging_cow_fault(t->page_dir, p) != 0)
+                return -1;
+        } else if (mm_fault(t, p, 1) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
 
 /*
  * Signal delivery (v0.5.0) -- the third Unix stage after generation
@@ -56,6 +88,14 @@ void signal_deliver_pending(struct task *t, struct pt_regs *r) {
     if (!handler || nrsp < stack_bot) {
         atomic_and32(&t->sigpending, ~(1u << (sig - 1)));
         task_kill_task(t, sig);
+        return;
+    }
+
+    /* resolve the frame's destination pages before touching them: this
+     * may run inside schedule() with sched_lock held, so a #PF here would
+     * recurse into the scheduler instead of being resolved */
+    if (signal_prefault_frame(t, nrsp, frame_sz) != 0) {
+        signal_fail_delivery(t, sig);
         return;
     }
 

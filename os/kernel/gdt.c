@@ -14,6 +14,8 @@ static void gdt_build(struct cpu *c) {
     memset(&c->tss, 0, sizeof(c->tss));
     c->tss.iomap_base = sizeof(struct tss64);
     c->tss.rsp0 = 0;                      /* task.c owns RSP0 from milestone D */
+    /* IST1 (#DF): a dedicated stack survives a blown kernel stack */
+    c->tss.ist[0] = (uint64_t)(uintptr_t)(c->df_stack + sizeof(c->df_stack));
 
     c->gdt[1] = 0x00AF9A000000FFFFull;    /* 0x08 kernel code64 (L=1) */
     c->gdt[2] = 0x00CF92000000FFFFull;    /* 0x10 kernel data */

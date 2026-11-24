@@ -282,6 +282,9 @@ static void wire_child_fds(const struct osh_stage *st, int pipe_in, int pipe_out
         if (fd < 0) { uprintf("osh: cannot open %s\n", st->r.out_file); uexit(1); }
         udup2(fd, 1);
     }
+    /* everything the child needs is now on 0/1/2; close inherited pipe/file
+     * descriptors so a stage never keeps an unrelated pipe end alive */
+    for (int fd = 3; fd < 32; fd++) uclose(fd);
 }
 
 /* v1.1.5: the exported-variable environment children exec with --
